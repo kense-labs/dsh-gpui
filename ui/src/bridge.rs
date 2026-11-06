@@ -19,6 +19,15 @@ export function dshListen(callback) {
     }
     return api.event.listen('acp-event', event => callback(JSON.stringify(event.payload)));
 }
+
+export function dshListenKeys(callback) {
+    window.addEventListener('keydown', event => {
+        if (callback(event.key)) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+        }
+    }, true);
+}
 "#)]
 extern "C" {
     #[wasm_bindgen(js_name = dshInvoke)]
@@ -26,6 +35,9 @@ extern "C" {
 
     #[wasm_bindgen(js_name = dshListen)]
     fn listen_js(callback: &js_sys::Function) -> js_sys::Promise;
+
+    #[wasm_bindgen(js_name = dshListenKeys)]
+    fn listen_keys_js(callback: &js_sys::Function);
 }
 
 /// Invoke one Tauri command and normalize its result to JSON.
@@ -41,6 +53,11 @@ pub async fn invoke(command: &str, args: Value) -> Result<Value, String> {
 /// Subscribe to backend ACP events. The returned Promise resolves to an unlisten function.
 pub fn listen(callback: &js_sys::Function) -> js_sys::Promise {
     listen_js(callback)
+}
+
+/// Intercept composer navigation before the editor consumes those keys.
+pub fn listen_keys(callback: &js_sys::Function) {
+    listen_keys_js(callback);
 }
 
 fn js_error(value: JsValue) -> String {

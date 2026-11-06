@@ -1,31 +1,52 @@
 # dsh-gpui
 
-DeepSeek Harness 的桌面 GPUI 客户端。Tauri 负责桌面窗口、ACP 子进程和 JSON-RPC 通信；KUI 提供 GPUI 组件，前端编译为 WebAssembly 后在 Tauri WebView 中运行。
+DeepSeek Harness 的桌面 GPUI 客户端。Tauri 负责桌面窗口、子进程和 IPC；KUI 提供 GPUI 组件，前端编译为 WebAssembly 后在 Tauri WebView 中运行。
 
-## 功能
+当前实现覆盖登录、凭据配置和 ACP 对话主流程，并参照官方 Harness 重构了主工作区、设置模态框和桌面品牌资源。它不是对 DeepSeek Harness 全部产品功能和 UI/UX 的完整复刻。
 
-- 新建、列出、恢复和关闭持久会话
+## 已实现
+
+- DeepSeek 账户登录：系统浏览器 PKCE 授权、复制授权链接、取消、重试和退出登录
+- API Key 配置：密码掩码输入、校验、保存、更新和移除
+- 主工作区：可动画折叠的会话侧栏、本地会话搜索、按工作区分组、新建和恢复会话
+- 官方鱼形品牌、深色 surface、Hero、轻量工作区与模型菜单、蓝色圆形发送／停止按钮
+- 设置模态框：模型、账户与 API Key、工作区与连接、外观四个独立页面
 - 发送任务、取消执行、展示助手消息与思考内容
-- 展示工具输入、执行状态和结果
-- 人工批准或拒绝一次性工具权限请求
+- 展示工具输入、执行状态和结果，人工批准或拒绝一次性工具权限请求
 - 切换模型和推理强度，显示上下文用量
 - 明暗主题、中文界面、工作区与服务路径设置
+- 登录状态防倒退、凭据就绪后的服务重建，以及发送失败后的草稿恢复
+- `DeepSeek Harness` 应用名称、官方 Dock／打包图标，以及带打开窗口和退出菜单的状态栏鱼形图标
 
-## 源码分析结论
+API Key 使用 `deepseek-official` 路由。只登录账户时，客户端在登录完成后重建会话，并从 ACP 模型目录选择 `deepseek-account` 路由，避免仍按官方 API Key 路由发送请求。
+
+Composer 左下角的“＋”打开与官方 Harness 相同层级的指令面板，模型和思考强度使用 ACP 返回的真实选项。ACP 尚未提供的文件、目标、计划、反馈和权限预设会明确标记为不可用，不会伪装成已经支持。
+
+## 架构与凭据
 
 DeepSeek Harness 采用 Cordis 插件架构。`dsh-base` 提供模型、工具、持久化和审批能力，`dsh-acp-app` 将 Agent 生命周期映射到标准 ACP。一个 ACP 连接可以承载多个独立会话，每个会话同时只允许一个进行中的 prompt。
 
-ACP 服务端接收 `initialize`、`session/new`、`session/list`、`session/resume`、`session/close`、`session/prompt`、`session/cancel` 和 `session/set_config_option`。它通过 `session/update` 发送已提交的助手消息、思考、工具生命周期和上下文用量，通过 `session/request_permission` 请求一次性授权。
+客户端启动两个独立的 Node 子进程：
 
-本客户端遵循两个重要边界：ACP 恢复会话但不回放历史消息；ACP 发送提交后的语义消息块，而不是模型原始 token 流。因此恢复时界面会显示明确提示，消息也在服务端提交后出现。
+- `dsh-acp`：标准 ACP stdio 服务，负责会话、模型、工具和权限。
+- `services/account-service.mjs`：Host-only NDJSON 辅助服务，动态加载同级 `dsh-acp` 中保留的官方 `WebServer`、`LocalCredentialProvider`、`AuthorizationService` 和 `PlatformAccount` 模块，只负责账户与凭据。
+
+两个进程共享 `$DSH_HOME/.credentials.yaml`。API Key 只从 Tauri Host 写入官方凭据服务，已保存的值不会返回 GPUI/WASM；登录 token 也不进入前端。凭据文件在隔离测试中权限为 `0600`，但它是凭据文件而非界面加密保险库，应继续保护用户主目录。
+
+ACP 恢复会话但不回放历史消息；ACP 发送提交后的语义消息块，而不是模型原始 token 流。
 
 ## 目录
 
 ```text
-src-tauri/       Tauri 后端、Node 子进程、NDJSON JSON-RPC 路由
-ui/              KUI/GPUI Rust 前端与 WASM 入口
-ui/src/state.rs  可测试的 ACP 消息归并逻辑
-scripts/         可重复的 WASM 构建脚本
+src-tauri/             Tauri 后端、ACP、账户子进程与原生托盘
+src-tauri/icons/       官方应用图标和状态栏模板
+services/              Host-only 官方账户和凭据桥
+ui/                    KUI/GPUI Rust 前端与 WASM 入口
+ui/src/web/workspace.rs 主工作区、对话、Composer 与设置模态框
+ui/src/welcome.rs      登录和 API Key 流程，以及设置内的账户控件
+ui/src/state.rs        可测试的消息归并、登录状态与凭据草稿校验
+scripts/               可重复的 WASM 与开发应用构建脚本
+justfile               本地快捷启动
 ```
 
 ## 准备
@@ -42,44 +63,50 @@ scripts/         可重复的 WASM 构建脚本
 cd ../dsh-acp
 pnpm install
 pnpm run build
-export DEEPSEEK_API_KEY=your_key
 cd ../dsh-gpui
 npm install
 ```
 
 未构建 `dsh-acp` 时，客户端会尝试通过 `node --import tsx/esm apps/cli/src/bin.ts --profile acp` 从源码启动。生产使用建议先构建服务。
 
-## 运行
+## 启动
 
 ```sh
-export DEEPSEEK_API_KEY=your_key
-npm run dev
+just dev
 ```
 
-客户端默认自动寻找同级 `../dsh-acp`，也可以设置：
+macOS 上该命令构建前端和 debug Host，并在 `.tools/dev-app/` 生成轻量 `DeepSeek Harness.app` 后运行，使开发模式的 Dock 名称和图标也与正式应用一致。其他平台使用 `npm run dev` 启动 Tauri 开发客户端。
+
+首次启动需要完成 DeepSeek 账户登录，仅添加 API Key 不会绕过账户登录。登录后可进入主工作区，并通过侧栏底部的账户菜单打开“设置”，在“账号与余额”中管理自己的 API Key。无需再在 shell 中导出 `DEEPSEEK_API_KEY`；已有环境变量仍可作为 Harness 的凭据回退来源。
+
+可选环境变量：
 
 ```sh
 export DSH_ACP_PATH=/absolute/path/to/dsh-acp
-export DSH_NODE=/absolute/path/to/node       # 可选
-export DSH_HOME=/absolute/path/to/harness-home # 可选
+export DSH_NODE=/absolute/path/to/node         # 可选
+export DSH_HOME=/absolute/path/to/harness-home # 可选，默认 ~/.dsh
 ```
 
-`DSH_HOME`、DeepSeek 凭据和其他 Harness 环境变量由子进程继承。工作区必须在发起任务的机器上存在；会话使用其规范化绝对路径。
+工作区必须在发起任务的机器上存在；会话使用其规范化绝对路径。
 
 ## 构建与检查
 
 ```sh
 npm run ui:build   # release WASM + wasm-bindgen，工具安装在 .tools/
-npm run build      # Tauri 应用，不生成安装包
+npm run build      # Tauri release Host，不生成安装包
+npm exec -- tauri build --bundles app  # macOS .app，包含名称和图标
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy -p dsh-gpui-ui --target wasm32-unknown-unknown -- -D warnings
 ```
 
 WASM 构建会依据 `Cargo.lock` 安装匹配版本的 `wasm-bindgen-cli` 到项目 `.tools/`，不污染全局 Rust 工具目录。
 
-## ACP 限制
+## 尚未对齐与验收边界
 
-当前服务端不支持会话删除、fork、历史 transcript 回放、计划、终端、客户端文件系统操作或附加工作目录。本客户端不会伪造这些能力。API 密钥只通过环境变量传入 `dsh-acp`，不会写入界面状态或仓库。
+当前服务端不支持会话删除、fork、历史 transcript 回放、计划、终端、客户端文件系统操作或附加工作目录。官方 Harness 的插件、计划、完整工作区管理及其他高级能力尚未复刻。侧栏历史会话的标题和排序仍受 ACP 返回字段限制。新界面参照官方侧栏、Hero、InputBar 和设置规格实现，但尚未完成像素级视觉对照。
+
+隔离测试已通过授权 URL 生成、取消登录、API Key 校验/保存/状态读取/移除及凭据文件权限检查。使用用户已有凭据的真实 ACP 冒烟已成功创建会话、选择官方模型并得到 `end_turn` 回复。真实 ACP 成功不等同于新版客户端内发送已验收；后者仍需用户在桌面 UI 中确认。原生截图受当前环境的屏幕录制权限限制，视觉验收也未完成。
 
 ## 许可
 

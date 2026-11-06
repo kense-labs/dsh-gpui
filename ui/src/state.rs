@@ -2,6 +2,64 @@
 
 use serde_json::Value;
 
+/// Validate a draft without retaining or returning the credential value.
+pub fn validate_api_key(value: &str) -> Result<(), &'static str> {
+    if value.is_empty() {
+        return Err("请输入 API Key。");
+    }
+    if !value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+        || value.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte == b'_' || byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        })
+        || (matches!(value.as_bytes().first(), Some(b'\'' | b'"' | b'`'))
+            && value.as_bytes().last() == value.as_bytes().first())
+    {
+        return Err("请输入 API Key 本身，不要包含引号、空格或环境变量赋值。");
+    }
+    Ok(())
+}
+
+/// Only an authorized DeepSeek account may unlock the workspace.
+pub fn account_signed_in(auth: Option<&Value>) -> bool {
+    auth.is_some_and(|status| {
+        status.pointer("/account/status").and_then(Value::as_str) == Some("credential-stored")
+            || status
+                .pointer("/account/attempt/phase")
+                .and_then(Value::as_str)
+                == Some("succeeded")
+    })
+}
+
+/// Reject a delayed response that would move one sign-in attempt backwards.
+pub fn is_stale_account(current: &Value, incoming: &Value) -> bool {
+    let phase_rank = |value: &Value| match value.get("phase").and_then(Value::as_str) {
+        Some("initializing") => 0,
+        Some("waiting-browser") => 1,
+        Some("exchanging") => 2,
+        Some("committing") => 3,
+        Some("cancelled" | "expired" | "failed") => 4,
+        Some("succeeded") => 5,
+        _ => -1,
+    };
+    let current_attempt = current.get("attempt");
+    let incoming_attempt = incoming.get("attempt");
+    let same_attempt = current_attempt
+        .and_then(|attempt| attempt.get("id"))
+        .and_then(Value::as_str)
+        .is_some_and(|id| {
+            incoming_attempt
+                .and_then(|attempt| attempt.get("id"))
+                .and_then(Value::as_str)
+                == Some(id)
+        });
+    same_attempt
+        && incoming_attempt
+            .is_some_and(|attempt| phase_rank(attempt) < current_attempt.map_or(-1, phase_rank))
+}
+
 /// Visual role for one conversation row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EntryRole {
@@ -207,8 +265,58 @@ fn role_name(role: EntryRole) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{EntryRole, apply_update};
+    use super::{EntryRole, account_signed_in, apply_update, is_stale_account, validate_api_key};
     use serde_json::json;
+
+    #[test]
+    fn api_key_alone_does_not_unlock_workspace() {
+        let auth = json!({
+            "account": {"status": "signed-out"},
+            "apiKey": {"configured": true}
+        });
+        assert!(!account_signed_in(Some(&auth)));
+    }
+
+    #[test]
+    fn stored_credential_unlocks_workspace() {
+        let auth = json!({"account": {"status": "credential-stored"}});
+        assert!(account_signed_in(Some(&auth)));
+    }
+
+    #[test]
+    fn successful_attempt_unlocks_workspace() {
+        let auth = json!({"account": {"attempt": {"phase": "succeeded"}}});
+        assert!(account_signed_in(Some(&auth)));
+    }
+
+    #[test]
+    fn api_key_validation_accepts_keys_and_rejects_assignments_and_quotes() {
+        assert_eq!(validate_api_key("sk-test-not-a-real-key"), Ok(()));
+        for value in ["", "DEEPSEEK_API_KEY=secret", "'secret'", "two words"] {
+            assert!(
+                validate_api_key(value).is_err(),
+                "rejected draft: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn delayed_responses_cannot_reverse_one_sign_in_attempt() {
+        let initializing = json!({"attempt": {"id": "attempt-1", "phase": "initializing"}});
+        let waiting = json!({"attempt": {"id": "attempt-1", "phase": "waiting-browser"}});
+        let succeeded = json!({"attempt": {"id": "attempt-1", "phase": "succeeded"}});
+        assert!(!is_stale_account(&initializing, &waiting));
+        assert!(!is_stale_account(&waiting, &succeeded));
+        assert!(is_stale_account(&waiting, &initializing));
+        assert!(is_stale_account(&succeeded, &initializing));
+    }
+
+    #[test]
+    fn a_new_sign_in_attempt_is_not_stale() {
+        let previous = json!({"attempt": {"id": "attempt-1", "phase": "succeeded"}});
+        let next = json!({"attempt": {"id": "attempt-2", "phase": "initializing"}});
+        assert!(!is_stale_account(&previous, &next));
+    }
 
     #[test]
     fn committed_blocks_from_one_message_are_coalesced() {

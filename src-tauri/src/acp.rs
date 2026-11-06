@@ -441,7 +441,7 @@ fn resolve_workspace(value: Option<&str>) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
-fn resolve_service_path(value: Option<&str>) -> Result<PathBuf, String> {
+pub(crate) fn resolve_service_path(value: Option<&str>) -> Result<PathBuf, String> {
     if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
         let path = absolute_path(Path::new(value))?;
         return path

@@ -49,6 +49,7 @@ run(bindgen, [
   '--out-dir', pkg,
   join(root, 'target', 'wasm32-unknown-unknown', 'release', 'dsh_gpui_ui.wasm'),
 ]);
+copyFileSync(join(root, 'ui', 'assets', 'deepseek-fish.svg'), join(dist, 'deepseek-fish.svg'));
 for (const file of ['index.html', 'app.css', 'bootstrap.js']) {
   copyFileSync(join(root, 'ui', file), join(dist, file));
 }
