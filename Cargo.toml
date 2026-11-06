@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["src-tauri", "ui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[profile.dev]
+debug = "limited"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

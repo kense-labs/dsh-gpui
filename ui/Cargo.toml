@@ -1,0 +1,23 @@
+[package]
+name = "dsh-gpui-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "KUI/GPUI WebAssembly frontend for DeepSeek Harness"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+gpui = { package = "gpui-pre", version = "=0.3.10", default-features = false }
+kui = { package = "kense-kui", git = "https://github.com/kense-labs/KUI.git", rev = "e5142159168d865a71e88485ec6208a5a0714488", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.10", default-features = false }
+console_error_panic_hook = "0.1"
+js-sys = "0.3"
+serde-wasm-bindgen = "0.6"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"

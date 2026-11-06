@@ -1,0 +1,16 @@
+[package]
+name = "dsh-gpui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tauri ACP host for the DeepSeek Harness GPUI client"
+build = "build.rs"
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }

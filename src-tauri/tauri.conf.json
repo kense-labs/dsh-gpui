@@ -1,0 +1,28 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "DeepSeek Harness GPUI",
+  "version": "0.1.0",
+  "identifier": "com.kense-labs.dsh-gpui",
+  "build": {
+    "frontendDist": "../ui/dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "DeepSeek Harness",
+        "width": 1280,
+        "height": 840,
+        "minWidth": 900,
+        "minHeight": 640,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' data: blob:; font-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": false
+  }
+}
