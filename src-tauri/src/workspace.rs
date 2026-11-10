@@ -1,10 +1,16 @@
-//! Bounded, workspace-local directory listings for composer file references.
+//! Workspace directory listings and native open actions.
+
+#[cfg(target_os = "macos")]
+pub(crate) mod applications;
+pub(crate) mod document;
+pub(crate) mod watch;
 
 use serde::Serialize;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 const ENTRY_LIMIT: usize = 200;
+const TREE_ENTRY_LIMIT: usize = 2_000;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -12,6 +18,8 @@ pub struct WorkspaceFileEntry {
     pub name: String,
     pub path: String,
     pub is_directory: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub is_other: bool,
 }
 
 #[derive(Serialize)]
@@ -28,10 +36,17 @@ pub async fn list_workspace_files(
     workspace: String,
     directory: String,
     request_id: u64,
+    tree: Option<bool>,
 ) -> Result<WorkspaceFileList, String> {
-    tokio::task::spawn_blocking(move || list_files(&workspace, &directory, request_id))
-        .await
-        .map_err(|error| format!("读取工作区任务失败：{error}"))?
+    tokio::task::spawn_blocking(move || {
+        if tree.unwrap_or(false) {
+            list_tree_level(&workspace, &directory, request_id)
+        } else {
+            list_files(&workspace, &directory, request_id)
+        }
+    })
+    .await
+    .map_err(|error| format!("读取工作区任务失败：{error}"))?
 }
 
 #[tauri::command]
@@ -39,6 +54,55 @@ pub async fn open_start_tool(workspace: String, tool: String) -> Result<(), Stri
     tokio::task::spawn_blocking(move || open_tool(&workspace, &tool))
         .await
         .map_err(|error| format!("打开工作区工具失败：{error}"))?
+}
+
+#[tauri::command]
+pub async fn open_browser_url(url: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || open_url(&url))
+        .await
+        .map_err(|error| format!("打开链接失败：{error}"))?
+}
+
+fn normalize_url(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("请输入网址".to_string());
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return Ok(trimmed.to_string());
+    }
+    if trimmed.contains(' ') {
+        return Err("网址无效".to_string());
+    }
+    Ok(format!("https://{trimmed}"))
+}
+
+#[cfg(target_os = "macos")]
+fn open_url(raw: &str) -> Result<String, String> {
+    let url = normalize_url(raw)?;
+    let status = std::process::Command::new("open")
+        .arg(&url)
+        .status()
+        .map_err(|error| format!("无法打开链接：{error}"))?;
+    if status.success() {
+        Ok(url)
+    } else {
+        Err(format!("打开链接失败：{status}"))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_url(raw: &str) -> Result<String, String> {
+    let url = normalize_url(raw)?;
+    let status = std::process::Command::new("xdg-open")
+        .arg(&url)
+        .status()
+        .map_err(|error| format!("无法打开链接：{error}"))?;
+    if status.success() {
+        Ok(url)
+    } else {
+        Err(format!("打开链接失败：{status}"))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -107,6 +171,7 @@ fn list_files(
             name,
             path: slash_path(&child_relative),
             is_directory: metadata.is_dir(),
+            is_other: false,
         });
     }
     entries.sort_by(|left, right| {
@@ -126,6 +191,79 @@ fn list_files(
         entries,
         truncated,
     })
+}
+
+fn list_tree_level(
+    workspace: &str,
+    directory: &str,
+    request_id: u64,
+) -> Result<WorkspaceFileList, String> {
+    let (relative, target) = tree_target(workspace, directory)?;
+    let mut entries = Vec::new();
+    for item in fs::read_dir(&target).map_err(tree_read_error)? {
+        let item = item.map_err(tree_read_error)?;
+        let kind = item.file_type().map_err(tree_read_error)?;
+        let kind = if kind.is_symlink() {
+            match fs::metadata(item.path()) {
+                Ok(info) => Some(info.file_type()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(tree_read_error(error)),
+            }
+        } else {
+            Some(kind)
+        };
+        let name = item.file_name().to_string_lossy().into_owned();
+        entries.push(WorkspaceFileEntry {
+            path: slash_path(&relative.join(&name)),
+            name,
+            is_directory: kind.is_some_and(|kind| kind.is_dir()),
+            is_other: kind.is_none_or(|kind| !kind.is_dir() && !kind.is_file()),
+        });
+    }
+    entries.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let truncated = entries.len() > TREE_ENTRY_LIMIT;
+    entries.truncate(TREE_ENTRY_LIMIT);
+    Ok(WorkspaceFileList {
+        request_id,
+        directory: slash_path(&relative),
+        entries,
+        truncated,
+    })
+}
+
+fn tree_target(workspace: &str, directory: &str) -> Result<(PathBuf, PathBuf), String> {
+    let root = tree_directory(Path::new(workspace))?;
+    let relative = checked_relative(directory)
+        .map_err(|_| "这个目录在工作区之外，侧栏不会读取它。".to_owned())?;
+    let target = tree_directory(&root.join(&relative))?;
+    if !target.starts_with(&root) {
+        return Err("这个目录在工作区之外，侧栏不会读取它。".to_owned());
+    }
+    Ok((relative, target))
+}
+
+fn tree_directory(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err("工作区必须是绝对路径".to_owned());
+    }
+    let canonical = fs::canonicalize(path).map_err(tree_read_error)?;
+    if !canonical.is_dir() {
+        return Err("这不是一个目录。".to_owned());
+    }
+    Ok(canonical)
+}
+
+fn tree_read_error(error: std::io::Error) -> String {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => "这个目录不在了。可能已被移动或删除。".to_owned(),
+        std::io::ErrorKind::NotADirectory => "这不是一个目录。".to_owned(),
+        _ => format!("读取失败：{error}"),
+    }
 }
 
 fn canonical_root(workspace: &Path) -> Result<PathBuf, String> {
@@ -183,6 +321,53 @@ mod tests {
         assert!(checked_relative("").is_ok());
         assert!(checked_relative("../secrets").is_err());
         assert!(checked_relative("/etc").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tree_lists_dotfiles_and_directory_links_but_only_reads_inside_the_root() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join(format!("dsh-tree-{}", std::process::id()));
+        fs::create_dir(&base).unwrap();
+        struct RemoveTree(PathBuf);
+        impl Drop for RemoveTree {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = RemoveTree(base.clone());
+        let root = base.join("root");
+        fs::create_dir_all(root.join("dir")).unwrap();
+        fs::write(root.join(".env"), "").unwrap();
+        fs::write(root.join("dir/child.txt"), "").unwrap();
+        symlink("dir", root.join("inside")).unwrap();
+        symlink(&base, root.join("outside")).unwrap();
+        symlink("missing", root.join("broken")).unwrap();
+        let root = root.to_str().unwrap();
+
+        let tree = list_tree_level(root, "", 1).unwrap();
+        let entries: Vec<_> = tree
+            .entries
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.is_directory, entry.is_other))
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                (".env", false, false),
+                ("broken", false, true),
+                ("dir", true, false),
+                ("inside", true, false),
+                ("outside", true, false),
+            ]
+        );
+        let inside = list_tree_level(root, "inside", 2).unwrap();
+        assert_eq!(inside.entries[0].path, "inside/child.txt");
+        assert!(list_tree_level(root, "outside", 3).is_err());
+
+        let mention = list_files(root, "", 4).unwrap();
+        assert!(mention.entries.iter().all(|entry| entry.name != ".env"));
     }
 
     #[test]

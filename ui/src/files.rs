@@ -2,12 +2,85 @@
 
 use std::ops::Range;
 
-#[cfg(target_arch = "wasm32")]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct WorkspaceFile {
     pub(crate) name: String,
     pub(crate) path: String,
     pub(crate) is_directory: bool,
+    #[cfg(target_family = "wasm")]
+    #[serde(default)]
+    pub(crate) is_other: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct FileListing {
+    pub(crate) directory: String,
+    pub(crate) entries: Vec<WorkspaceFile>,
+    pub(crate) error: Option<String>,
+    pub(crate) truncated: bool,
+    request: Option<u64>,
+    loaded: bool,
+}
+
+impl FileListing {
+    pub(crate) fn loading(&self) -> bool {
+        self.request.is_some()
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub(crate) fn loaded(&self) -> bool {
+        self.loaded
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub(crate) fn cancel(&mut self) {
+        self.request = None;
+    }
+
+    pub(crate) fn start(&mut self, directory: String, request: u64) {
+        if directory != self.directory {
+            self.entries.clear();
+            self.truncated = false;
+            self.loaded = false;
+        }
+        self.directory = directory;
+        self.request = Some(request);
+        self.error = None;
+    }
+
+    pub(crate) fn finish(
+        &mut self,
+        request: u64,
+        reply: Result<serde_json::Value, String>,
+    ) -> bool {
+        if self.request != Some(request) {
+            return false;
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Reply {
+            request_id: u64,
+            directory: String,
+            entries: Vec<WorkspaceFile>,
+            truncated: bool,
+        }
+
+        self.request = None;
+        match reply.and_then(|reply| {
+            serde_json::from_value::<Reply>(reply).map_err(|error| error.to_string())
+        }) {
+            Ok(reply) if reply.request_id == request => {
+                self.directory = reply.directory;
+                self.entries = reply.entries;
+                self.truncated = reply.truncated;
+                self.loaded = true;
+            }
+            Ok(_) => self.error = Some("文件列表请求编号不匹配".into()),
+            Err(error) => self.error = Some(error),
+        }
+        true
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -103,6 +176,30 @@ pub(crate) fn replace_token(text: &str, token: &FileToken, mention: &str) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn late_file_failures_and_successes_cannot_replace_a_newer_directory() {
+        let mut listing = FileListing::default();
+        listing.start("old".into(), 1);
+        listing.start("new".into(), 2);
+        assert!(!listing.finish(1, Err("old request failed".into())));
+        assert!(listing.loading());
+        assert!(listing.error.is_none());
+        assert!(!listing.finish(
+            1,
+            Ok(serde_json::json!({"requestId": 1, "directory": "old"}))
+        ));
+        assert!(listing.finish(
+            2,
+            Ok(serde_json::json!({
+                "requestId": 2, "directory": "new", "truncated": false,
+                "entries": [{"name": "note.txt", "path": "new/note.txt", "isDirectory": false}],
+            }))
+        ));
+        assert!(!listing.loading());
+        assert_eq!(listing.directory, "new");
+        assert_eq!(listing.entries[0].path, "new/note.txt");
+    }
 
     #[test]
     fn detects_only_live_reference_tokens() {

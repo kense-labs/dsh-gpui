@@ -9,6 +9,11 @@ body {
   font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
+html[data-native-mac-material],
+html[data-native-mac-material] body {
+  background: transparent;
+}
+
 canvas {
   display: block;
   outline: none;

@@ -14,3 +14,6 @@ debug = "limited"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[patch.crates-io]
+gpui-pre-wgpu = { path = "vendor/gpui-pre-wgpu" }

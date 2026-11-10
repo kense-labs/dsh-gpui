@@ -22,51 +22,16 @@ pub fn validate_api_key(value: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Only an authorized DeepSeek account may unlock the workspace.
-pub fn account_signed_in(auth: Option<&Value>) -> bool {
-    auth.is_some_and(|status| {
-        status.pointer("/account/status").and_then(Value::as_str) == Some("credential-stored")
-            || status
-                .pointer("/account/attempt/phase")
-                .and_then(Value::as_str)
-                == Some("succeeded")
-    })
-}
-
-/// Reject a delayed response that would move one sign-in attempt backwards.
-pub fn is_stale_account(current: &Value, incoming: &Value) -> bool {
-    let phase_rank = |value: &Value| match value.get("phase").and_then(Value::as_str) {
-        Some("initializing") => 0,
-        Some("waiting-browser") => 1,
-        Some("exchanging") => 2,
-        Some("committing") => 3,
-        Some("cancelled" | "expired" | "failed") => 4,
-        Some("succeeded") => 5,
-        _ => -1,
-    };
-    let current_attempt = current.get("attempt");
-    let incoming_attempt = incoming.get("attempt");
-    let same_attempt = current_attempt
-        .and_then(|attempt| attempt.get("id"))
-        .and_then(Value::as_str)
-        .is_some_and(|id| {
-            incoming_attempt
-                .and_then(|attempt| attempt.get("id"))
-                .and_then(Value::as_str)
-                == Some(id)
-        });
-    same_attempt
-        && incoming_attempt
-            .is_some_and(|attempt| phase_rank(attempt) < current_attempt.map_or(-1, phase_rank))
-}
-
-/// Visual role for one conversation row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EntryRole {
     User,
     Assistant,
     Thought,
     Tool,
+    QuestionReply,
+    Plan,
+    /// 官方 ModelRetryItem：模型请求重试行。
+    Retry,
     System,
     Error,
 }
@@ -81,6 +46,9 @@ pub struct ChatEntry {
     pub text: String,
     pub input: String,
     pub status: String,
+    pub(crate) tool: Option<crate::tool_calls::ToolCall>,
+    /// Wall-clock epoch milliseconds when the row appeared (user hover time).
+    pub at_ms: Option<f64>,
 }
 
 impl ChatEntry {
@@ -93,7 +61,20 @@ impl ChatEntry {
             text: text.into(),
             input: String::new(),
             status: String::new(),
+            tool: None,
+            at_ms: None,
         }
+    }
+
+    pub(crate) fn submitted_plan(plan: crate::submitted_plan::SubmittedPlan) -> Self {
+        let mut entry = Self::local(
+            EntryRole::Plan,
+            format!("plan-{}", plan.call_id),
+            plan.document.markdown,
+        );
+        entry.external_id = Some(plan.call_id);
+        entry.title = plan.document.title;
+        entry
     }
 }
 
@@ -102,6 +83,10 @@ impl ChatEntry {
 pub struct UpdateEffect {
     pub usage: Option<(u64, u64)>,
     pub config_options: Option<Vec<Value>>,
+    /// Host extension: durable turn/end for autonomous goal rounds.
+    pub turn_ended: Option<String>,
+    /// Host extension: a waking turn-trigger was projected.
+    pub turn_triggered: bool,
 }
 
 /// Merge one committed ACP update without duplicating same-message content blocks.
@@ -114,17 +99,45 @@ pub fn apply_update(entries: &mut Vec<ChatEntry>, update: &Value) -> UpdateEffec
         Some("agent_thought_chunk") => {
             merge_content(entries, update, EntryRole::Thought);
         }
+        Some("gpui_question_record" | "gpui_ptc_dispatch") => {
+            let event = &update["event"];
+            if matches!(
+                event["type"].as_str(),
+                Some("tool/ptc-dispatch" | "tool/ptc-dispatch-start")
+            ) {
+                crate::tool_calls::apply_dispatch(entries, event);
+            } else {
+                crate::questions::apply_question_call_event(entries, event);
+            }
+            if let Some(entry) =
+                crate::questions::reply_entry(event, event.get("questionArguments"))
+                && !entries.iter().any(|existing| existing.key == entry.key)
+            {
+                entries.push(entry);
+            }
+        }
         Some("tool_call") => {
             let id = string_field(update, "toolCallId");
+            if id.is_empty() {
+                return effect;
+            }
             let title = string_field(update, "title");
+            let tool = Some(crate::tool_calls::ToolCall::root(title.clone()));
             let input = update.get("rawInput").map(pretty_value).unwrap_or_default();
             let status = string_field(update, "status");
+            let at_ms = update.get("time").and_then(Value::as_f64);
             if let Some(entry) = entries.iter_mut().find(|entry| {
-                entry.role == EntryRole::Tool && entry.external_id.as_deref() == Some(id.as_str())
+                entry.role == EntryRole::Tool
+                    && !entry.is_subcall()
+                    && entry.external_id.as_deref() == Some(id.as_str())
             }) {
                 entry.title = title;
+                entry.tool = tool;
                 entry.input = input;
-                entry.status = status;
+                entry.at_ms = at_ms.or(entry.at_ms);
+                if entry.is_running_tool() {
+                    entry.status = status;
+                }
             } else {
                 entries.push(ChatEntry {
                     key: format!("tool-{id}"),
@@ -134,6 +147,8 @@ pub fn apply_update(entries: &mut Vec<ChatEntry>, update: &Value) -> UpdateEffec
                     text: String::new(),
                     input,
                     status,
+                    tool,
+                    at_ms,
                 });
             }
         }
@@ -153,10 +168,18 @@ pub fn apply_update(entries: &mut Vec<ChatEntry>, update: &Value) -> UpdateEffec
                 })
                 .unwrap_or_default();
             if let Some(entry) = entries.iter_mut().find(|entry| {
-                entry.role == EntryRole::Tool && entry.external_id.as_deref() == Some(id.as_str())
+                entry.role == EntryRole::Tool
+                    && !entry.is_subcall()
+                    && entry.external_id.as_deref() == Some(id.as_str())
             }) {
-                entry.text = output;
-                entry.status = string_field(update, "status");
+                if update.get("content").is_some() {
+                    entry.text = output;
+                }
+                if !matches!(entry.status.as_str(), "ASK_CANCELLED" | "ASK_ABORTED")
+                    && let Some(status) = update["status"].as_str()
+                {
+                    entry.status = status.to_owned();
+                }
                 if let Some(title) = update.get("title").and_then(Value::as_str) {
                     entry.title = title.to_string();
                 }
@@ -167,11 +190,146 @@ pub fn apply_update(entries: &mut Vec<ChatEntry>, update: &Value) -> UpdateEffec
             let size = update.get("size").and_then(Value::as_u64).unwrap_or(0);
             effect.usage = Some((used, size));
         }
+        // Host/ACP 扩展：非人类 waking 消息 → 官方 TurnTrigger 卡。
+        Some("turn_trigger") => {
+            let id = update
+                .get("messageId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("trigger-{}", entries.len()));
+            let source = update
+                .get("sourceKind")
+                .and_then(Value::as_str)
+                .unwrap_or("goal");
+            if matches!(
+                source,
+                "runtime-context" | "compact-checkpoint" | "user-question-reply"
+            ) {
+                return effect;
+            }
+            let raw = update
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let (title, text) = if source == "goal" || raw.contains("<goal_round>") {
+                let objective = raw
+                    .split("Objective:")
+                    .nth(1)
+                    .map(|rest| {
+                        rest.trim()
+                            .trim_start_matches('"')
+                            .lines()
+                            .next()
+                            .unwrap_or(rest)
+                            .trim()
+                            .trim_matches('"')
+                            .trim_end_matches('\\')
+                            .to_string()
+                    })
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| raw.clone());
+                ("goal".to_string(), objective)
+            } else {
+                (format!("trigger:{source}"), raw)
+            };
+            if text.trim().is_empty() {
+                return effect;
+            }
+            effect.turn_triggered = true;
+            if let Some(entry) = entries.iter_mut().find(|entry| {
+                entry.role == EntryRole::User && entry.external_id.as_deref() == Some(id.as_str())
+            }) {
+                entry.title = title;
+                entry.text = text;
+            } else {
+                entries.push(ChatEntry {
+                    key: format!("trigger-{id}"),
+                    external_id: Some(id),
+                    role: EntryRole::User,
+                    title,
+                    text,
+                    input: String::new(),
+                    status: String::new(),
+                    tool: None,
+                    at_ms: update.get("time").and_then(Value::as_f64),
+                });
+            }
+        }
+        // Host/ACP 扩展：模型重试行（官方 ModelRetryItem）。
+        Some("model_retry") => {
+            let id = update
+                .get("retryId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("retry-{}", entries.len()));
+            let title = update
+                .get("statusLabel")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    let retry = update.get("retry").and_then(Value::as_u64).unwrap_or(1);
+                    let maximum = update
+                        .get("maximum")
+                        .map(|value| match value {
+                            Value::String(text) => text.clone(),
+                            Value::Number(number) => number.to_string(),
+                            _ => "∞".to_string(),
+                        })
+                        .unwrap_or_else(|| "5".to_string());
+                    format!("{retry}/{maximum}")
+                });
+            let status = string_field(update, "retryState");
+            let seconds = update
+                .get("delaySeconds")
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    update
+                        .get("delayMs")
+                        .and_then(Value::as_u64)
+                        .map(|ms| (ms + 999) / 1000)
+                })
+                .unwrap_or(1);
+            let text = update
+                .get("failure")
+                .and_then(|failure| failure.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if let Some(entry) = entries.iter_mut().find(|entry| {
+                entry.role == EntryRole::Retry && entry.external_id.as_deref() == Some(id.as_str())
+            }) {
+                entry.title = title;
+                entry.status = status;
+                entry.input = seconds.to_string();
+                entry.text = text;
+            } else {
+                entries.push(ChatEntry {
+                    key: format!("retry-{id}"),
+                    external_id: Some(id),
+                    role: EntryRole::Retry,
+                    title,
+                    text,
+                    input: seconds.to_string(),
+                    status,
+                    tool: None,
+                    at_ms: None,
+                });
+            }
+        }
         Some("config_option_update") => {
             effect.config_options = update
                 .get("configOptions")
                 .and_then(Value::as_array)
                 .cloned();
+        }
+        // Host/ACP 扩展：自主轮次边界（无 open prompt RPC 时也要收尾）。
+        Some("turn_end") => {
+            effect.turn_ended = update
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| Some("completed".to_string()));
         }
         _ => {}
     }
@@ -209,6 +367,8 @@ fn merge_content(entries: &mut Vec<ChatEntry>, update: &Value, role: EntryRole) 
             text,
             input: String::new(),
             status: String::new(),
+            tool: None,
+            at_ms: None,
         });
     }
 }
@@ -258,6 +418,9 @@ fn role_name(role: EntryRole) -> &'static str {
         EntryRole::Assistant => "assistant",
         EntryRole::Thought => "thought",
         EntryRole::Tool => "tool",
+        EntryRole::QuestionReply => "question-reply",
+        EntryRole::Plan => "plan",
+        EntryRole::Retry => "retry",
         EntryRole::System => "system",
         EntryRole::Error => "error",
     }
@@ -265,29 +428,8 @@ fn role_name(role: EntryRole) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{EntryRole, account_signed_in, apply_update, is_stale_account, validate_api_key};
+    use super::{EntryRole, apply_update, validate_api_key};
     use serde_json::json;
-
-    #[test]
-    fn api_key_alone_does_not_unlock_workspace() {
-        let auth = json!({
-            "account": {"status": "signed-out"},
-            "apiKey": {"configured": true}
-        });
-        assert!(!account_signed_in(Some(&auth)));
-    }
-
-    #[test]
-    fn stored_credential_unlocks_workspace() {
-        let auth = json!({"account": {"status": "credential-stored"}});
-        assert!(account_signed_in(Some(&auth)));
-    }
-
-    #[test]
-    fn successful_attempt_unlocks_workspace() {
-        let auth = json!({"account": {"attempt": {"phase": "succeeded"}}});
-        assert!(account_signed_in(Some(&auth)));
-    }
 
     #[test]
     fn api_key_validation_accepts_keys_and_rejects_assignments_and_quotes() {
@@ -301,21 +443,55 @@ mod tests {
     }
 
     #[test]
-    fn delayed_responses_cannot_reverse_one_sign_in_attempt() {
-        let initializing = json!({"attempt": {"id": "attempt-1", "phase": "initializing"}});
-        let waiting = json!({"attempt": {"id": "attempt-1", "phase": "waiting-browser"}});
-        let succeeded = json!({"attempt": {"id": "attempt-1", "phase": "succeeded"}});
-        assert!(!is_stale_account(&initializing, &waiting));
-        assert!(!is_stale_account(&waiting, &succeeded));
-        assert!(is_stale_account(&waiting, &initializing));
-        assert!(is_stale_account(&succeeded, &initializing));
+    fn turn_trigger_projects_goal_objective() {
+        let mut entries = Vec::new();
+        let effect = apply_update(
+            &mut entries,
+            &json!({
+                "sessionUpdate": "turn_trigger",
+                "messageId": "g1",
+                "sourceKind": "goal",
+                "content": "<goal_round>\nObjective: \"Fix the bug\"\nRound: 1/20\n\nContinue...</goal_round>",
+                "time": 1_700_000_000_000f64
+            }),
+        );
+        assert!(effect.turn_triggered);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "goal");
+        assert_eq!(entries[0].text, "Fix the bug");
+        assert_eq!(entries[0].role, EntryRole::User);
     }
 
     #[test]
-    fn a_new_sign_in_attempt_is_not_stale() {
-        let previous = json!({"attempt": {"id": "attempt-1", "phase": "succeeded"}});
-        let next = json!({"attempt": {"id": "attempt-2", "phase": "initializing"}});
-        assert!(!is_stale_account(&previous, &next));
+    fn internal_context_and_durable_question_replies_do_not_start_turns() {
+        let mut entries = Vec::new();
+        for source in [
+            "runtime-context",
+            "compact-checkpoint",
+            "user-question-reply",
+        ] {
+            let effect = apply_update(
+                &mut entries,
+                &json!({
+                    "sessionUpdate": "turn_trigger",
+                    "sourceKind": source,
+                    "content": "This is not a waking message."
+                }),
+            );
+            assert!(!effect.turn_triggered);
+        }
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn turn_end_marks_effect() {
+        let mut entries = Vec::new();
+        let effect = apply_update(
+            &mut entries,
+            &json!({"sessionUpdate": "turn_end", "turn": 3, "reason": "completed"}),
+        );
+        assert_eq!(effect.turn_ended.as_deref(), Some("completed"));
+        assert!(entries.is_empty());
     }
 
     #[test]
@@ -377,5 +553,44 @@ mod tests {
             &json!({"sessionUpdate": "config_option_update", "configOptions": [{"id": "model"}]}),
         );
         assert_eq!(config.config_options.map(|options| options.len()), Some(1));
+    }
+
+    #[test]
+    fn model_retry_updates_upsert_retry_rows() {
+        let mut entries = Vec::new();
+        apply_update(
+            &mut entries,
+            &json!({
+                "sessionUpdate": "model_retry",
+                "retryId": "r1",
+                "retry": 1,
+                "maximum": 5,
+                "retryState": "started",
+                "delayMs": 1000,
+                "failure": {"message": "timeout"}
+            }),
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].role, EntryRole::Retry);
+        assert_eq!(entries[0].title, "1/5");
+        assert_eq!(entries[0].status, "started");
+        assert_eq!(entries[0].input, "1");
+        assert_eq!(entries[0].text, "timeout");
+        apply_update(
+            &mut entries,
+            &json!({
+                "sessionUpdate": "model_retry",
+                "retryId": "r1",
+                "retry": 2,
+                "maximum": 5,
+                "retryState": "active",
+                "delaySeconds": 3,
+                "failure": {"message": "timeout"}
+            }),
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "2/5");
+        assert_eq!(entries[0].status, "active");
+        assert_eq!(entries[0].input, "3");
     }
 }

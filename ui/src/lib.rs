@@ -1,11 +1,33 @@
-//! KUI/GPUI frontend for the DeepSeek Harness ACP desktop client.
+//! KUI/GPUI frontend for KWork.
 
+#[cfg(any(target_family = "wasm", test))]
+pub mod anim;
+#[cfg(any(target_family = "wasm", test))]
+mod commands;
 #[cfg(any(target_family = "wasm", test))]
 mod files;
+pub mod history;
+#[cfg(any(target_family = "wasm", test))]
+mod markdown;
+pub mod process;
+mod questions;
+#[cfg(any(target_family = "wasm", test))]
+mod right_dock;
 #[cfg(any(target_family = "wasm", test))]
 mod sessions;
+#[cfg(any(target_family = "wasm", test))]
+mod shortcuts;
 pub mod state;
+#[path = "../../shared/submitted_plan.rs"]
+mod submitted_plan;
+#[cfg(any(target_family = "wasm", test))]
+mod terminal_keys;
+#[cfg(any(target_family = "wasm", test))]
+pub mod tokens;
+mod tool_calls;
 
+#[cfg(target_family = "wasm")]
+mod brand;
 #[cfg(target_family = "wasm")]
 mod bridge;
 #[cfg(target_family = "wasm")]

@@ -11,6 +11,26 @@ pub struct WorkspacePreferences {
     pub aliases: HashMap<String, String>,
     pub hidden: Vec<String>,
     pub collapsed: Vec<String>,
+    pub sidebar_collapsed: Option<bool>,
+    pub sidebar_width: Option<f32>,
+    pub group_by: Option<String>,
+    pub order_by: Option<String>,
+    pub archived_filter: Option<String>,
+    /// 置顶的会话 ID（排序时置顶组内最前）。
+    pub pinned: Vec<String>,
+    /// Legacy session aliases from builds that saved renames in sidebar preferences.
+    pub session_titles: HashMap<String, String>,
+    /// 已归档的会话 ID。
+    pub archived: Vec<String>,
+    /// 外观：dark / light。
+    pub theme_mode: Option<String>,
+    /// 正文字号步进（官方 --dsh-content-font-delta，约 -2..=4）。
+    pub content_font_delta: Option<i32>,
+    /// 工作详情折叠：compact / standard / detailed / verbose。
+    pub work_details: Option<String>,
+    pub collapse_timing: Option<String>,
+    pub folded_replies: Option<String>,
+    pub workspace_open_with: Option<String>,
 }
 
 #[tauri::command]
@@ -32,6 +52,36 @@ pub async fn save_workspace_preferences(
         .map_err(|error| format!("保存工作区显示设置失败：{error}"))?
 }
 
+#[tauri::command]
+pub async fn load_developer_tools(webview: tauri::Webview) -> Result<bool, String> {
+    let path = developer_tools_path(&webview)?;
+    tokio::task::spawn_blocking(move || match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| error.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.to_string()),
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn save_developer_tools(webview: tauri::Webview, enabled: bool) -> Result<bool, String> {
+    let path = developer_tools_path(&webview)?;
+    tokio::task::spawn_blocking(move || {
+        write_preferences(&path, &enabled)?;
+        Ok(enabled)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn developer_tools_path(webview: &tauri::Webview) -> Result<PathBuf, String> {
+    if webview.label() != "main" {
+        return Err("只有主界面可以访问代码工作视图设置。".into());
+    }
+    Ok(preferences_path(webview.app_handle())?.with_file_name("developer-tools.json"))
+}
+
 fn preferences_path(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_config_dir()
@@ -50,7 +100,7 @@ fn read_preferences(path: &PathBuf) -> Result<WorkspacePreferences, String> {
     }
 }
 
-fn write_preferences(path: &PathBuf, preferences: &WorkspacePreferences) -> Result<(), String> {
+fn write_preferences(path: &PathBuf, preferences: &impl Serialize) -> Result<(), String> {
     let directory = path.parent().ok_or("工作区显示设置路径无效")?;
     std::fs::create_dir_all(directory).map_err(|error| format!("无法创建设置目录：{error}"))?;
     let temporary = path.with_extension("json.tmp");

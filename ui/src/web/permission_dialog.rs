@@ -4,9 +4,15 @@ use super::workspace::{composer_bg, conversation_bg};
 use super::*;
 
 impl DshApp {
-    pub(super) fn close_full_access_confirmation(&mut self) {
-        self.confirm_full_access = false;
+    pub(super) fn close_permission_confirmation(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        self.confirm_permission = None;
         self.full_access_acknowledged = false;
+        if self.composer_menu == Some(ComposerMenu::PermissionChoices) {
+            self.focus_command_picker(w, cx);
+        } else {
+            self.permission_menu.trigger.focus(w, cx);
+        }
+        cx.notify();
     }
 
     pub(super) fn render_full_access_dialog(
@@ -14,9 +20,26 @@ impl DshApp {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let p = Paint::get(cx);
+        let p = dsh(cx);
         let width = (f32::from(w.viewport_size().width) - 48.).clamp(0., 440.);
         let acknowledged = self.full_access_acknowledged;
+        let (title, description, acknowledgement, action) = if self.confirm_permission.as_deref()
+            == Some("auto")
+        {
+            (
+                "确认启用自动审查（实验）？",
+                "自动审查不使用沙箱。每次原生工具调用和 PTC 内层调用前，都会由与当前 agent 相同的模型进行审查；审查拒绝的调用由你批准或拒绝。此功能仍属实验性，可能误放行或误拒绝，并会消耗额外 token。",
+                "我已了解这些风险，并愿意继续",
+                "启用自动审查",
+            )
+        } else {
+            (
+                "确认启用完全权限？",
+                "启用完全权限后，智能体将减少确认步骤，并且可以直接执行更多操作，包括敏感操作、文件修改或外部命令。仅建议在你信任当前任务时使用。",
+                "我已了解风险，并愿意继续",
+                "启用完全权限",
+            )
+        };
         div()
             .id("full-access-dialog")
             .absolute()
@@ -24,12 +47,9 @@ impl DshApp {
             .flex()
             .items_center()
             .justify_center()
-            .bg(gpui::rgba(0x00000066))
+            .bg(p.bg_mask_1)
             .occlude()
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.close_full_access_confirmation();
-                cx.notify();
-            }))
+            .on_click(cx.listener(|this, _, w, cx| this.close_permission_confirmation(w, cx)))
             .child(
                 column()
                     .id("full-access-dialog-panel")
@@ -37,20 +57,16 @@ impl DshApp {
                     .pb(px(24.))
                     .rounded(px(28.))
                     .bg(composer_bg(cx))
-                    .shadow_lg()
+                    .shadow(elevation_prominent())
                     .occlude()
-                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation()
-                    })
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|_, _, _, cx| cx.stop_propagation()))
                     .child(dialog_header(
-                        "确认启用完全权限？",
+                        title,
                         "close-full-access-dialog",
+                        None,
                         cx,
-                        |this, cx| {
-                            this.close_full_access_confirmation();
-                            cx.notify();
-                        },
+                        |this, w, cx| this.close_permission_confirmation(w, cx),
                     ))
                     .child(
                         column()
@@ -61,13 +77,11 @@ impl DshApp {
                                     .w_full()
                                     .items_start()
                                     .gap(px(10.))
-                                    .child(
-                                        div().pt(px(2.)).flex_none().child(icon(
-                                            Glyph::Alert,
-                                            16.,
-                                            p.danger,
-                                        )),
-                                    )
+                                    .child(div().pt(px(2.)).flex_none().child(icon(
+                                        Glyph::Alert,
+                                        16.,
+                                        p.danger,
+                                    )))
                                     .child(
                                         div()
                                             .flex_1()
@@ -75,14 +89,14 @@ impl DshApp {
                                             .text_size(px(14.))
                                             .line_height(px(22.))
                                             .text_color(p.secondary)
-                                            .child("启用完全权限后，智能体将减少确认步骤，并且可以直接执行更多操作，包括敏感操作、文件修改或外部命令。仅建议在你信任当前任务时使用。"),
+                                            .child(description),
                                     ),
                             )
                             .child(
                                 row()
                                     .id("full-access-acknowledgement")
                                     .role(gpui::Role::CheckBox)
-                                    .aria_label("我已了解风险，并愿意继续")
+                                    .aria_label(acknowledgement)
                                     .aria_selected(acknowledged)
                                     .tab_index(0)
                                     .w_full()
@@ -120,7 +134,7 @@ impl DshApp {
                                             .text_size(px(14.))
                                             .line_height(px(20.))
                                             .text_color(p.secondary)
-                                            .child("我已了解风险，并愿意继续"),
+                                            .child(acknowledgement),
                                     )
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.full_access_acknowledged =
@@ -143,25 +157,22 @@ impl DshApp {
                                 false,
                                 72.,
                                 cx,
-                                |this, _, cx| {
-                                    this.close_full_access_confirmation();
-                                    cx.notify();
-                                },
+                                |this, w, cx| this.close_permission_confirmation(w, cx),
                             ))
                             .child(dialog_action(
                                 "confirm-full-access",
-                                "启用完全权限",
+                                action,
                                 true,
                                 !acknowledged,
                                 136.,
                                 cx,
-                                |this, _, cx| {
-                                    this.close_full_access_confirmation();
-                                    this.error = Some(
-                                        "当前 ACP 服务暂未提供权限模式切换，已保持“工作区内修改”。"
-                                            .to_string(),
-                                    );
-                                    cx.notify();
+                                |this, w, cx| {
+                                    if this.full_access_acknowledged
+                                        && let Some(preset) = this.confirm_permission.take()
+                                    {
+                                        this.close_permission_confirmation(w, cx);
+                                        this.apply_permission(preset, true);
+                                    }
                                 },
                             )),
                     ),
@@ -172,10 +183,11 @@ impl DshApp {
 pub(super) fn dialog_header(
     title: &'static str,
     id: &'static str,
+    focus: Option<&gpui::FocusHandle>,
     cx: &mut Context<DshApp>,
-    action: impl Fn(&mut DshApp, &mut Context<DshApp>) + 'static,
+    action: impl Fn(&mut DshApp, &mut Window, &mut Context<DshApp>) + 'static,
 ) -> gpui::Div {
-    let p = Paint::get(cx);
+    let p = dsh(cx);
     row()
         .w_full()
         .pl(px(24.))
@@ -195,11 +207,12 @@ pub(super) fn dialog_header(
                 .text_color(p.ink)
                 .child(title),
         )
-        .child(
+        .child(super::dock_action_button(
             div()
                 .id(id)
                 .role(gpui::Role::Button)
                 .aria_label("关闭")
+                .when_some(focus, |button, focus| button.track_focus(focus))
                 .tab_index(0)
                 .size(px(28.))
                 .flex_none()
@@ -209,9 +222,14 @@ pub(super) fn dialog_header(
                 .rounded(px(8.))
                 .cursor_pointer()
                 .hover(|style| style.bg(p.hover))
-                .child(icon(Glyph::Close, 14., p.secondary))
-                .on_click(cx.listener(move |this, _, _, cx| action(this, cx))),
-        )
+                .child(
+                    gpui::svg()
+                        .data(include_bytes!("../../assets/session-log-close.svg"))
+                        .size(px(14.))
+                        .text_color(p.label_secondary),
+                ),
+            cx.listener(move |this, _, w, cx| action(this, w, cx)),
+        ))
 }
 
 pub(super) fn dialog_action(
@@ -223,7 +241,7 @@ pub(super) fn dialog_action(
     cx: &mut Context<DshApp>,
     action: impl Fn(&mut DshApp, &mut Window, &mut Context<DshApp>) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
-    let p = Paint::get(cx);
+    let p = dsh(cx);
     let mut button = div()
         .id(id)
         .role(gpui::Role::Button)
@@ -242,26 +260,33 @@ pub(super) fn dialog_action(
         .border_color(if primary {
             gpui::transparent_black()
         } else {
-            p.line
+            p.border_l3
         })
         .text_size(px(14.))
         .line_height(px(22.))
-        .text_color(if primary { conversation_bg(cx) } else { p.ink });
+        .text_color(if primary {
+            p.label_primary_foreground
+        } else {
+            p.label_primary
+        })
+        .child(label);
     if primary {
-        button = button.bg(p.ink);
+        button = button.bg(p.button_primary_fill);
     }
     if disabled {
-        button.opacity(0.4).cursor_default()
-    } else {
         button
-            .cursor_pointer()
-            .hover(move |style| {
-                if primary {
-                    style.bg(p.ink.opacity(0.86))
+            .opacity(0.4)
+            .cursor(gpui::CursorStyle::OperationNotAllowed)
+    } else {
+        super::dock_action_button(
+            button.cursor_pointer().hover(move |style| {
+                style.bg(if primary {
+                    p.button_primary_hover
                 } else {
-                    style.bg(p.hover)
-                }
-            })
-            .on_click(cx.listener(move |this, _, w, cx| action(this, w, cx)))
+                    p.hover
+                })
+            }),
+            cx.listener(move |this, _, w, cx| action(this, w, cx)),
+        )
     }
 }

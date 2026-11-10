@@ -1,0 +1,33 @@
+<!doctype html>
+<meta charset="utf-8">
+<script>
+(() => {
+  const token = location.hash.slice(1);
+  if (parent === window || !token) return;
+
+  function receive(event) {
+    const { data } = event;
+    if (event.source !== parent || data?.type !== 'dsh-preview-content' || data.token !== token) return;
+    removeEventListener('message', receive);
+    let { html } = data;
+    if (data.assets.length) {
+      const parsed = new DOMParser().parseFromString(html, 'text/html');
+      for (const { kind, reference, text } of data.assets) {
+        const script = kind === 'script';
+        const url = URL.createObjectURL(new Blob([text], { type: script ? 'application/javascript' : 'text/css' }));
+        const attribute = script ? 'src' : 'href';
+        for (const element of parsed.querySelectorAll(script ? 'script[src]' : 'link[rel~="stylesheet" i][href]')) {
+          if (element.getAttribute(attribute) === reference) element.setAttribute(attribute, url);
+        }
+      }
+      html = '<!doctype html>' + parsed.documentElement.outerHTML;
+    }
+    document.open();
+    document.write(html);
+    document.close();
+  }
+
+  addEventListener('message', receive);
+  parent.postMessage({ type: 'dsh-preview-ready', token }, '*');
+})();
+</script>

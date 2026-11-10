@@ -9,7 +9,18 @@
     "build": "npm run ui:build && tauri build --no-bundle",
     "check": "cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace"
   },
+  "dependencies": {
+    "@shikijs/core": "4.4.3",
+    "@shikijs/engine-javascript": "4.4.3",
+    "@shikijs/langs": "4.4.3",
+    "@xterm/addon-serialize": "0.14.0",
+    "@xterm/headless": "6.0.0",
+    "dompurify": "3.4.16",
+    "harfbuzzjs": "1.6.4",
+    "yaml": "2.9.0"
+  },
   "devDependencies": {
-    "@tauri-apps/cli": "2.12.4"
+    "@tauri-apps/cli": "2.12.4",
+    "esbuild": "0.28.2"
   }
 }
