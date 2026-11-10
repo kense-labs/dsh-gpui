@@ -12,7 +12,7 @@ impl DshApp {
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let p = Paint::get(cx);
+        let p = dsh(cx);
         page_scroll("plugins-page", cx)
             .child(
                 row()
@@ -76,7 +76,7 @@ impl DshApp {
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let p = Paint::get(cx);
+        let p = dsh(cx);
         let mut filters = row().w_full().gap(px(8.)).mb(px(14.));
         for (index, label) in ["已开启", "已暂停", "已结束", "全部"]
             .into_iter()
@@ -179,12 +179,7 @@ impl DshApp {
         &mut self,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let p = Paint::get(cx);
-        let account = if self.welcome.read(cx).signed_in() {
-            "查看 DeepSeek 账户或配置自己的 API Key"
-        } else {
-            "登录 DeepSeek 或配置自己的 API Key"
-        };
+        let p = dsh(cx);
         let connection = if self.workspace.is_empty() {
             "选择工作区并配置 dsh-acp 服务路径".to_string()
         } else {
@@ -211,11 +206,11 @@ impl DshApp {
                         cx,
                     ))
                     .child(self.settings_link(
-                        "more-account",
-                        "账户与 API Key",
-                        account,
-                        Glyph::User,
-                        SettingsPage::Account,
+                        "more-api-key",
+                        "API Key",
+                        "配置本机 DeepSeek API Key",
+                        Glyph::Lock,
+                        SettingsPage::Credentials,
                         cx,
                     ))
                     .child(self.settings_link(
@@ -274,12 +269,12 @@ impl DshApp {
         primary: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let p = Paint::get(cx);
-        let enabled = self.connected() && !self.running && !self.creating_session;
+        let p = dsh(cx);
+        let enabled = self.connected() && !self.creating_session;
         let blue = if super::workspace::dark(cx) {
-            gpui::rgb(0x7aaaff)
+            p.button_info_fill
         } else {
-            gpui::rgb(0x4176e6)
+            p.button_info_hover
         };
         let button = row()
             .id(id)
@@ -293,12 +288,12 @@ impl DshApp {
             .gap(px(6.))
             .rounded(px(16.))
             .border(px(0.5))
-            .border_color(if primary { blue.into() } else { p.line })
-            .bg(if primary { blue.into() } else { p.panel })
+            .border_color(if primary { blue } else { p.line })
+            .bg(if primary { blue } else { p.panel })
             .text_size(px(13.))
             .line_height(px(20.))
             .text_color(if primary {
-                gpui::rgb(0x151517).into()
+                p.label_primary_foreground
             } else {
                 p.ink
             })
@@ -306,7 +301,7 @@ impl DshApp {
                 glyph,
                 13.,
                 if primary {
-                    gpui::rgb(0x151517).into()
+                    p.label_primary_foreground
                 } else {
                     p.secondary
                 },
@@ -339,7 +334,7 @@ impl DshApp {
         target: SettingsPage,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let p = Paint::get(cx);
+        let p = dsh(cx);
         row()
             .id(id)
             .role(gpui::Role::Button)
@@ -378,7 +373,7 @@ impl DshApp {
             .child(icon(Glyph::Arrow, 15., p.faint))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.settings_page = target;
-                this.show_account_menu = false;
+                this.show_more_menu = false;
                 this.show_settings = true;
                 cx.notify();
             }))
@@ -398,7 +393,7 @@ fn page_scroll(id: &'static str, cx: &App) -> gpui::Stateful<gpui::Div> {
         .pt(px(76.))
         .pb(px(48.))
         .gap_0()
-        .text_color(Paint::get(cx).ink)
+        .text_color(dsh(cx).ink)
 }
 
 fn page_title(title: &'static str) -> impl IntoElement {
@@ -424,7 +419,7 @@ fn capability_notice(
     glyph: Glyph,
     cx: &App,
 ) -> impl IntoElement {
-    let p = Paint::get(cx);
+    let p = dsh(cx);
     row()
         .w_full()
         .p(px(16.))

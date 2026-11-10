@@ -1,36 +1,55 @@
 //! GPUI application, WASM lifecycle, and Tauri event handling.
 
 use crate::{
+    anim,
+    anim::{FISH_SWIM, menu_in, modal_in, pending_dot},
     bridge,
+    commands::{CommandSpec, command_catalog, visible_commands},
     files::{
-        FileToken, WorkspaceFile, active_file_token, file_mention, replace_token, utf16_byte_index,
+        FileListing, FileToken, WorkspaceFile, active_file_token, file_mention, replace_token,
+        utf16_byte_index,
     },
-    sessions::{SessionSummary, merge_session_page, short_session_title},
+    markdown::{Block, InlinePart, code_spans, inline_parts, parse_markdown},
+    right_dock::{
+        DockFrame, DockPaneId, DockSlide, DockSurface, RightPanelTab, TerminalCheckpoint,
+    },
+    sessions::{
+        PendingInteraction, SessionActivity, SessionIndicator, SessionSummary, merge_session_page,
+        short_session_title,
+    },
     state::{ChatEntry, EntryRole, apply_update},
+    tokens::{dsh, elevation_prominent, elevation_soft},
     welcome::{Welcome, WelcomeEvent},
 };
 use gpui::{
-    App, AsyncApp, Context, FontWeight, ScrollHandle, Subscription, Window, WindowHandle,
-    WindowOptions, div, prelude::*, px,
+    AnimationExt, App, AsyncApp, Context, FontWeight, ScrollHandle, Subscription, Window,
+    WindowHandle, WindowOptions, div, prelude::*, px,
 };
 use kui::components::button::Button;
 use kui::components::select::Select;
 use kui::foundation::{Theme, ThemeMode};
 use kui::primitives::control::UiLanguage;
 use kui::primitives::editor::{EditEvent, Editor, EditorShortcutEvent, InputMode};
-use kui::primitives::family::Paint;
 use kui::primitives::glyph::{Glyph, icon};
 use kui::primitives::ops_surface::{column, editor, input, note, replace, row};
 use kui::primitives::picker::{PickerOption, SelectionChanged};
 use serde_json::{Value, json};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
 struct Host {
     app: AsyncApp,
     window: WindowHandle<DshApp>,
     _event_listener: Closure<dyn FnMut(String)>,
-    _key_listener: Closure<dyn FnMut(String) -> bool>,
+    _key_listener: Closure<dyn FnMut(String, String, u8, u8, bool, bool) -> bool>,
+    _file_listener: Closure<dyn FnMut(String)>,
+    _dock_cancel_listener: Closure<dyn FnMut()>,
+    _browser_selection_listener: Closure<dyn FnMut(String)>,
+    _html_focus_listener: Closure<dyn FnMut(String, u32)>,
+    _transparency_listener: Closure<dyn FnMut()>,
+    _motion_listener: Closure<dyn FnMut(bool)>,
 }
 
 thread_local! {
@@ -53,9 +72,20 @@ pub fn start() {
                 "../assets/KUIInputSans.ttf"
             ))])
             .expect("load the Chinese application font");
+        cx.text_system()
+            .add_fonts(vec![
+                std::borrow::Cow::Borrowed(include_bytes!("../assets/Montserrat-Light.ttf")),
+                std::borrow::Cow::Borrowed(include_bytes!("../assets/Montserrat-Regular.ttf")),
+                std::borrow::Cow::Borrowed(include_bytes!("../assets/Montserrat-Medium.ttf")),
+            ])
+            .expect("load the official Montserrat brand font");
         cx.set_global(UiLanguage::Chinese);
         kui::init(cx);
+        cx.set_reduce_motion(bridge::prefers_reduced_motion());
         Theme::global_mut(cx).set_mode(ThemeMode::Dark);
+        if bridge::has_mac_window_material() {
+            cx.set_text_rendering_mode(gpui::TextRenderingMode::Grayscale);
+        }
         let window = cx
             .open_window(
                 WindowOptions {
@@ -64,7 +94,7 @@ pub fn start() {
                 },
                 |w, cx| cx.new(|cx| DshApp::new(w, cx)),
             )
-            .expect("open the DeepSeek Harness GPUI window");
+            .expect("open the KWork GPUI window");
         let listener = Closure::<dyn FnMut(String)>::new(|payload: String| {
             if let Ok(event) = serde_json::from_str::<Value>(&payload) {
                 with_host(|host| {
@@ -76,26 +106,108 @@ pub fn start() {
                 });
             }
         });
-        let key_listener = Closure::<dyn FnMut(String) -> bool>::new(|key: String| {
+        let key_listener = Closure::<dyn FnMut(String, String, u8, u8, bool, bool) -> bool>::new(
+            |combo: String, code: String, modifiers, phase, repeat, composing| {
+                with_host(|host| {
+                    host.app.update(|cx| {
+                        host.window
+                            .update(cx, |app, w, cx| {
+                                app.handle_shortcut_input(
+                                    &combo, &code, modifiers, phase, repeat, composing, w, cx,
+                                )
+                            })
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false)
+            },
+        );
+        let file_listener = Closure::<dyn FnMut(String)>::new(|payload: String| {
             with_host(|host| {
                 host.app.update(|cx| {
-                    host.window
-                        .update(cx, |app, w, cx| app.handle_file_key(&key, w, cx))
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap_or(false)
+                    let _ = host.window.update(cx, |app, _, cx| {
+                        app.handle_file_event(&payload, cx);
+                    });
+                });
+            });
+        });
+        let dock_cancel_listener = Closure::<dyn FnMut()>::new(|| {
+            with_host(|host| {
+                host.app.update(|cx| {
+                    let _ = host.window.update(cx, |app, _, cx| {
+                        app.cancel_dock_tab_drag(cx);
+                        app.cancel_float_drag(cx);
+                        for tab in app.sidebar.documents.values() {
+                            tab.selection.cancel_drag();
+                        }
+                    });
+                });
+            });
+        });
+        let browser_selection_listener = Closure::<dyn FnMut(String)>::new(|prefix: String| {
+            with_host(|host| {
+                host.app.update(|cx| {
+                    let _ = host.window.update(cx, |app, w, cx| {
+                        app.advance_browser_selection(&prefix, w, cx);
+                    });
+                });
+            });
+        });
+        let html_focus_listener =
+            Closure::<dyn FnMut(String, u32)>::new(|key: String, revision| {
+                with_host(|host| {
+                    host.app.update(|cx| {
+                        let _ = host.window.update(cx, |app, w, cx| {
+                            app.html_preview_focus_changed(key.parse().ok(), revision, w, cx)
+                        });
+                    });
+                });
+            });
+        let transparency_listener = Closure::<dyn FnMut()>::new(|| {
+            with_host(|host| host.app.update(|cx| cx.refresh_windows()));
+        });
+        let motion_listener = Closure::<dyn FnMut(bool)>::new(|reduce| {
+            with_host(|host| host.app.update(|cx| cx.set_reduce_motion(reduce)));
         });
         HOST.set(Some(Host {
             app: cx.to_async(),
             window,
             _event_listener: listener,
             _key_listener: key_listener,
+            _file_listener: file_listener,
+            _dock_cancel_listener: dock_cancel_listener,
+            _browser_selection_listener: browser_selection_listener,
+            _html_focus_listener: html_focus_listener,
+            _transparency_listener: transparency_listener,
+            _motion_listener: motion_listener,
         }));
         with_host(|host| {
             bridge::listen_keys(host._key_listener.as_ref().unchecked_ref());
+            bridge::listen_files(host._file_listener.as_ref().unchecked_ref());
+            bridge::listen_dock_cancel(host._dock_cancel_listener.as_ref().unchecked_ref());
+            bridge::listen_browser_selection(
+                host._browser_selection_listener.as_ref().unchecked_ref(),
+            );
+            document_html::listen_focus(host._html_focus_listener.as_ref().unchecked_ref());
+            bridge::watch_reduced_motion(host._motion_listener.as_ref().unchecked_ref());
+            if bridge::has_mac_window_material() {
+                bridge::watch_transparency(host._transparency_listener.as_ref().unchecked_ref());
+            }
         });
         cx.activate(true);
+        if bridge::is_mac() {
+            wasm_bindgen_futures::spawn_local(async {
+                if let Some(bytes) = bridge::terminal_font().await {
+                    with_host(|host| {
+                        host.app.update(|cx| {
+                            if cx.text_system().add_fonts(vec![bytes.into()]).is_ok() {
+                                cx.refresh_windows();
+                            }
+                        });
+                    });
+                }
+            });
+        }
         wasm_bindgen_futures::spawn_local(async {
             let registered = with_host(|host| {
                 wasm_bindgen_futures::JsFuture::from(bridge::listen(
@@ -105,8 +217,14 @@ pub fn start() {
             if let Some(registered) = registered {
                 let _ = registered.await;
             }
+            invoke("browser_shell_generation", json!({}));
             invoke("start_auth", json!({}));
             invoke("load_workspace_preferences", json!({}));
+            invoke("load_shortcuts", json!({}));
+            if bridge::is_mac() {
+                invoke("workspace_applications", json!({}));
+            }
+            invoke("load_developer_tools", json!({}));
             invoke("start_service", json!({}));
         });
     });
@@ -117,12 +235,17 @@ fn with_host<R>(operation: impl FnOnce(&mut Host) -> R) -> Option<R> {
 }
 
 pub(crate) fn invoke(command: &'static str, args: Value) {
+    invoke_with_reply(command, command, args);
+}
+
+fn invoke_with_reply(command: &'static str, reply: &'static str, args: Value) {
+    let owner = args["sessionId"].as_str().map(str::to_owned);
     wasm_bindgen_futures::spawn_local(async move {
         let result = bridge::invoke(command, args).await;
         with_host(|host| {
             host.app.update(|cx| {
                 let _ = host.window.update(cx, |app, w, cx| {
-                    app.handle_reply(command, result, w, cx);
+                    app.handle_reply(reply, owner.as_deref(), result, w, cx);
                 });
             });
         });
@@ -166,11 +289,25 @@ pub(crate) enum WorkspaceArchivedFilter {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SettingsPage {
-    Account,
+    Credentials,
     General,
+    Appearance,
     Model,
+    Providers,
     Plugins,
     AgentPresets,
+    Shell,
+    AgentLoop,
+    WebSearch,
+    SessionLog,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkDetailsMode {
+    Compact,
+    Standard,
+    Detailed,
+    Verbose,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -179,20 +316,237 @@ pub(crate) enum ComposerMenu {
     ModelChoices,
     ReasoningChoices,
     Permission,
+    PermissionChoices,
+    CommandModels,
     Commands,
     Files,
 }
 
-#[derive(Clone)]
+impl ComposerMenu {
+    fn is_model(self) -> bool {
+        matches!(
+            self,
+            Self::Model | Self::ModelChoices | Self::ReasoningChoices
+        )
+    }
+
+    fn is_card_overlay(self) -> bool {
+        self.is_command_picker() || matches!(self, Self::Commands | Self::Files)
+    }
+
+    fn is_command_picker(self) -> bool {
+        matches!(self, Self::PermissionChoices | Self::CommandModels)
+    }
+}
+
+struct SidebarDrawerFocus {
+    scope: gpui::FocusHandle,
+    opener: gpui::FocusHandle,
+    close: gpui::FocusHandle,
+    more: gpui::FocusHandle,
+}
+
+impl SidebarDrawerFocus {
+    fn new(cx: &mut Context<DshApp>) -> Self {
+        Self {
+            scope: cx.focus_handle(),
+            opener: cx.focus_handle(),
+            close: cx.focus_handle(),
+            more: cx.focus_handle(),
+        }
+    }
+}
+
+type ComposerAnchor = Rc<Cell<Option<gpui::Bounds<gpui::Pixels>>>>;
+
+/// 官方 StatsPills DialogPill：Activity / Usage 点击展开详情。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatsDialog {
+    Activity,
+    Usage,
+}
+
 enum PendingAction {
-    New,
+    New {
+        cwd: String,
+        draft: Option<&'static str>,
+    },
     Resume(SessionSummary),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ForkOrigin {
+    Answer(u64),
+    Sidebar,
+    Shortcut,
+}
+
+struct SessionRename {
+    id: String,
+    restore_focus: Option<gpui::FocusHandle>,
+    close: gpui::FocusHandle,
+    cancel: gpui::FocusHandle,
+    confirm: gpui::FocusHandle,
+    pending: bool,
+    error: Option<String>,
+}
+
+/// One embedded PTY tab in the right dock.
+pub(crate) struct TerminalTab {
+    id: String,
+    title: Option<String>,
+    requested_shell: Option<String>,
+    connection: TerminalConnection,
+    sequence: u64,
+    pending: Vec<terminal::TerminalUpdate>,
+    screen: gpui::Entity<terminal::TerminalScreen>,
+}
+
+enum TerminalConnection {
+    Opening {
+        create: bool,
+        reading_shells: bool,
+    },
+    Connected,
+    Missing,
+    Exited {
+        code: Option<u32>,
+    },
+    Failed {
+        error: String,
+        retry_create: bool,
+        has_screen: bool,
+    },
+}
+
+impl TerminalTab {
+    fn apply_update(&mut self, update: terminal::TerminalUpdate, cx: &mut App) -> bool {
+        if update.sequence <= self.sequence {
+            return false;
+        }
+        self.sequence = update.sequence;
+        match update.operation {
+            terminal::TerminalOperation::Output { data } => {
+                self.screen.update(cx, |screen, cx| screen.feed(&data, cx));
+            }
+            terminal::TerminalOperation::Resize { cols, rows } => {
+                self.screen
+                    .update(cx, |screen, cx| screen.observe_grid(cols, rows, cx));
+            }
+            terminal::TerminalOperation::Exit { code } => self.end(code, cx),
+            terminal::TerminalOperation::Rename { title } => {
+                self.title = Some(title);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn end(&mut self, code: Option<u32>, cx: &mut App) {
+        self.connection = TerminalConnection::Exited { code };
+        self.screen.update(cx, |screen, cx| screen.unbind(cx));
+    }
+}
+
+#[derive(Default)]
+struct SessionSidebar {
+    surface: DockSurface,
+    persisted: DockSurface,
+    workspace: String,
+    file_trees: HashMap<DockPaneId, dock_files::DockFileTree>,
+    documents: HashMap<u64, dock_documents::DocumentTab>,
+    plans: HashMap<u64, plan::PlanPreview>,
+    tab_strips: HashMap<DockPaneId, dock_strip::DockStrip>,
+    terminals: HashMap<u64, TerminalTab>,
+    browsers: HashMap<u64, browser::BrowserTab>,
+}
+
+impl SessionSidebar {
+    fn persist(&mut self, session: &str) {
+        if self.surface != self.persisted
+            && let Ok(json) = serde_json::to_string(&self.surface)
+        {
+            bridge::write_sidebar(session, &json);
+            self.persisted = self.surface.clone();
+        }
+    }
+}
+
+/// Composer 草稿附件（对齐官方 attachment rail：64px 高卡片）。
+pub(crate) struct DraftAttachment {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) size: u64,
+    pub(crate) kind: AttachmentKind,
+    pub(crate) mime: String,
+    /// data URL 预览；图片发送时从此提取 ACP `image` block 的 base64。
+    pub(crate) preview: Option<String>,
+}
+
+/// 排队发送：展示文案 + 已组装的 ACP prompt blocks。
+#[derive(Clone)]
+pub(crate) struct QueuedPrompt {
+    pub(crate) display: String,
+    pub(crate) prompt: Vec<Value>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttachmentKind {
+    Image,
+    File,
 }
 
 pub(crate) struct PermissionRequest {
     pub(crate) request_id: Value,
     pub(crate) tool_call: Value,
     pub(crate) options: Vec<(String, String)>,
+}
+
+/// 官方轮次结束状态：分隔线文案由它决定。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnEnd {
+    Completed,
+    Stopped,
+    Failed,
+    MaxTokens,
+}
+
+impl TurnEnd {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            TurnEnd::Completed => "已完成",
+            TurnEnd::Stopped => "已停止",
+            TurnEnd::Failed => "处理失败",
+            TurnEnd::MaxTokens => "已达到输出 token 上限",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct TurnSummary {
+    pub(crate) end: TurnEnd,
+    pub(crate) seconds: f32,
+    /// 本轮新增的上下文消耗（token 数；usage 无数据时为 None）。
+    pub(crate) used: Option<u64>,
+}
+
+/// 把轮次时长格式化为官方风格的短文本。
+pub(crate) fn turn_duration_text(seconds: f32) -> String {
+    let total = seconds.round().max(0.) as u32;
+    if total < 60 {
+        format!("{total} 秒")
+    } else if total < 3600 {
+        format!("{} 分 {} 秒", total / 60, total % 60)
+    } else {
+        format!("{} 小时 {} 分", total / 3600, total % 3600 / 60)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct Toast {
+    pub(crate) message: String,
+    /// 创建时刻；3s 后开始 1s 淡出，4s 移除。
+    pub(crate) at: f64,
 }
 
 pub(crate) struct DshApp {
@@ -204,93 +558,232 @@ pub(crate) struct DshApp {
     pub(crate) error: Option<String>,
     pub(crate) sessions: Vec<SessionSummary>,
     pub(crate) active_session: Option<String>,
+    conversation: Conversation,
+    parked_conversations: HashMap<String, Conversation>,
+    session_activity: HashMap<String, SessionActivity>,
+    running_subagents: HashMap<String, String>,
+    opening_session_events: Vec<Value>,
     pub(crate) page: WorkspacePage,
-    requested_session_id: Option<String>,
     pending_action: Option<PendingAction>,
     pub(crate) creating_session: bool,
-    pub(crate) running: bool,
-    pub(crate) resumed_session: bool,
-    pub(crate) entries: Vec<ChatEntry>,
-    pub(crate) usage: Option<(u64, u64)>,
-    pub(crate) permission: Option<PermissionRequest>,
-    pub(crate) config_options: Vec<Value>,
+    fork_pending: Option<ForkOrigin>,
+    pub(crate) copied_mark: Option<String>,
+    message_feedback: message_feedback::MessageFeedback,
     pub(crate) model_select: Option<gpui::Entity<Select>>,
     pub(crate) reasoning_select: Option<gpui::Entity<Select>>,
     pub(crate) composer: gpui::Entity<Editor>,
     pub(crate) workspace_editor: gpui::Entity<Editor>,
     pub(crate) workspace_rename_editor: gpui::Entity<Editor>,
+    session_rename_editor: gpui::Entity<Editor>,
     pub(crate) service_editor: gpui::Entity<Editor>,
     pub(crate) search_editor: gpui::Entity<Editor>,
-    pub(crate) scroll: ScrollHandle,
+    pub(crate) sessions_scroll: ScrollHandle,
     pub(crate) search_expanded: bool,
     pub(crate) search_slide: kui::primitives::family::Slide,
-    pub(crate) expanded_entries: std::collections::HashSet<String>,
     pub(crate) sidebar_collapsed: bool,
+    sidebar_narrow: bool,
+    sidebar_drawer: bool,
+    sidebar_drawer_focus: SidebarDrawerFocus,
+    narrow_sidebar_expanded: bool,
     pub(crate) sidebar_width: f32,
     pub(crate) sidebar_dragging: bool,
-    pub(crate) sidebar_slide: kui::primitives::family::Slide,
+    pub(crate) sidebar_slide: Option<DockSlide>,
     pub(crate) brand_hover: kui::primitives::family::Slide,
-    pub(crate) show_account_menu: bool,
+    pub(crate) show_more_menu: bool,
     pub(crate) show_settings: bool,
     pub(crate) settings_page: SettingsPage,
+    transcript_preferences: transcript_preferences::TranscriptPreferences,
+    model_providers: model_providers::ProviderSettings,
+    runtime_settings: Option<runtime_settings::RuntimeSettings>,
+    shortcuts: shortcut_settings::ShortcutUi,
+    header_menu: Option<header_chrome::OpenHeaderMenu>,
+    exiting_header_menu: Option<header_chrome::ExitingHeaderMenu>,
+    header_menu_buttons: Rc<RefCell<Vec<gpui::Bounds<gpui::Pixels>>>>,
+    session_markdown: session_markdown::SessionMarkdownCopy,
+    session_downloads: session_download::SessionDownloads,
+    session_feedback: session_feedback::SessionFeedback,
+    workspace_applications: Vec<header_chrome::WorkspaceApplication>,
+    workspace_open_with: Option<String>,
+    workspace_open_pending: bool,
+    developer_tools: bool,
+    developer_tools_loading: bool,
+    developer_tools_saving: bool,
+    developer_tools_error: bool,
+    developer_tools_switched_at: Option<f64>,
+    pub(crate) content_font_delta: i32,
+    pub(crate) work_details: WorkDetailsMode,
+    pub(crate) collapse_next_input: bool,
+    pub(crate) keep_folded_replies: bool,
     pub(crate) show_workspace_menu: bool,
     pub(crate) show_workspace_view_options: bool,
     pub(crate) workspace_context_menu: Option<(String, f32)>,
     pub(crate) hovered_workspace: Option<String>,
+    hovered_session: Option<String>,
+    session_row_focus: HashMap<String, gpui::FocusHandle>,
+    session_row_more_focus: HashMap<String, gpui::FocusHandle>,
+    session_title_focus: gpui::FocusHandle,
     pub(crate) collapsed_workspaces: std::collections::HashSet<String>,
     pub(crate) hidden_workspaces: std::collections::HashSet<String>,
     pub(crate) workspace_aliases: std::collections::HashMap<String, String>,
     pub(crate) workspace_rename: Option<String>,
     pub(crate) workspace_delete: Option<String>,
-    pub(crate) confirm_full_access: bool,
+    session_rename: Option<SessionRename>,
+    pub(crate) pinned_sessions: std::collections::HashSet<String>,
+    legacy_session_titles: HashMap<String, String>,
+    session_title_seqs: HashMap<String, u64>,
+    pub(crate) archived_sessions: std::collections::HashSet<String>,
+    pub(crate) toasts: Vec<Toast>,
+    confirm_permission: Option<String>,
     pub(crate) full_access_acknowledged: bool,
+    pub(crate) stats_dialog: Option<StatsDialog>,
+    stats_dialog_bounds: ComposerAnchor,
     pub(crate) workspace_group_by: WorkspaceGroupBy,
     pub(crate) workspace_order_by: WorkspaceOrderBy,
     pub(crate) workspace_archived_filter: WorkspaceArchivedFilter,
-    pub(crate) show_start_panel: bool,
-    pub(crate) start_panel_expanded: bool,
+    sidebar: SessionSidebar,
+    parked_sidebars: HashMap<String, SessionSidebar>,
+    right_dock_slide: DockSlide,
+    right_dock_frame: DockFrame,
+    right_dock_viewport: Option<f32>,
+    right_dock_preferred_width: Option<f32>,
+    right_dock_drag: Option<start_panel::DockDrag>,
+    dock_tab_gesture: Option<dock_drag::DockTabGesture>,
+    dock_tab_menus: dock_tab_menu::DockTabMenus,
+    dock_controls: dock_controls::DockControls,
+    terminal_shell_menu: terminal_shell_menu::ShellMenuState,
+    terminal_title_edit: Option<terminal_title::TerminalTitleEdit>,
+    float_gesture: Option<floating_panes::FloatGesture>,
+    float_return: Option<floating_panes::FloatReturn>,
+    float_grips: HashMap<DockPaneId, floating_panes::FloatGrip>,
+    right_dock_focus: HashMap<DockPaneId, gpui::FocusHandle>,
+    pub(crate) drop_active: bool,
     pub(crate) composer_menu: Option<ComposerMenu>,
-    pub(crate) file_entries: Vec<WorkspaceFile>,
+    composer_card_bounds: ComposerAnchor,
+    mention_files: FileListing,
     pub(crate) file_token: Option<FileToken>,
-    pub(crate) file_directory: String,
     pub(crate) file_filter: String,
     pub(crate) file_selected: usize,
-    pub(crate) file_request_id: u64,
-    pub(crate) file_loading: bool,
-    pub(crate) file_error: Option<String>,
-    pub(crate) file_truncated: bool,
+    next_file_request: u64,
     pub(crate) file_show_crumbs: bool,
+    /// 右侧内嵌终端：多页签 Host PTY（对齐官方 sidebar-terminal tabs）。
+    next_terminal_tab: u64,
+    next_browser_key: u64,
+    browser_shell: Option<u64>,
+    browser_revision: u64,
+    browser_placements: Vec<browser::BrowserPlacement>,
+    pub(crate) command_filter: String,
+    pub(crate) command_from_slash: bool,
+    pub(crate) command_selected: usize,
+    pub(crate) model_filter_editor: gpui::Entity<Editor>,
+    model_menu: model_menu::ModelMenu,
+    permission_menu: permission_picker::PermissionMenu,
+    command_picker: command_picker::CommandPicker,
+    pub(crate) seeking_shimmer: gpui::Entity<kui::components::text_shimmer::TextShimmer>,
+    /// Official ChatGroupSeat live process title shimmer (`TextShimmer active={!closed}`).
+    pub(crate) process_shimmer: gpui::Entity<kui::components::text_shimmer::TextShimmer>,
+    pub(crate) last_escape: Option<f64>,
     suppress_file_trigger: bool,
     sessions_loading: bool,
+    /// ACP `session/list` pagination finished (or failed); local merge may finalize the sidebar.
+    sessions_acp_complete: bool,
     pub(crate) show_welcome: bool,
+    shell_presentation: Option<(bool, Option<bool>)>,
+    native_fullscreen: bool,
     pub(crate) welcome: gpui::Entity<Welcome>,
-    next_local_id: u64,
+    turn_ticker_running: bool,
     _composer_subscriptions: Vec<Subscription>,
     _workspace_rename_subscription: Subscription,
+    _session_rename_subscription: Subscription,
     _search_subscription: Subscription,
+    _model_filter_subscription: Subscription,
     _config_subscriptions: Vec<Subscription>,
     _welcome_subscription: Subscription,
 }
 
 impl DshApp {
+    fn shell_fullscreen(&self, w: &Window) -> bool {
+        self.native_fullscreen || w.is_fullscreen()
+    }
+
+    /// 侧栏是否处于 rail 态：手动折叠，或视口 < 1024 触发官方自动折叠。
+    pub(crate) fn rail_active(&self, w: &Window) -> bool {
+        if f32::from(w.viewport_size().width) < 1024. {
+            !self.narrow_sidebar_expanded
+        } else {
+            self.sidebar_collapsed
+        }
+    }
+
+    fn sidebar_track_width(&self, w: &Window) -> f32 {
+        if self.sidebar_drawer {
+            0.
+        } else if self.rail_active(w) {
+            workspace::collapsed_sidebar_width()
+        } else {
+            self.sidebar_width
+        }
+    }
+
+    fn sidebar_drawer_covers_window(&self) -> bool {
+        self.sidebar_drawer
+            && (self.narrow_sidebar_expanded
+                || self
+                    .sidebar_slide
+                    .as_ref()
+                    .is_some_and(|slide| slide.sample(bridge::monotonic_ms()).0 > 0.))
+    }
+
+    fn set_left_sidebar_collapsed(
+        &mut self,
+        collapsed: bool,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if f32::from(w.viewport_size().width) < 1024. {
+            self.narrow_sidebar_expanded = !collapsed;
+            if self.sidebar_drawer {
+                self.sidebar_dragging = false;
+                self.composer_menu = None;
+                self.header_menu = None;
+                self.exiting_header_menu = None;
+                if collapsed {
+                    self.show_more_menu = false;
+                    self.show_workspace_view_options = false;
+                    self.sidebar_drawer_focus.opener.focus(w, cx);
+                } else {
+                    self.sidebar_drawer_focus.close.focus(w, cx);
+                }
+            }
+        } else {
+            self.sidebar_collapsed = collapsed;
+            self.save_workspace_preferences(cx);
+        }
+        cx.notify();
+    }
+
     fn new(w: &mut Window, cx: &mut Context<Self>) -> Self {
+        document_fonts::prepare(cx);
+        // 启动即空会话 → 官方 hero placeholder；有 transcript 后由 render_composer 切换。
         let composer = editor(
-            "发消息或创建任务, / 调用指令, @ 文件或对话".into(),
+            "描述你想要构建的内容, / 调用指令, @ 文件或对话".into(),
             InputMode::InlineMulti,
             w,
             cx,
         );
         composer.update(cx, |editor, _| editor.set_command_submit(true));
         let submit = cx.subscribe_in(&composer, w, |this, _, _: &EditorShortcutEvent, w, cx| {
-            this.send_prompt(w, cx);
+            this.submit_prompt(w, cx);
         });
         let submit_plain = cx.subscribe_in(&composer, w, |this, _, event: &EditEvent, w, cx| {
             if *event == EditEvent::Submitted {
-                if this.composer_menu != Some(ComposerMenu::Files) {
-                    this.send_prompt(w, cx);
+                if this.composer_menu == Some(ComposerMenu::Commands) && this.command_from_slash {
+                    this.activate_first_command(w, cx);
+                } else if this.composer_menu != Some(ComposerMenu::Files) {
+                    this.submit_prompt(w, cx);
                 }
             } else if *event == EditEvent::Changed {
                 this.sync_file_trigger(w, cx);
+                this.sync_command_trigger(cx);
                 cx.notify();
             }
         });
@@ -304,17 +797,35 @@ impl DshApp {
         let workspace_rename_subscription = cx.subscribe_in(
             &workspace_rename_editor,
             w,
-            |this, _, event: &EditEvent, _, cx| match event {
+            |this, _, event: &EditEvent, w, cx| match event {
                 EditEvent::Submitted => {
                     this.confirm_workspace_rename(cx);
                     cx.notify();
                 }
                 EditEvent::Escape => {
-                    this.close_workspace_dialog();
+                    this.close_workspace_dialog(w, cx);
                     cx.notify();
                 }
                 EditEvent::Changed => cx.notify(),
                 _ => {}
+            },
+        );
+        let session_rename_editor = editor("会话名称".into(), InputMode::Single, w, cx);
+        let session_rename_subscription = cx.subscribe_in(
+            &session_rename_editor,
+            w,
+            |this, _, event: &EditEvent, w, cx| {
+                match event {
+                    EditEvent::Submitted => this.confirm_session_rename(cx),
+                    EditEvent::Escape => this.close_workspace_dialog(w, cx),
+                    EditEvent::Changed => {
+                        if let Some(rename) = &mut this.session_rename {
+                            rename.error = None;
+                        }
+                    }
+                    _ => {}
+                }
+                cx.notify();
             },
         );
         let service_editor = editor(
@@ -323,24 +834,65 @@ impl DshApp {
             w,
             cx,
         );
-        let search_editor = editor("搜索会话".into(), InputMode::Single, w, cx);
+        let search_editor = editor("搜索会话名称".into(), InputMode::Search, w, cx);
+        search_editor.update(cx, |input, _| {
+            input.font_size = 13.;
+            input.disabled = true;
+        });
         let search_subscription =
             cx.subscribe_in(&search_editor, w, |this, _, event: &EditEvent, w, cx| {
                 if *event == EditEvent::Escape {
-                    replace(&this.search_editor, "", w, cx);
-                    this.search_expanded = false;
+                    this.close_workspace_search(w, cx);
                 }
                 cx.notify();
             });
-        let welcome = cx.new(|cx| Welcome::new(w, cx));
-        let welcome_subscription = cx.subscribe(&welcome, |this, _, event: &WelcomeEvent, cx| {
-            match event {
-                WelcomeEvent::Changed => {
-                    this.show_welcome = !this.welcome.read(cx).signed_in();
+        let model_filter_editor = editor("搜索模型…".into(), InputMode::Single, w, cx);
+        model_filter_editor.update(cx, |input, _| input.font_size = 12.);
+        let model_filter_subscription = cx.subscribe_in(
+            &model_filter_editor,
+            w,
+            |this, _, event: &EditEvent, _, cx| {
+                if *event == EditEvent::Changed
+                    && this.composer_menu == Some(ComposerMenu::ModelChoices)
+                {
+                    let query = this.model_filter_editor.read(cx).value();
+                    if this.model_menu.query != query {
+                        this.model_menu.query = query.to_owned();
+                        this.model_menu.active = Some(0);
+                        this.model_menu.viewport.reset();
+                        cx.notify();
+                    }
                 }
-            }
-            cx.notify();
+            },
+        );
+        // 官方“深度求索中”标签：kui TextShimmer 1.5s 移动高光。
+        let seeking_shimmer = cx.new(|cx| {
+            kui::components::text_shimmer::TextShimmer::new("深度求索中···", cx)
+                .with_duration(std::time::Duration::from_millis(1500))
+                .with_font_size(12.)
         });
+        // Official process header title: same shimmer while the group is live.
+        let process_shimmer = cx.new(|cx| {
+            kui::components::text_shimmer::TextShimmer::new("正在分析请求", cx)
+                .with_duration(std::time::Duration::from_millis(1500))
+                .with_font_size(13.)
+        });
+        let welcome = cx.new(|cx| Welcome::new(w, cx));
+        let welcome_subscription =
+            cx.subscribe_in(&welcome, w, |this, _, event: &WelcomeEvent, w, cx| {
+                match event {
+                    WelcomeEvent::Changed => {
+                        let welcome = this.welcome.read(cx);
+                        this.show_welcome = welcome.should_show();
+                        this.sync_shell_window(cx);
+                    }
+                    WelcomeEvent::OpenModelProviders => {
+                        this.show_settings = true;
+                        this.open_model_providers(w, cx);
+                    }
+                }
+                cx.notify();
+            });
         Self {
             status: ServiceStatus::Starting,
             service_starting: false,
@@ -350,70 +902,141 @@ impl DshApp {
             error: None,
             sessions: Vec::new(),
             active_session: None,
+            conversation: Conversation::fresh(),
+            parked_conversations: HashMap::new(),
+            session_activity: HashMap::new(),
+            running_subagents: HashMap::new(),
+            opening_session_events: Vec::new(),
             page: WorkspacePage::Conversation,
-            requested_session_id: None,
             pending_action: None,
             creating_session: false,
-            running: false,
-            resumed_session: false,
-            entries: Vec::new(),
-            usage: None,
-            permission: None,
-            config_options: Vec::new(),
+            fork_pending: None,
+            copied_mark: None,
+            message_feedback: Default::default(),
             model_select: None,
             reasoning_select: None,
             composer,
             workspace_editor,
             workspace_rename_editor,
+            session_rename_editor,
             service_editor,
             search_editor,
-            scroll: ScrollHandle::new(),
+            sessions_scroll: ScrollHandle::new(),
             search_expanded: false,
             search_slide: kui::primitives::family::Slide::new(0.),
-            expanded_entries: std::collections::HashSet::new(),
             sidebar_collapsed: false,
+            sidebar_narrow: false,
+            sidebar_drawer: false,
+            sidebar_drawer_focus: SidebarDrawerFocus::new(cx),
+            narrow_sidebar_expanded: false,
             sidebar_width: 280.,
             sidebar_dragging: false,
-            sidebar_slide: kui::primitives::family::Slide::new(1.),
+            sidebar_slide: None,
             brand_hover: kui::primitives::family::Slide::snappy(0.),
-            show_account_menu: false,
+            show_more_menu: false,
             show_settings: false,
-            settings_page: SettingsPage::Account,
+            settings_page: SettingsPage::Credentials,
+            transcript_preferences: transcript_preferences::TranscriptPreferences::new(cx),
+            model_providers: model_providers::ProviderSettings::new(w, cx),
+            runtime_settings: None,
+            shortcuts: shortcut_settings::ShortcutUi::new(w, cx),
+            header_menu: None,
+            exiting_header_menu: None,
+            header_menu_buttons: Rc::default(),
+            session_markdown: session_markdown::SessionMarkdownCopy::default(),
+            session_downloads: session_download::SessionDownloads::new(cx),
+            session_feedback: session_feedback::SessionFeedback::new(w, cx),
+            workspace_applications: Vec::new(),
+            workspace_open_with: None,
+            workspace_open_pending: false,
+            developer_tools: false,
+            developer_tools_loading: true,
+            developer_tools_saving: false,
+            developer_tools_error: false,
+            developer_tools_switched_at: None,
+            content_font_delta: 0,
+            work_details: WorkDetailsMode::Standard,
+            collapse_next_input: false,
+            keep_folded_replies: true,
             show_workspace_menu: false,
             show_workspace_view_options: false,
             workspace_context_menu: None,
             hovered_workspace: None,
+            hovered_session: None,
+            session_row_focus: HashMap::new(),
+            session_row_more_focus: HashMap::new(),
+            session_title_focus: cx.focus_handle(),
             collapsed_workspaces: std::collections::HashSet::new(),
             hidden_workspaces: std::collections::HashSet::new(),
             workspace_aliases: std::collections::HashMap::new(),
             workspace_rename: None,
             workspace_delete: None,
-            confirm_full_access: false,
+            session_rename: None,
+            pinned_sessions: std::collections::HashSet::new(),
+            legacy_session_titles: HashMap::new(),
+            session_title_seqs: HashMap::new(),
+            archived_sessions: std::collections::HashSet::new(),
+            toasts: Vec::new(),
+            confirm_permission: None,
             full_access_acknowledged: false,
+            stats_dialog: None,
+            stats_dialog_bounds: ComposerAnchor::default(),
             workspace_group_by: WorkspaceGroupBy::Workspace,
             workspace_order_by: WorkspaceOrderBy::Updated,
             workspace_archived_filter: WorkspaceArchivedFilter::Hide,
-            show_start_panel: true,
-            start_panel_expanded: false,
+            sidebar: SessionSidebar::default(),
+            parked_sidebars: HashMap::new(),
+            right_dock_slide: DockSlide::default(),
+            right_dock_frame: DockFrame::default(),
+            right_dock_viewport: None,
+            right_dock_preferred_width: None,
+            right_dock_drag: None,
+            dock_tab_gesture: None,
+            dock_tab_menus: dock_tab_menu::DockTabMenus::default(),
+            dock_controls: dock_controls::DockControls::default(),
+            terminal_shell_menu: terminal_shell_menu::ShellMenuState::default(),
+            terminal_title_edit: None,
+            float_gesture: None,
+            float_return: None,
+            float_grips: HashMap::new(),
+            right_dock_focus: HashMap::new(),
+            drop_active: false,
             composer_menu: None,
-            file_entries: Vec::new(),
+            composer_card_bounds: ComposerAnchor::default(),
+            mention_files: FileListing::default(),
             file_token: None,
-            file_directory: String::new(),
             file_filter: String::new(),
             file_selected: 0,
-            file_request_id: 0,
-            file_loading: false,
-            file_error: None,
-            file_truncated: false,
+            next_file_request: 0,
             file_show_crumbs: false,
+            next_terminal_tab: 0,
+            next_browser_key: 0,
+            browser_shell: None,
+            browser_revision: 0,
+            browser_placements: Vec::new(),
+            command_filter: String::new(),
+            command_from_slash: false,
+            command_selected: 0,
+            model_filter_editor,
+            model_menu: model_menu::ModelMenu::new(w, cx),
+            permission_menu: permission_picker::PermissionMenu::new(cx),
+            command_picker: command_picker::CommandPicker::new(w, cx),
+            seeking_shimmer,
+            process_shimmer,
+            last_escape: None,
             suppress_file_trigger: false,
             sessions_loading: false,
+            sessions_acp_complete: false,
             show_welcome: true,
+            shell_presentation: None,
+            native_fullscreen: false,
             welcome,
-            next_local_id: 0,
+            turn_ticker_running: false,
             _composer_subscriptions: vec![submit, submit_plain],
             _workspace_rename_subscription: workspace_rename_subscription,
+            _session_rename_subscription: session_rename_subscription,
             _search_subscription: search_subscription,
+            _model_filter_subscription: model_filter_subscription,
             _config_subscriptions: Vec::new(),
             _welcome_subscription: welcome_subscription,
         }
@@ -423,22 +1046,254 @@ impl DshApp {
         self.status == ServiceStatus::Connected
     }
 
+    /// 本轮新增消耗（运行中实时刷新，供“已消耗 ◇ N”使用）。
+    pub(crate) fn turn_used_delta(&self) -> Option<u64> {
+        self.conversation
+            .usage
+            .map(|(used, _)| used.saturating_sub(self.conversation.turn_usage_base.unwrap_or(0)))
+            .filter(|used| *used > 0)
+    }
+
+    /// 官方 toast：.16s 滑入，停留 3s，1s 淡出后移除。
+    pub(crate) fn push_toast(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        self.toasts
+            .retain(|toast| bridge::monotonic_ms() - toast.at < 4000.);
+        self.toasts.push(Toast {
+            message: message.into(),
+            at: bridge::monotonic_ms(),
+        });
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(4100))
+                .await;
+            this.update(cx, |app, cx| {
+                app.toasts
+                    .retain(|toast| bridge::monotonic_ms() - toast.at < 4000.);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn refresh_sessions(&mut self) {
         if self.sessions_loading {
             return;
         }
         self.sessions_loading = true;
+        self.sessions_acp_complete = false;
+        // Local durable sessions (projcache) load in parallel with ACP pagination.
+        invoke("list_local_sessions", json!({}));
         invoke(
             "list_sessions",
             json!({"cwd": Value::Null, "cursor": Value::Null}),
         );
     }
 
-    fn activate_session(&mut self, session: SessionSummary) {
-        self.sessions
-            .retain(|known| !known.blank && known.id != session.id);
+    fn activate_session(
+        &mut self,
+        session: SessionSummary,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_session.as_deref() != Some(session.id.as_str()) {
+            let next = self
+                .parked_conversations
+                .remove(&session.id)
+                .unwrap_or_else(Conversation::fresh);
+            let mut previous = std::mem::replace(&mut self.conversation, next);
+            if let Some(id) = self.detach_sidebar(w, cx) {
+                previous.draft = self.composer.read(cx).value().to_owned();
+                previous.draft_workspace = self
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == id && session.blank && !previous.running)
+                    .map(|session| session.cwd.clone());
+                if previous.draft_workspace.is_some()
+                    && previous.draft.is_empty()
+                    && previous.draft_attachments.is_empty()
+                    && previous.plan_active != Some(true)
+                    && previous.plan_reviews.is_empty()
+                    && previous.questions.is_empty()
+                {
+                    if previous.acp_open {
+                        invoke("close_session", json!({"sessionId": id}));
+                    }
+                    self.sessions.retain(|session| session.id != id);
+                    self.parked_sidebars.remove(&id);
+                } else {
+                    self.parked_conversations.insert(id, previous);
+                }
+            }
+            let draft = std::mem::take(&mut self.conversation.draft);
+            self.replace_composer_without_trigger(&draft, w, cx);
+            self.composer_menu = None;
+            self.drop_active = false;
+            self.last_escape = None;
+            self.stats_dialog = None;
+            self.sidebar = self.parked_sidebars.remove(&session.id).unwrap_or_else(|| {
+                let surface = DockSurface::restore(&bridge::read_sidebar(&session.id));
+                SessionSidebar {
+                    persisted: surface.clone(),
+                    surface,
+                    ..Default::default()
+                }
+            });
+            self.mount_restored_browsers(w, cx);
+        }
+        if self.sidebar.workspace != session.cwd {
+            self.sidebar.workspace.clone_from(&session.cwd);
+            self.sidebar.file_trees.clear();
+            self.sidebar.documents.clear();
+        }
+        self.sessions.retain(|known| known.id != session.id);
         self.sessions.insert(0, session.clone());
+        self.workspace.clone_from(&session.cwd);
+        replace(&self.workspace_editor, self.workspace.clone(), w, cx);
+        if let Some(activity) = self.session_activity.get_mut(&session.id) {
+            activity.acknowledge();
+        }
         self.active_session = Some(session.id);
+        self.mount_restored_terminals(w, cx);
+        self.start_turn_ticker(cx);
+        self.maybe_follow_tail();
+    }
+
+    fn detach_sidebar(&mut self, w: &mut Window, cx: &mut Context<Self>) -> Option<String> {
+        self.header_menu = None;
+        self.exiting_header_menu = None;
+        self.confirm_permission = None;
+        self.full_access_acknowledged = false;
+        self.dismiss_session_feedback(w, cx);
+        self.clear_session_feedback();
+        self.message_feedback.reset();
+        if self.focused_right_pane(w, cx).is_some() {
+            self.focus_composer(w, cx);
+        }
+        self.finish_terminal_title(true, w, cx);
+        self.persist_right_sidebar();
+        let previous = self.active_session.take();
+        let mut sidebar = std::mem::take(&mut self.sidebar);
+        for tree in sidebar.file_trees.values_mut() {
+            tree.suspend();
+        }
+        for document in sidebar.documents.values_mut() {
+            document.suspend_watch();
+        }
+        for strip in sidebar.tab_strips.values() {
+            strip.suspend();
+        }
+        if let Some(id) = &previous {
+            self.parked_sidebars.insert(id.clone(), sidebar);
+        }
+        self.right_dock_drag = None;
+        self.dock_tab_gesture = None;
+        self.dock_tab_menus = dock_tab_menu::DockTabMenus::default();
+        self.dock_controls = dock_controls::DockControls::default();
+        self.terminal_shell_menu = terminal_shell_menu::ShellMenuState::default();
+        self.float_gesture = None;
+        self.float_return = None;
+        self.float_grips.clear();
+        self.right_dock_focus.clear();
+        self.right_dock_viewport = None;
+        self.mention_files = FileListing::default();
+        self.file_token = None;
+        previous
+    }
+
+    fn sidebar_for_session(&mut self, session: &str) -> Option<&mut SessionSidebar> {
+        if self.active_session.as_deref() == Some(session) {
+            Some(&mut self.sidebar)
+        } else {
+            self.parked_sidebars.get_mut(session)
+        }
+    }
+
+    fn conversation_mut(&mut self, session: &str) -> Option<&mut Conversation> {
+        if self.active_session.as_deref() == Some(session) {
+            Some(&mut self.conversation)
+        } else {
+            self.parked_conversations.get_mut(session)
+        }
+    }
+
+    fn session_conversation(&self, session: &str) -> Option<&Conversation> {
+        if self.active_session.as_deref() == Some(session) {
+            Some(&self.conversation)
+        } else {
+            self.parked_conversations.get(session)
+        }
+    }
+
+    fn session_indicator(&self, id: &str) -> (SessionIndicator, usize) {
+        let conversation = self.session_conversation(id);
+        let running = conversation.is_some_and(|conversation| conversation.running);
+        let pending = conversation.and_then(|conversation| {
+            if conversation.permission.is_some() {
+                Some(PendingInteraction::Approval)
+            } else if !conversation.plan_reviews.is_empty() {
+                Some(PendingInteraction::PlanReview)
+            } else if conversation
+                .questions
+                .iter()
+                .any(|panel| panel.is_pending())
+            {
+                Some(PendingInteraction::Question)
+            } else {
+                None
+            }
+        });
+        let subagents = self
+            .running_subagents
+            .values()
+            .filter(|parent| parent.as_str() == id)
+            .count();
+        let baseline = SessionActivity::default();
+        let status = self.session_activity.get(id).unwrap_or(&baseline);
+        (status.indicator(running, pending, subagents), subagents)
+    }
+
+    fn observe_local_session_activity(&mut self, id: &str, previous: bool, running: bool) {
+        let selected = self.active_session.as_deref() == Some(id);
+        self.session_activity
+            .entry(id.to_owned())
+            .or_default()
+            .observe_local(previous, running, selected);
+    }
+
+    fn observe_host_session_activity(&mut self, id: &str, update: &Value) {
+        let Some(running) = update["running"].as_bool() else {
+            return;
+        };
+        if let Some(parent) = update["parentSessionId"].as_str() {
+            if running {
+                self.running_subagents
+                    .insert(id.to_owned(), parent.to_owned());
+            } else {
+                self.running_subagents.remove(id);
+            }
+            return;
+        }
+        let local_running = self
+            .session_conversation(id)
+            .is_some_and(|conversation| conversation.running);
+        let selected = self.active_session.as_deref() == Some(id);
+        self.session_activity
+            .entry(id.to_owned())
+            .or_default()
+            .observe_host(running, local_running, selected);
+    }
+
+    fn record_session_prompt_time(&mut self, id: &str, time: u64) {
+        let activity = self.session_activity.entry(id.to_owned()).or_default();
+        activity.last_prompt_at_ms = activity.last_prompt_at_ms.max(Some(time));
+    }
+
+    fn persist_right_sidebar(&mut self) {
+        if let Some(session) = &self.active_session {
+            self.sidebar.persist(session);
+        }
     }
 
     fn apply_session_page(&mut self, reply: &Value) {
@@ -448,14 +1303,36 @@ impl DshApp {
             .into_iter()
             .flatten()
             .filter_map(|session| {
+                let id = session.get("sessionId")?.as_str()?.to_string();
+                let cwd = session.get("cwd")?.as_str()?.to_string();
+                // ACP session/list often omits titles or sends placeholders; treat those as missing
+                // so peek_session_titles can fill from projcache / session.v4.
+                let title = session
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|title| {
+                        !title.is_empty()
+                            && *title != "未命名会话"
+                            && *title != "未命名"
+                            && *title != "Untitled"
+                            && *title != "New session"
+                    })
+                    .map(str::to_string);
                 Some(SessionSummary {
-                    id: session.get("sessionId")?.as_str()?.to_string(),
-                    cwd: session.get("cwd")?.as_str()?.to_string(),
-                    title: session
-                        .get("title")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
+                    id,
+                    cwd,
+                    title,
                     blank: false,
+                    created_at_ms: session
+                        .get("createdAt")
+                        .and_then(Value::as_u64)
+                        .or_else(|| {
+                            session
+                                .get("createdAt")
+                                .and_then(Value::as_f64)
+                                .map(|value| value as u64)
+                        }),
                 })
             });
         merge_session_page(&mut self.sessions, incoming, self.active_session.as_deref());
@@ -470,6 +1347,53 @@ impl DshApp {
                 json!({"cwd": Value::Null, "cursor": cursor}),
             );
         } else {
+            self.sessions_acp_complete = true;
+            // Official sidebar also surfaces durable local sessions ACP may omit.
+            invoke("list_local_sessions", json!({}));
+        }
+    }
+
+    fn apply_local_sessions(&mut self, reply: &Value) {
+        let incoming = reply
+            .get("sessions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|session| {
+                let id = session.get("sessionId")?.as_str()?.to_string();
+                let cwd = session.get("cwd")?.as_str()?.to_string();
+                let title = session
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|title| {
+                        !title.is_empty()
+                            && *title != "未命名会话"
+                            && *title != "未命名"
+                            && *title != "Untitled"
+                            && *title != "New session"
+                    })
+                    .map(str::to_string);
+                Some(SessionSummary {
+                    id,
+                    cwd,
+                    title,
+                    blank: false,
+                    created_at_ms: session
+                        .get("createdAt")
+                        .and_then(Value::as_u64)
+                        .or_else(|| {
+                            session
+                                .get("createdAt")
+                                .and_then(Value::as_f64)
+                                .map(|value| value as u64)
+                        }),
+                })
+            });
+        merge_session_page(&mut self.sessions, incoming, self.active_session.as_deref());
+        // ACP session/list omits titles; enrich from durable session.v4 logs / first prompt.
+        self.request_session_titles();
+        if self.sessions_acp_complete {
             self.sessions_loading = false;
         }
     }
@@ -485,24 +1409,36 @@ impl DshApp {
     }
 
     fn start_service(&mut self, w: &mut Window, cx: &mut Context<Self>) {
-        if self.running || self.service_starting || self.creating_session {
+        if self.conversation.running
+            || self
+                .parked_conversations
+                .values()
+                .any(|session| session.running)
+            || self.service_starting
+            || self.creating_session
+            || self.fork_pending.is_some()
+        {
             return;
         }
         let workspace = self.workspace_editor.read(cx).value().trim().to_string();
         let service_path = self.service_editor.read(cx).value().trim().to_string();
         self.service_starting = true;
+        self.runtime_settings = None;
         self.creating_session = false;
         self.pending_action = None;
         self.status = ServiceStatus::Starting;
         self.error = None;
-        self.active_session = None;
+        self.detach_sidebar(w, cx);
         self.page = WorkspacePage::Conversation;
-        self.resumed_session = false;
-        self.entries.clear();
+        self.conversation = Conversation::fresh();
+        self.parked_conversations.clear();
+        self.session_activity.clear();
+        self.running_subagents.clear();
+        self.hovered_session = None;
+        self.opening_session_events.clear();
         self.sessions.clear();
         self.sessions_loading = false;
         self.composer_menu = None;
-        self.config_options.clear();
         self.rebuild_selectors(w, cx);
         invoke(
             "start_service",
@@ -513,19 +1449,62 @@ impl DshApp {
 
     pub(crate) fn open_page(&mut self, page: WorkspacePage, cx: &mut Context<Self>) {
         self.page = page;
+        if self.sidebar_drawer {
+            self.narrow_sidebar_expanded = false;
+        }
         self.composer_menu = None;
         self.show_workspace_menu = false;
         self.show_workspace_view_options = false;
-        self.show_account_menu = false;
+        self.show_more_menu = false;
         cx.notify();
     }
 
     fn new_session(&mut self, w: &mut Window, cx: &mut Context<Self>) {
-        if !self.connected() || self.running || self.creating_session {
+        self.new_session_at(self.workspace.clone(), None, w, cx);
+    }
+
+    fn new_session_at(
+        &mut self,
+        cwd: String,
+        draft: Option<&'static str>,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.connected() || self.creating_session {
             return;
         }
-        self.page = WorkspacePage::Conversation;
-        self.begin_action(PendingAction::New, w, cx);
+        if self.sidebar_drawer && self.narrow_sidebar_expanded {
+            self.set_left_sidebar_collapsed(true, w, cx);
+        }
+        if self.conversation.acp_open
+            && self.sessions.iter().any(|session| {
+                session.blank
+                    && session.cwd == cwd
+                    && self.active_session.as_ref() == Some(&session.id)
+            })
+        {
+            self.open_page(WorkspacePage::Conversation, cx);
+        } else if let Some((id, _)) = self.parked_conversations.iter().find(|(_, session)| {
+            session.acp_open && session.draft_workspace.as_deref() == Some(cwd.as_str())
+        }) {
+            self.resume(
+                SessionSummary {
+                    id: id.clone(),
+                    cwd,
+                    title: None,
+                    blank: true,
+                    created_at_ms: None,
+                },
+                w,
+                cx,
+            );
+        } else {
+            self.begin_action(PendingAction::New { cwd, draft }, cx);
+            return;
+        }
+        if let Some(draft) = draft {
+            self.replace_composer_without_trigger(draft, w, cx);
+        }
     }
 
     fn start_assisted_session(
@@ -534,59 +1513,516 @@ impl DshApp {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.connected() || self.running || self.creating_session {
-            return;
-        }
-        replace(&self.composer, prompt, w, cx);
-        self.new_session(w, cx);
+        self.new_session_at(self.workspace.clone(), Some(prompt), w, cx);
     }
 
     fn resume(&mut self, session: SessionSummary, w: &mut Window, cx: &mut Context<Self>) {
-        if !self.connected() || self.running || self.creating_session {
+        if !self.connected() || self.creating_session {
             return;
         }
-        self.page = WorkspacePage::Conversation;
-        self.begin_action(PendingAction::Resume(session), w, cx);
+        if self.sidebar_drawer && self.narrow_sidebar_expanded {
+            self.set_left_sidebar_collapsed(true, w, cx);
+        }
+        if self
+            .parked_conversations
+            .get(&session.id)
+            .is_some_and(|session| session.acp_open)
+        {
+            self.page = WorkspacePage::Conversation;
+            self.error = None;
+            self.activate_session(session, w, cx);
+            self.rebuild_selectors(w, cx);
+            cx.notify();
+        } else {
+            self.begin_action(PendingAction::Resume(session), cx);
+        }
     }
 
-    fn begin_action(&mut self, action: PendingAction, w: &mut Window, cx: &mut Context<Self>) {
-        self.creating_session = true;
-        self.error = None;
-        self.permission = None;
-        self.usage = None;
-        self.resumed_session = false;
-        self.entries.clear();
-        self.config_options.clear();
-        self.composer_menu = None;
-        self.rebuild_selectors(w, cx);
-        if let Some(previous) = self.active_session.take() {
-            self.pending_action = Some(action);
-            invoke("close_session", json!({"sessionId": previous}));
-        } else {
-            self.perform_action(action);
+    fn fork_session(&mut self, session_id: &str, origin: ForkOrigin, cx: &mut Context<Self>) {
+        let at_seq = match origin {
+            ForkOrigin::Answer(seq) => Some(seq),
+            _ => None,
+        };
+        let open = at_seq.is_some();
+        if !self.connected() || self.creating_session || self.fork_pending.is_some() {
+            return;
         }
+        self.fork_pending = Some(origin);
+        self.creating_session = open;
+        invoke(
+            "fork_session",
+            json!({
+                "sessionId": session_id,
+                "atSeq": at_seq,
+                "open": open,
+                "allowMigration": origin != ForkOrigin::Sidebar,
+            }),
+        );
         cx.notify();
     }
 
-    fn perform_action(&mut self, action: PendingAction) {
-        match action {
-            PendingAction::New => {
-                self.requested_session_id = None;
-                invoke("new_session", json!({"cwd": self.workspace}));
+    fn finish_fork(
+        &mut self,
+        result: Result<Value, String>,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(origin) = self.fork_pending.take() else {
+            return;
+        };
+        let open = matches!(origin, ForkOrigin::Answer(_));
+        if open {
+            self.creating_session = false;
+        }
+        let reply = match result {
+            Ok(reply) => reply,
+            Err(error) => {
+                if open {
+                    self.opening_session_events.clear();
+                }
+                if error.contains("session/migration-required") {
+                    self.push_toast("请先打开原会话完成迁移，再创建分支", cx);
+                } else if origin == ForkOrigin::Shortcut {
+                    let message = if error.contains("session/fork-unavailable") {
+                        "当前会话没有已结束的轮次"
+                    } else {
+                        "无法分叉会话，请重试"
+                    };
+                    self.push_toast(message, cx);
+                }
+                self.refresh_sessions();
+                return;
             }
-            PendingAction::Resume(session) => {
-                self.requested_session_id = Some(session.id.clone());
-                self.workspace = session.cwd.clone();
-                invoke(
-                    "resume_session",
-                    json!({"sessionId": session.id, "cwd": session.cwd}),
-                );
+        };
+        let Some(id) = reply["sessionId"].as_str() else {
+            if open {
+                self.opening_session_events.clear();
+            }
+            return;
+        };
+        let summary = SessionSummary {
+            id: id.to_owned(),
+            cwd: reply["cwd"].as_str().unwrap_or(&self.workspace).to_owned(),
+            title: reply["title"].as_str().map(str::to_owned),
+            blank: false,
+            created_at_ms: reply["createdAt"].as_u64(),
+        };
+        if open {
+            self.open_conversation(summary, Some(&reply), true, None, w, cx);
+        } else {
+            merge_session_page(
+                &mut self.sessions,
+                [summary],
+                self.active_session.as_deref(),
+            );
+        }
+        self.refresh_sessions();
+    }
+
+    fn begin_action(&mut self, action: PendingAction, cx: &mut Context<Self>) {
+        self.creating_session = true;
+        self.opening_session_events.clear();
+        match &action {
+            PendingAction::New { cwd, .. } => invoke("new_session", json!({"cwd": cwd})),
+            PendingAction::Resume(session) => invoke(
+                "resume_session",
+                json!({"sessionId": session.id, "cwd": session.cwd}),
+            ),
+        }
+        self.pending_action = Some(action);
+        cx.notify();
+    }
+
+    fn open_conversation(
+        &mut self,
+        session: SessionSummary,
+        reply: Option<&Value>,
+        resumed: bool,
+        draft: Option<&str>,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = session.id.clone();
+        self.page = WorkspacePage::Conversation;
+        self.error = None;
+        self.activate_session(session, w, cx);
+        self.conversation.acp_open = reply.is_some();
+        if reply.is_some() {
+            self.request_permission_mode();
+            invoke("plan_mode", json!({"sessionId": id}));
+            invoke("question_state", json!({"sessionId": id}));
+        }
+        self.conversation.resumed_session = resumed;
+        self.conversation.config_options = reply
+            .and_then(|reply| reply["configOptions"].as_array())
+            .cloned()
+            .unwrap_or_default();
+        if let Some(draft) = draft {
+            self.replace_composer_without_trigger(draft, w, cx);
+        }
+        self.rebuild_selectors(w, cx);
+        if resumed {
+            self.request_session_history();
+        }
+        for event in std::mem::take(&mut self.opening_session_events) {
+            if event["sessionId"] == id {
+                self.handle_event(event, w, cx);
             }
         }
     }
 
+    fn finish_session_open(
+        &mut self,
+        result: Result<Value, String>,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(action) = self.pending_action.take() else {
+            return;
+        };
+        self.creating_session = false;
+        match (action, result) {
+            (PendingAction::New { cwd, draft }, Ok(reply)) => {
+                if let Some(id) = reply["sessionId"].as_str() {
+                    self.open_conversation(
+                        SessionSummary {
+                            id: id.to_owned(),
+                            cwd,
+                            title: None,
+                            blank: true,
+                            created_at_ms: None,
+                        },
+                        Some(&reply),
+                        false,
+                        draft,
+                        w,
+                        cx,
+                    );
+                    self.refresh_sessions();
+                }
+            }
+            (PendingAction::Resume(session), Ok(reply)) => {
+                self.open_conversation(session, Some(&reply), true, None, w, cx);
+                self.refresh_sessions();
+            }
+            (PendingAction::Resume(session), Err(error)) => {
+                // A writer elsewhere can hold the lease while its transcript remains readable.
+                self.opening_session_events.clear();
+                self.open_conversation(session, None, true, None, w, cx);
+                self.conversation.error = Some(if error.contains("already owned") {
+                    "该会话正被另一个实例占用；已载入只读历史，关闭占用实例后可继续对话。".into()
+                } else {
+                    error
+                });
+            }
+            (PendingAction::New { .. }, Err(error)) => {
+                self.opening_session_events.clear();
+                self.error = Some(error);
+            }
+        }
+    }
+
+    fn request_session_history(&mut self) {
+        let Some(session_id) = self.active_session.clone() else {
+            return;
+        };
+        self.conversation.history_loading = true;
+        self.conversation.history_prepend_pending = false;
+        invoke(
+            "load_session_history",
+            json!({
+                "sessionId": session_id,
+                "cwd": self.workspace,
+                "limit": 2500,
+            }),
+        );
+    }
+
+    pub(crate) fn request_older_history(&mut self, cx: &mut Context<Self>) {
+        if self.conversation.history_loading
+            || !self.conversation.history_has_more
+            || self.creating_session
+        {
+            return;
+        }
+        let Some(session_id) = self.active_session.clone() else {
+            return;
+        };
+        let Some(before_seq) = self.conversation.history_oldest_seq else {
+            self.conversation.history_has_more = false;
+            return;
+        };
+        self.conversation.history_loading = true;
+        self.conversation.history_prepend_pending = true;
+        invoke(
+            "load_session_history",
+            json!({
+                "sessionId": session_id,
+                "cwd": self.workspace,
+                "beforeSeq": before_seq,
+                "limit": 800,
+            }),
+        );
+        cx.notify();
+    }
+
+    fn apply_session_history(&mut self, session: &str, reply: &Value, prepend: bool) {
+        let events = reply
+            .get("events")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let has_more = reply
+            .get("hasMore")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut projected = crate::history::project_session_events_with_more(&events, has_more);
+        if let Some(time) = projected.last_prompt_at_ms {
+            self.record_session_prompt_time(session, time);
+        }
+        if let Some((seq, title)) = &projected.session_title {
+            self.apply_durable_session_title(session, title, *seq);
+        }
+        let Some(conversation) = self.conversation_mut(session) else {
+            return;
+        };
+        conversation.history_loading = false;
+        for event in &events {
+            conversation.turn_tails.observe_history(event);
+            conversation.turn_process.observe_history(event);
+        }
+        conversation.history_has_more = projected.has_more;
+        if projected.entries.is_empty() {
+            return;
+        }
+        // A call can start on an earlier history page or settle while hydration is in flight.
+        let tools: std::collections::HashMap<_, _> = projected
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.role == EntryRole::Tool)
+            .map(|(index, entry)| (entry.key.clone(), index))
+            .collect();
+        let recent = std::mem::take(&mut conversation.entries);
+        for entry in recent {
+            if entry.role == EntryRole::Tool
+                && let Some(&index) = tools.get(&entry.key)
+            {
+                crate::tool_calls::merge_tool_observation(&mut projected.entries[index], entry);
+                continue;
+            }
+            let duplicate = !prepend
+                && entry.external_id.as_ref().is_some_and(|id| {
+                    projected.entries.iter().any(|stored| {
+                        stored.role == entry.role && stored.external_id.as_ref() == Some(id)
+                    })
+                });
+            if !duplicate {
+                projected.entries.push(entry);
+            }
+        }
+        conversation.entries = projected.entries;
+        if !prepend {
+            conversation.follow_tail = true;
+            conversation.scroll.scroll_to_bottom();
+        }
+        if conversation.usage.is_none()
+            && let Some(usage) = projected.usage
+        {
+            conversation.usage = Some(usage);
+        }
+        conversation.uncached_input_tokens = projected.uncached_input_tokens;
+        conversation.cache_read_tokens = projected.cache_read_tokens;
+        conversation.cache_write_tokens = projected.cache_write_tokens;
+        conversation.output_tokens = projected.output_tokens;
+        if projected.decode_tokens > 0 {
+            conversation.decode_tokens = projected.decode_tokens;
+        }
+        if projected.decode_ms > 0. {
+            conversation.decode_ms = projected.decode_ms;
+        }
+        if projected.turns > 0 {
+            conversation.stats_turns = projected.turns;
+        }
+        if projected.steps > 0 {
+            conversation.stats_steps = projected.steps;
+        }
+        if let Some(stats) = reply.get("sessionStats") {
+            if let Some(turns) = stats.get("turns").and_then(Value::as_u64) {
+                conversation.stats_turns = turns;
+            }
+            if let Some(steps) = stats.get("steps").and_then(Value::as_u64) {
+                conversation.stats_steps = steps;
+            }
+            if let Some(ms) = stats.get("llmMs").and_then(Value::as_f64) {
+                conversation.stats_llm_ms = ms;
+            }
+            if let Some(ms) = stats.get("toolMs").and_then(Value::as_f64) {
+                conversation.stats_tool_ms = ms;
+            }
+            if let Some(ms) = stats.get("ttftMs").and_then(Value::as_f64) {
+                conversation.stats_ttft_ms = ms;
+            }
+            if let Some(steps) = stats.get("ttftSteps").and_then(Value::as_u64) {
+                conversation.stats_ttft_steps = steps;
+            }
+            if let Some(ms) = stats.get("decodeMs").and_then(Value::as_f64) {
+                if ms > 0. {
+                    conversation.decode_ms = ms;
+                }
+            }
+            if let Some(tokens) = stats
+                .get("decodeTokens")
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    stats
+                        .get("decodeTokens")
+                        .and_then(Value::as_f64)
+                        .map(|v| v as u64)
+                })
+            {
+                if tokens > 0 {
+                    conversation.decode_tokens = tokens;
+                }
+            }
+        }
+        // Official tokenUsage projection (whole-log totals) wins over window fold.
+        if let Some(usage) = reply.get("tokenUsage") {
+            let read_u64 = |key: &str| {
+                usage
+                    .get(key)
+                    .and_then(Value::as_u64)
+                    .or_else(|| usage.get(key).and_then(Value::as_f64).map(|v| v as u64))
+                    .unwrap_or(0)
+            };
+            let uncached = read_u64("uncachedInputTokens");
+            let cache_read = read_u64("cacheReadTokens");
+            let cache_write = read_u64("cacheWriteTokens");
+            let output = read_u64("outputTokens");
+            if uncached + cache_read + cache_write + output > 0 {
+                conversation.uncached_input_tokens = uncached;
+                conversation.cache_read_tokens = cache_read;
+                conversation.cache_write_tokens = cache_write;
+                conversation.output_tokens = output;
+                let billed = uncached + cache_read + cache_write + output;
+                let window = conversation
+                    .usage
+                    .map(|(_, size)| size)
+                    .filter(|size| *size > billed)
+                    .unwrap_or(billed.max(1));
+                conversation.usage = Some((billed, window));
+            }
+        }
+        if let Some(oldest) = projected.oldest_seq {
+            conversation.history_oldest_seq = Some(match conversation.history_oldest_seq {
+                Some(current) if prepend => current.min(oldest),
+                _ => oldest,
+            });
+        }
+    }
+
+    fn request_session_titles(&mut self) {
+        let missing: Vec<Value> = self
+            .sessions
+            .iter()
+            .filter(|session| session.title.is_none())
+            .map(|session| {
+                json!({
+                    "sessionId": session.id,
+                    "cwd": session.cwd,
+                })
+            })
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        invoke("peek_session_titles", json!({ "sessions": missing }));
+    }
+
+    fn apply_session_titles(&mut self, reply: &Value) {
+        let Some(map) = reply.as_object() else {
+            return;
+        };
+        for (id, value) in map {
+            let Some(title) = value
+                .as_str()
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+            else {
+                continue;
+            };
+            if let Some(session) = self
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == *id && session.title.is_none())
+            {
+                session.title = Some(title.to_string());
+            }
+        }
+    }
+
+    fn apply_durable_session_title(&mut self, id: &str, title: &str, seq: u64) {
+        if let Some(session) = self.sessions.iter_mut().find(|session| session.id == id)
+            && self
+                .session_title_seqs
+                .get(id)
+                .is_none_or(|&latest| seq > latest)
+        {
+            self.session_title_seqs.insert(id.to_owned(), seq);
+            session.title = Some(title.to_owned());
+        }
+    }
+
+    /// Enter 提交入口：空闲即发送；生成中按官方行为排队。
+    fn submit_prompt(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        if self.conversation.permission_mode.changing() || self.confirm_permission.is_some() {
+            return;
+        }
+        let command = match self.composer.read(cx).value() {
+            "/permission" => Some(ComposerMenu::PermissionChoices),
+            "/model" => Some(ComposerMenu::CommandModels),
+            _ => None,
+        };
+        if let Some(command) = command {
+            self.open_command_picker(command, true, w, cx);
+            cx.notify();
+            return;
+        }
+        if self.submit_feedback_command(w, cx) || self.submit_plan_command(w, cx) {
+            return;
+        }
+        if self.conversation.running {
+            self.queue_prompt(w, cx);
+        } else {
+            self.send_prompt(w, cx);
+        }
+    }
+
+    fn queue_prompt(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        if !self.connected() || self.creating_session {
+            return;
+        }
+        let text = self.composer.read(cx).value().trim().to_string();
+        if text.is_empty() && self.conversation.draft_attachments.is_empty() {
+            return;
+        }
+        let (display, prompt) = build_prompt_payload(&text, &self.conversation.draft_attachments);
+        self.conversation.draft_attachments.clear();
+        replace(&self.composer, "", w, cx);
+        self.conversation
+            .queued_prompts
+            .push(QueuedPrompt { display, prompt });
+        self.error = None;
+        cx.notify();
+    }
+
     fn send_prompt(&mut self, w: &mut Window, cx: &mut Context<Self>) {
-        if !self.connected() || self.running || self.creating_session {
+        if !self.connected()
+            || !self.conversation.acp_open
+            || self.conversation.running
+            || self.creating_session
+            || (self.conversation.history_loading && !self.conversation.history_prepend_pending)
+        {
             return;
         }
         let Some(session_id) = self.active_session.clone() else {
@@ -595,25 +2031,238 @@ impl DshApp {
             return;
         };
         let text = self.composer.read(cx).value().trim().to_string();
-        if text.is_empty() {
+        if text.is_empty() && self.conversation.draft_attachments.is_empty() {
             return;
         }
+        let (display, prompt) = build_prompt_payload(&text, &self.conversation.draft_attachments);
         replace(&self.composer, "", w, cx);
+        self.conversation.draft_attachments.clear();
         self.page = WorkspacePage::Conversation;
         if let Some(session) = self
             .sessions
             .iter_mut()
-            .find(|session| session.id == session_id && session.title.is_none())
+            .find(|session| session.id == session_id)
         {
-            session.title = Some(short_session_title(&text));
+            if session.title.is_none() {
+                session.title = Some(short_session_title(&display));
+            }
             session.blank = false;
         }
-        self.push_local(EntryRole::User, text.clone());
-        self.running = true;
         self.error = None;
-        self.scroll.scroll_to_bottom();
-        invoke("prompt", json!({"sessionId": session_id, "text": text}));
+        self.start_prompt(&session_id, QueuedPrompt { display, prompt }, cx);
         cx.notify();
+    }
+
+    fn start_prompt(&mut self, session: &str, prompt: QueuedPrompt, cx: &mut Context<Self>) {
+        let defer_collapse = self.collapse_next_input;
+        let Some(conversation) = self.conversation_mut(session) else {
+            return;
+        };
+        conversation.error = None;
+        if defer_collapse && !conversation.entries.is_empty() {
+            conversation.flow_motion.new_input();
+        }
+        conversation.push_local(EntryRole::User, prompt.display);
+        conversation.prompt_inflight = true;
+        conversation.begin_turn();
+        self.observe_local_session_activity(session, false, true);
+        if self.active_session.as_deref() == Some(session) {
+            self.start_turn_ticker(cx);
+            self.pin_follow_tail();
+        }
+        invoke(
+            "prompt",
+            json!({"sessionId": session, "prompt": prompt.prompt}),
+        );
+    }
+
+    fn start_turn_ticker(&mut self, cx: &mut Context<Self>) {
+        if self.turn_ticker_running || !self.conversation.running {
+            return;
+        }
+        self.turn_ticker_running = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(1))
+                    .await;
+                let live = this
+                    .update(cx, |app, cx| {
+                        let live = app.conversation.running;
+                        app.turn_ticker_running = live;
+                        if live {
+                            cx.notify();
+                        }
+                        live
+                    })
+                    .unwrap_or(false);
+                if !live {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn finish_session_turn(&mut self, session: &str, end: TurnEnd, cx: &mut Context<Self>) {
+        let Some(conversation) = self.conversation_mut(session) else {
+            return;
+        };
+        let previous = conversation.running;
+        conversation.finish_turn(end);
+        if end == TurnEnd::MaxTokens {
+            conversation.push_local(
+                EntryRole::System,
+                "输出达到 token 上限，可以继续发送消息。".into(),
+            );
+        }
+        let next = (end != TurnEnd::Failed && !conversation.queued_prompts.is_empty())
+            .then(|| conversation.queued_prompts.remove(0));
+        self.observe_local_session_activity(session, previous, false);
+        if let Some(next) = next {
+            self.start_prompt(session, next, cx);
+        }
+        if self.active_session.as_deref() == Some(session) {
+            self.maybe_follow_tail();
+        }
+    }
+
+    fn handle_prompt_reply(
+        &mut self,
+        session: &str,
+        result: Result<Value, String>,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let selected = self.active_session.as_deref() == Some(session);
+        let Some(conversation) = self.conversation_mut(session) else {
+            return;
+        };
+        if !std::mem::take(&mut conversation.prompt_inflight) {
+            return;
+        }
+        let end = match result {
+            Ok(reply) => match reply["stopReason"].as_str() {
+                Some("max_tokens") => TurnEnd::MaxTokens,
+                Some("cancelled") => TurnEnd::Stopped,
+                _ => TurnEnd::Completed,
+            },
+            Err(error) => {
+                let draft = conversation
+                    .entries
+                    .last()
+                    .filter(|entry| entry.role == EntryRole::User && entry.external_id.is_none())
+                    .map(|entry| entry.text.clone());
+                if let Some(draft) = draft {
+                    conversation.entries.pop();
+                    if selected {
+                        replace(&self.composer, draft, w, cx);
+                    } else if conversation.draft.is_empty() {
+                        conversation.draft = draft;
+                    } else {
+                        conversation.draft = format!("{draft}\n\n{}", conversation.draft);
+                    }
+                }
+                if let Some(conversation) = self.conversation_mut(session) {
+                    conversation.error = Some(format!("发送失败：{error}。草稿已保留，请重试。"));
+                }
+                TurnEnd::Failed
+            }
+        };
+        self.finish_session_turn(session, end, cx);
+    }
+
+    pub(crate) fn pick_attachments(&mut self, cx: &mut Context<Self>) {
+        let owner = self.active_session.clone();
+        cx.spawn(async move |this, cx| {
+            match bridge::pick_files(
+                "image/*,.pdf,.txt,.md,.json,.csv,.zip,.png,.jpg,.jpeg,.gif,.webp",
+            )
+            .await
+            {
+                Ok(raw) => {
+                    let Ok(items) = serde_json::from_str::<Vec<Value>>(&raw) else {
+                        return;
+                    };
+                    let _ = this.update(cx, |app, cx| {
+                        if let Some(conversation) =
+                            owner.as_deref().and_then(|id| app.conversation_mut(id))
+                        {
+                            conversation.ingest_draft_items(&items);
+                        }
+                        cx.notify();
+                    });
+                }
+                Err(error) => {
+                    let _ = this.update(cx, |app, cx| {
+                        if let Some(conversation) =
+                            owner.as_deref().and_then(|id| app.conversation_mut(id))
+                        {
+                            conversation.error = Some(error);
+                        }
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    pub(crate) fn handle_file_event(&mut self, payload: &str, cx: &mut Context<Self>) {
+        let Ok(event) = serde_json::from_str::<Value>(payload) else {
+            return;
+        };
+        match event.get("kind").and_then(Value::as_str) {
+            Some("drag") => {
+                let active = event
+                    .get("active")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if self.drop_active != active {
+                    self.drop_active = active;
+                    cx.notify();
+                }
+            }
+            Some("files") => {
+                self.drop_active = false;
+                if let Some(items) = event.get("items").and_then(Value::as_array) {
+                    self.conversation.ingest_draft_items(items);
+                }
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    /// 用户发送或点「回到底部」时恢复尾部跟随。
+    pub(crate) fn pin_follow_tail(&mut self) {
+        self.conversation.follow_tail = true;
+        if self.conversation.flow_motion.owns_tail() {
+            self.conversation.flow_motion.new_input();
+        }
+        self.maybe_follow_tail();
+    }
+
+    /// 流式更新：仅在仍跟随尾部时滚到底。
+    pub(crate) fn maybe_follow_tail(&mut self) {
+        if self.conversation.follow_tail && !self.conversation.flow_motion.owns_tail() {
+            self.conversation.scroll.scroll_to_bottom();
+        }
+    }
+
+    /// 根据当前偏移更新跟随权：贴底则恢复，离开阈值则解除。
+    pub(crate) fn sync_follow_from_scroll(&mut self, delta: f32) {
+        if self.conversation.flow_motion.owns_tail() {
+            if delta > 0. {
+                self.conversation.follow_tail = false;
+                self.conversation.flow_motion.cancel_tail_request();
+            }
+            return;
+        }
+        let remaining = (self.conversation.scroll.max_offset().y
+            + self.conversation.scroll.offset().y)
+            .as_f32();
+        self.conversation.follow_tail = remaining <= 25.;
     }
 
     fn cancel(&mut self, cx: &mut Context<Self>) {
@@ -632,91 +2281,39 @@ impl DshApp {
         }
     }
 
-    fn ensure_account_model(&mut self, cx: &mut Context<Self>) {
-        let welcome = self.welcome.read(cx);
-        let has_key = welcome
-            .auth
-            .as_ref()
-            .and_then(|auth| auth.pointer("/apiKey/configured"))
-            .and_then(Value::as_bool)
-            == Some(true);
-        if !welcome.signed_in() || has_key {
-            return;
-        }
-        let Some(option) = self
-            .config_options
-            .iter()
-            .find(|option| option.get("id").and_then(Value::as_str) == Some("model"))
-        else {
-            return;
-        };
-        let current = option.get("currentValue").and_then(Value::as_str);
-        let account_value = option
-            .get("options")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .find(|group| group.get("group").and_then(Value::as_str) == Some("deepseek-account"))
-            .and_then(|group| group.get("options"))
-            .and_then(Value::as_array)
-            .and_then(|options| options.first())
-            .and_then(|option| option.get("value"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        if let Some(value) = account_value
-            && current != Some(value.as_str())
-        {
-            self.set_config("model".to_string(), value);
-        }
-    }
-
     fn respond_permission(&mut self, option_id: String, cx: &mut Context<Self>) {
-        if let Some(permission) = self.permission.take() {
+        if let Some(permission) = self.conversation.permission.take() {
             invoke(
                 "respond_permission",
-                json!({"requestId": permission.request_id, "optionId": option_id}),
+                json!({"sessionId": self.active_session, "requestId": permission.request_id, "optionId": option_id}),
             );
             cx.notify();
         }
     }
 
-    fn push_local(&mut self, role: EntryRole, text: String) {
-        let key = format!("local-{}", self.next_local_id);
-        self.next_local_id += 1;
-        self.entries.push(ChatEntry::local(role, key, text));
-    }
-
     fn handle_reply(
         &mut self,
         command: &'static str,
+        owner: Option<&str>,
         result: Result<Value, String>,
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if matches!(
             command,
-            "start_auth"
-                | "auth_status"
-                | "auth_profile"
-                | "auth_avatar"
-                | "save_api_key"
-                | "remove_api_key"
-                | "start_sign_in"
-                | "cancel_sign_in"
-                | "sign_out"
-                | "open_sign_in"
-                | "open_account_page"
+            "start_auth" | "auth_status" | "save_api_key" | "remove_api_key"
         ) {
             let was_configured = self.welcome.read(cx).configured();
             self.welcome.update(cx, |welcome, cx| {
                 welcome.handle_reply(command, result, w, cx);
             });
-            if !was_configured
+            if command == "save_api_key"
+                && !was_configured
                 && self.welcome.read(cx).configured()
                 && self.connected()
-                && !self.running
+                && !self.conversation.running
                 && !self.creating_session
-                && self.entries.is_empty()
+                && self.conversation.entries.is_empty()
             {
                 self.start_service(w, cx);
             }
@@ -739,77 +2336,59 @@ impl DshApp {
                         replace(&self.workspace_editor, self.workspace.clone(), w, cx);
                         replace(&self.service_editor, self.service_path.clone(), w, cx);
                         self.error = None;
+                        self.load_startup_model_providers(&reply, w, cx);
                         self.new_session(w, cx);
                     }
                     Err(error) => {
                         self.status = ServiceStatus::Error;
                         self.error = Some(error);
-                    }
-                }
-            }
-            "new_session" | "resume_session" => {
-                self.creating_session = false;
-                let requested_session_id = self.requested_session_id.take();
-                match result {
-                    Ok(reply) => {
-                        let active_id = reply
-                            .get("sessionId")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                            .or(requested_session_id);
-                        if let Some(id) = active_id {
-                            let existing = self
-                                .sessions
-                                .iter()
-                                .find(|session| session.id == id)
-                                .cloned();
-                            let summary = existing.unwrap_or(SessionSummary {
-                                id,
-                                cwd: self.workspace.clone(),
-                                title: None,
-                                blank: command == "new_session",
-                            });
-                            self.activate_session(summary);
+                        if self.show_settings && self.settings_page == SettingsPage::Providers {
+                            self.open_model_providers(w, cx);
                         }
-                        self.resumed_session = command == "resume_session";
-                        self.config_options = reply
-                            .get("configOptions")
-                            .and_then(Value::as_array)
-                            .cloned()
-                            .unwrap_or_default();
-                        self.rebuild_selectors(w, cx);
-                        self.ensure_account_model(cx);
-                        self.refresh_sessions();
                     }
-                    Err(error) => self.error = Some(error),
                 }
             }
-            "close_session" => match result {
-                Ok(_) => {
-                    if let Some(action) = self.pending_action.take() {
-                        self.perform_action(action);
+            "fork_session" => self.finish_fork(result, w, cx),
+            "rename_session" => self.finish_session_rename(result, w, cx),
+            "new_session" | "resume_session" => self.finish_session_open(result, w, cx),
+            "load_session_history" => {
+                if let Some(session) = owner
+                    && let Some(conversation) = self.conversation_mut(session)
+                {
+                    let prepend = std::mem::take(&mut conversation.history_prepend_pending);
+                    match result {
+                        Ok(reply) => self.apply_session_history(session, &reply, prepend),
+                        Err(error) => {
+                            conversation.history_loading = false;
+                            conversation.error = Some(format!("历史载入失败：{error}"));
+                        }
                     }
                 }
-                Err(error) => {
-                    self.pending_action = None;
-                    self.creating_session = false;
-                    self.error = Some(error);
-                }
-            },
+            }
             "list_sessions" => match result {
                 Ok(reply) => self.apply_session_page(&reply),
                 Err(error) => {
-                    self.sessions_loading = false;
+                    // Still surface durable local history when ACP list fails.
                     self.error = Some(format!("会话列表加载失败：{error}"));
+                    self.sessions_acp_complete = true;
+                    invoke("list_local_sessions", json!({}));
                 }
             },
-            "list_workspace_files" => match result {
-                Ok(reply) => self.apply_workspace_files(&reply),
-                Err(error) if self.file_loading => self.fail_workspace_files(error),
+            "list_local_sessions" => match result {
+                Ok(reply) => self.apply_local_sessions(&reply),
+                Err(_) => {
+                    self.request_session_titles();
+                    if self.sessions_acp_complete {
+                        self.sessions_loading = false;
+                    }
+                }
+            },
+            "peek_session_titles" => match result {
+                Ok(reply) => self.apply_session_titles(&reply),
                 Err(_) => {}
             },
             "load_workspace_preferences" => match result {
-                Ok(reply) => self.apply_workspace_preferences(reply),
+                Ok(reply) => self.apply_workspace_preferences(reply, cx),
                 Err(error) => self.error = Some(error),
             },
             "save_workspace_preferences" => {
@@ -817,47 +2396,83 @@ impl DshApp {
                     self.error = Some(error);
                 }
             }
+            "workspace_applications" => self.apply_workspace_applications(result, cx),
+            "open_workspace_application" => self.finish_workspace_open(result, cx),
+            "load_shortcuts" | "save_shortcuts" => {
+                self.shortcut_reply(command == "save_shortcuts", result, w, cx)
+            }
+            "load_developer_tools" => {
+                self.developer_tools_loading = false;
+                if let Some(enabled) = result.ok().and_then(|reply| reply.as_bool()) {
+                    self.update_html_preview_mode(enabled);
+                }
+            }
+            "save_developer_tools" => {
+                self.developer_tools_saving = false;
+                if let Some(enabled) = result.ok().and_then(|reply| reply.as_bool()) {
+                    self.developer_tools_switched_at = Some(bridge::monotonic_ms());
+                    self.update_html_preview_mode(enabled);
+                } else {
+                    self.developer_tools_error = true;
+                }
+            }
             "prompt" => {
-                self.running = false;
-                match result {
-                    Ok(reply) => {
-                        if reply.get("stopReason").and_then(Value::as_str) == Some("max_tokens") {
-                            self.push_local(
-                                EntryRole::System,
-                                "输出达到 token 上限，可以继续发送消息。".to_string(),
-                            );
+                if let Some(session) = owner {
+                    self.handle_prompt_reply(session, result, w, cx);
+                }
+            }
+            "set_config_option" => {
+                if let Some(session) = owner
+                    && let Some(conversation) = self.conversation_mut(session)
+                {
+                    match result {
+                        Ok(reply) => {
+                            conversation.config_options = reply["configOptions"]
+                                .as_array()
+                                .cloned()
+                                .unwrap_or_default();
+                            if self.active_session.as_deref() == Some(session) {
+                                self.rebuild_selectors(w, cx);
+                            }
                         }
-                    }
-                    Err(error) => {
-                        let draft = self
-                            .entries
-                            .last()
-                            .filter(|entry| {
-                                entry.role == EntryRole::User && entry.external_id.is_none()
-                            })
-                            .map(|entry| entry.text.clone());
-                        if let Some(draft) = draft {
-                            self.entries.pop();
-                            replace(&self.composer, draft, w, cx);
-                        }
-                        self.error = Some(format!("发送失败：{error}。草稿已保留，请重试。"));
+                        Err(error) => conversation.error = Some(error),
                     }
                 }
-                self.scroll.scroll_to_bottom();
             }
-            "set_config_option" => match result {
-                Ok(reply) => {
-                    self.config_options = reply
-                        .get("configOptions")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    self.rebuild_selectors(w, cx);
-                    self.ensure_account_model(cx);
+            "command_model" => self.finish_command_model(owner, result, w, cx),
+            "button_model" => self.finish_model_menu(owner, result, w, cx),
+            "browser_shell_generation" => match result {
+                Ok(value) => {
+                    self.browser_shell = value.as_u64();
+                    document_html::republish_focus();
                 }
                 Err(error) => self.error = Some(error),
             },
-            "cancel_session" | "respond_permission" | "stop_service" | "open_start_tool" => {
+            "plan_mode" => {
+                if let Some(conversation) = owner.and_then(|session| self.conversation_mut(session))
+                    && conversation.plan_active.is_none()
+                {
+                    conversation.plan_active =
+                        result.ok().and_then(|value| value["active"].as_bool());
+                }
+            }
+            "permission_mode" => self.finish_permission_mode(owner, result, w, cx),
+            "cancel_session" | "respond_permission" => {
+                if let Err(error) = result
+                    && let Some(conversation) =
+                        owner.and_then(|session| self.conversation_mut(session))
+                {
+                    conversation.error = Some(error);
+                }
+            }
+            "stop_service"
+            | "open_start_tool"
+            | "write_terminal"
+            | "resize_terminal"
+            | "stop_terminal"
+            | "close_embedded_browser"
+            | "embedded_browser_action"
+            | "open_browser_url" => {
                 if let Err(error) = result {
                     self.error = Some(error);
                 }
@@ -867,34 +2482,200 @@ impl DshApp {
         cx.notify();
     }
 
+    fn handle_conversation_event(&mut self, event: Value, w: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = event["sessionId"].as_str() else {
+            return;
+        };
+        let update = &event["update"];
+        if update["sessionUpdate"] == "gpui_agent_status" {
+            self.observe_host_session_activity(session, update);
+            return;
+        }
+        if update["sessionUpdate"] == "gpui_session_activity" {
+            if let Some(time) = update["time"].as_u64() {
+                self.record_session_prompt_time(session, time);
+            }
+            return;
+        }
+        if update["sessionUpdate"] == "gpui_session_title" {
+            if let (Some(title), Some(seq)) = (update["title"].as_str(), update["seq"].as_u64()) {
+                self.apply_durable_session_title(session, title, seq);
+            }
+            return;
+        }
+        let defer_collapse = self.collapse_next_input;
+        let selected = self.active_session.as_deref() == Some(session);
+        let Some(conversation) = self.conversation_mut(session) else {
+            if self.creating_session {
+                self.opening_session_events.push(event);
+            }
+            return;
+        };
+        if event["kind"] == "permission" {
+            conversation.apply_permission(&event);
+            if selected {
+                self.maybe_follow_tail();
+            }
+            return;
+        }
+        if update["sessionUpdate"] == "gpui_plan_review" {
+            self.handle_plan_review(session, update, w, cx);
+            return;
+        }
+        if update["sessionUpdate"] == "gpui_questions" {
+            self.handle_questions(session, update, w, cx);
+            return;
+        }
+        if update["sessionUpdate"] == "gpui_plan_mode" {
+            conversation.plan_active = update["active"].as_bool();
+            return;
+        }
+        if update["sessionUpdate"] == "gpui_turn_tail" {
+            if let (Some(id), Some(time)) = (
+                update["toolCall"]["toolCallId"].as_str(),
+                update["toolCall"]["time"].as_f64(),
+            ) && let Some(entry) = conversation.entries.iter_mut().find(|entry| {
+                entry.role == EntryRole::Tool
+                    && !entry.is_subcall()
+                    && entry.external_id.as_deref() == Some(id)
+            }) {
+                entry.at_ms = Some(time);
+            }
+            if let (Some(turn), Some(plans)) =
+                (update["turn"].as_u64(), update["planEvents"].as_array())
+            {
+                let mut seen = std::collections::HashSet::new();
+                let plans: Vec<_> = plans
+                    .iter()
+                    .filter_map(crate::submitted_plan::SubmittedPlan::from_event)
+                    .filter(|plan| seen.insert(plan.call_id.clone()))
+                    .collect();
+                if let Some(last) = plans.last() {
+                    conversation.turn_tails.note_plan_tail(turn, &last.call_id);
+                    conversation.submitted_plans.insert(turn, plans);
+                }
+            }
+            conversation.turn_tails.observe_live(update);
+            conversation.turn_process.observe_live(update);
+            return;
+        }
+        if update["sessionUpdate"] == "turn_end"
+            && let Some(plans) = update["turn"]
+                .as_u64()
+                .and_then(|turn| conversation.submitted_plans.remove(&turn))
+        {
+            for plan in plans {
+                if !conversation.entries.iter().any(|entry| {
+                    entry.role == EntryRole::Plan
+                        && entry.external_id.as_deref() == Some(&plan.call_id)
+                }) {
+                    conversation.entries.push(ChatEntry::submitted_plan(plan));
+                }
+            }
+        }
+        let effect = apply_update(&mut conversation.entries, update);
+        if update["sessionUpdate"] == "tool_call"
+            && let Some(id) = update["toolCallId"].as_str()
+            && let Some(time) = conversation.turn_process.tool_time(id)
+            && let Some(entry) = conversation.entries.iter_mut().find(|entry| {
+                entry.role == EntryRole::Tool
+                    && !entry.is_subcall()
+                    && entry.external_id.as_deref() == Some(id)
+            })
+        {
+            entry.at_ms = Some(time as f64);
+        }
+        let now = bridge::now_ms();
+        for entry in &mut conversation.entries {
+            if entry.at_ms.is_none() {
+                entry.at_ms = Some(now);
+            }
+        }
+        if let Some(usage) = effect.usage {
+            conversation.usage = Some(usage);
+        }
+        let options_changed = effect.config_options.is_some();
+        if let Some(options) = effect.config_options {
+            conversation.config_options = options;
+        }
+        let started = effect.turn_triggered && !conversation.running;
+        if started {
+            if defer_collapse && conversation.turn_summary.is_some() {
+                conversation.flow_motion.new_input();
+            }
+            conversation.begin_turn();
+        }
+        if let Some(reason) = effect.turn_ended.as_deref()
+            && conversation.running
+            && !conversation.prompt_inflight
+        {
+            use crate::history::turn_process::EndKind;
+            let durable_end = update["turn"]
+                .as_u64()
+                .and_then(|turn| conversation.turn_process.end_kind(turn));
+            let end = match (durable_end, reason) {
+                (Some(EndKind::Stopped), _)
+                | (_, "cancelled" | "cancel" | "aborted" | "interrupted") => TurnEnd::Stopped,
+                (Some(EndKind::Failed), _) | (_, "error" | "failed") => TurnEnd::Failed,
+                (_, "max_tokens") => TurnEnd::MaxTokens,
+                _ => TurnEnd::Completed,
+            };
+            self.finish_session_turn(session, end, cx);
+        }
+        if started {
+            self.observe_local_session_activity(session, false, true);
+        }
+        if effect.turn_triggered
+            && let Some(summary) = self
+                .sessions
+                .iter_mut()
+                .find(|summary| summary.id == session)
+        {
+            summary.blank = false;
+        }
+        if selected {
+            if options_changed {
+                self.rebuild_selectors(w, cx);
+            }
+            self.start_turn_ticker(cx);
+            self.maybe_follow_tail();
+        }
+    }
+
     fn handle_event(&mut self, event: Value, w: &mut Window, cx: &mut Context<Self>) {
-        if matches!(
-            event.get("kind").and_then(Value::as_str),
-            Some("account" | "auth")
-        ) {
-            let was_configured = self.welcome.read(cx).configured();
+        if event["kind"] == "auth" {
             self.welcome
                 .update(cx, |welcome, cx| welcome.handle_event(&event, cx));
-            if !was_configured
-                && self.welcome.read(cx).configured()
-                && self.connected()
-                && !self.running
-                && !self.creating_session
-                && self.entries.is_empty()
-            {
-                self.start_service(w, cx);
-            }
             cx.notify();
             return;
         }
         match event.get("kind").and_then(Value::as_str) {
+            Some("shell_fullscreen") => {
+                self.native_fullscreen = event["value"].as_bool().unwrap_or(false);
+            }
+            Some("session_log_download_started") => self.session_downloads.started(&event),
             Some("service") => match event.get("status").and_then(Value::as_str) {
                 Some("starting") => self.status = ServiceStatus::Starting,
                 Some("running") => self.status = ServiceStatus::Connected,
                 Some("exited") => {
                     self.status = ServiceStatus::Error;
                     self.service_starting = false;
-                    self.running = false;
+                    self.session_activity.clear();
+                    self.running_subagents.clear();
+                    for conversation in std::iter::once(&mut self.conversation)
+                        .chain(self.parked_conversations.values_mut())
+                    {
+                        conversation.acp_open = false;
+                        conversation.permission = None;
+                        conversation.plan_reviews.clear();
+                        conversation.questions.clear();
+                        conversation.submitted_plans.clear();
+                        conversation.plan_active = None;
+                        conversation.plan_mode_busy = false;
+                        if conversation.running {
+                            conversation.finish_turn(TurnEnd::Failed);
+                        }
+                    }
                     self.error = event
                         .get("detail")
                         .and_then(Value::as_str)
@@ -903,62 +2684,330 @@ impl DshApp {
                 }
                 _ => {}
             },
-            Some("session_update") => {
-                let session_id = event.get("sessionId").and_then(Value::as_str);
-                if session_id != self.active_session.as_deref() {
-                    return;
-                }
-                if let Some(update) = event.get("update") {
-                    let effect = apply_update(&mut self.entries, update);
-                    if effect.usage.is_some() {
-                        self.usage = effect.usage;
-                    }
-                    if let Some(options) = effect.config_options {
-                        self.config_options = options;
-                        self.rebuild_selectors(w, cx);
-                    }
-                    self.scroll.scroll_to_bottom();
-                }
+            Some("session_update" | "permission") => self.handle_conversation_event(event, w, cx),
+            Some("workspace_directory_changed") => {
+                self.workspace_directory_changed(&event, cx);
+                return;
             }
-            Some("permission") => {
-                let session_id = event.get("sessionId").and_then(Value::as_str);
-                if session_id != self.active_session.as_deref() {
+            Some("workspace_file_changed") => {
+                self.workspace_file_changed(event, cx);
+                return;
+            }
+            Some("main_shortcut_input" | "shortcut_record_input") => {
+                self.shortcut_input_event(&event, w, cx);
+                return;
+            }
+            Some("html_preview_input") => {
+                self.handle_html_preview_input(&event, w, cx);
+                return;
+            }
+            Some(
+                "browser_page" | "browser_popup" | "browser_focus" | "browser_input"
+                | "browser_terminated",
+            ) => {
+                self.handle_browser_event(&event, w, cx);
+                return;
+            }
+            Some("terminal") => {
+                let Some(id) = event
+                    .get("terminalId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                else {
                     return;
-                }
-                let tool_call = event.get("toolCall").cloned().unwrap_or_else(|| json!({}));
-                if let Some(call_id) = tool_call.get("toolCallId").and_then(Value::as_str)
-                    && let Some(entry) = self.entries.iter_mut().find(|entry| {
-                        entry.role == EntryRole::Tool
-                            && entry.external_id.as_deref() == Some(call_id)
-                    })
+                };
+                let Ok(update) = serde_json::from_value::<terminal::TerminalUpdate>(event) else {
+                    return;
+                };
+                for (owner, sidebar) in self
+                    .active_session
+                    .iter()
+                    .zip(std::iter::once(&mut self.sidebar))
+                    .chain(self.parked_sidebars.iter_mut())
                 {
-                    entry.status = "approval".to_string();
+                    let Some((&key, tab)) =
+                        sidebar.terminals.iter_mut().find(|(_, tab)| tab.id == id)
+                    else {
+                        continue;
+                    };
+                    match tab.connection {
+                        TerminalConnection::Opening { .. } => tab.pending.push(update),
+                        TerminalConnection::Connected | TerminalConnection::Exited { .. } => {
+                            if tab.apply_update(update, cx)
+                                && let Some(saved) = sidebar.surface.terminals.get_mut(&key)
+                            {
+                                saved.title = tab.title.clone();
+                                sidebar.persist(owner);
+                            }
+                        }
+                        _ => {}
+                    }
+                    break;
                 }
-                let options = event
-                    .get("options")
-                    .and_then(Value::as_array)
-                    .map(|options| {
-                        options
-                            .iter()
-                            .filter_map(|option| {
-                                Some((
-                                    option.get("optionId")?.as_str()?.to_string(),
-                                    option.get("name")?.as_str()?.to_string(),
-                                ))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                self.permission = Some(PermissionRequest {
-                    request_id: event.get("requestId").cloned().unwrap_or(Value::Null),
-                    tool_call,
-                    options,
-                });
-                self.scroll.scroll_to_bottom();
             }
             _ => {}
         }
         cx.notify();
+    }
+
+    fn connect_terminal(
+        &mut self,
+        key: u64,
+        create: bool,
+        requested_shell: Option<String>,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(owner) = self.active_session.clone() else {
+            return;
+        };
+        let Some(checkpoint) = self.sidebar.surface.terminals.get(&key) else {
+            return;
+        };
+        if self.sidebar.terminals.contains_key(&key) {
+            return;
+        }
+        let terminal_id = checkpoint.id.clone();
+        let reading_shells = create && requested_shell.is_none();
+        let screen = cx.new(|cx| terminal::TerminalScreen::new(w, cx));
+        self.sidebar.terminals.insert(
+            key,
+            TerminalTab {
+                id: terminal_id.clone(),
+                title: checkpoint.title.clone(),
+                screen,
+                requested_shell: requested_shell.clone(),
+                connection: TerminalConnection::Opening {
+                    create,
+                    reading_shells,
+                },
+                sequence: 0,
+                pending: Vec::new(),
+            },
+        );
+
+        let (command, mut args) = if create {
+            (
+                "start_terminal",
+                json!({
+                    "terminalId": terminal_id, "session": owner, "cwd": self.sidebar.workspace,
+                    "cols": 80, "rows": 24,
+                }),
+            )
+        } else {
+            (
+                "attach_terminal",
+                json!({"terminalId": terminal_id, "session": owner}),
+            )
+        };
+        cx.spawn_in(w, async move |this, cx| {
+            let choice = if reading_shells {
+                terminal_shell_menu::load_shells()
+                    .await
+                    .map(|shells| terminal_shell_menu::preferred_path(&shells).map(str::to_owned))
+            } else {
+                Ok(requested_shell)
+            };
+            let mut result = match choice {
+                Ok(choice) => {
+                    if create {
+                        let mounted = this.update_in(cx, |app, _, cx| {
+                            let Some(tab) = app
+                                .sidebar_for_session(&owner)
+                                .and_then(|sidebar| sidebar.terminals.get_mut(&key))
+                                .filter(|tab| tab.id == terminal_id)
+                            else {
+                                return false;
+                            };
+                            if let Some(path) = &choice {
+                                bridge::remember_terminal_shell(path);
+                            }
+                            tab.connection = TerminalConnection::Opening {
+                                create,
+                                reading_shells: false,
+                            };
+                            cx.notify();
+                            true
+                        });
+                        if !mounted.unwrap_or(false) {
+                            return;
+                        }
+                        args["shellPath"] = json!(choice);
+                    }
+                    bridge::invoke(command, args).await.and_then(|value| {
+                        serde_json::from_value::<Option<terminal::TerminalSnapshot>>(value)
+                            .map_err(|error| error.to_string())
+                    })
+                }
+                Err(error) => Err(error),
+            };
+            let has_screen = matches!(result, Ok(Some(_)));
+            if let Ok(Some(snapshot)) = &result {
+                let restore = this.update_in(cx, |app, _, cx| {
+                    let tab = app.sidebar_for_session(&owner)?.terminals.get_mut(&key)?;
+                    if tab.id != terminal_id {
+                        return None;
+                    }
+                    Some(tab.screen.update(cx, |screen, _| screen.restore(snapshot)))
+                });
+                match restore {
+                    Ok(Some(promise)) => {
+                        if wasm_bindgen_futures::JsFuture::from(promise).await.is_err() {
+                            result = Err("终端画面传输异常，请重新连接。".into());
+                        }
+                    }
+                    _ => return,
+                }
+            }
+            let _ = this.update_in(cx, |app, w, cx| {
+                let Some(sidebar) = app.sidebar_for_session(&owner) else {
+                    return;
+                };
+                let Some(tab) = sidebar
+                    .terminals
+                    .get_mut(&key)
+                    .filter(|tab| tab.id == terminal_id)
+                else {
+                    return;
+                };
+                match result {
+                    Ok(Some(snapshot)) => {
+                        tab.sequence = snapshot.sequence;
+                        tab.title = Some(snapshot.title);
+                        tab.connection = TerminalConnection::Connected;
+                        tab.screen
+                            .update(cx, |screen, cx| screen.restore_finished(cx));
+                        if let Some(exit) = snapshot.exit {
+                            tab.end(exit.code, cx);
+                        }
+                        let mut pending = std::mem::take(&mut tab.pending);
+                        pending.sort_by_key(|update| update.sequence);
+                        for update in pending {
+                            tab.apply_update(update, cx);
+                        }
+                        if matches!(tab.connection, TerminalConnection::Connected) {
+                            tab.screen
+                                .update(cx, |screen, cx| screen.bind(&terminal_id, cx));
+                        }
+                        if let Some(saved) = sidebar.surface.terminals.get_mut(&key) {
+                            saved.title = tab.title.clone();
+                        }
+                        sidebar.persist(&owner);
+                        if app.active_session.as_deref() == Some(owner.as_str()) {
+                            app.focus_terminal(key, w, cx);
+                        }
+                    }
+                    Ok(None) => {
+                        tab.connection = TerminalConnection::Missing;
+                        tab.pending.clear();
+                    }
+                    Err(error) => {
+                        tab.connection = TerminalConnection::Failed {
+                            error,
+                            retry_create: create && !has_screen,
+                            has_screen,
+                        };
+                        tab.pending.clear();
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn mount_restored_terminals(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        let keys: Vec<_> = self.sidebar.surface.layout.terminal_keys().collect();
+        for key in keys {
+            self.connect_terminal(key, false, None, w, cx);
+        }
+    }
+
+    fn new_terminal(
+        &mut self,
+        pane: DockPaneId,
+        shell_path: Option<String>,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_session.is_none() {
+            return;
+        }
+        self.next_terminal_tab = self
+            .next_terminal_tab
+            .max(self.sidebar.surface.layout.last_terminal_key())
+            + 1;
+        let key = self.next_terminal_tab;
+        self.open_right_tab(pane, RightPanelTab::Terminal(key), w, cx);
+        self.launch_terminal(key, shell_path, w, cx);
+    }
+
+    fn launch_terminal(
+        &mut self,
+        key: u64,
+        shell_path: Option<String>,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(owner) = self.active_session.as_deref() else {
+            return;
+        };
+        self.sidebar.surface.terminals.insert(
+            key,
+            TerminalCheckpoint {
+                id: bridge::terminal_id(),
+                title: None,
+            },
+        );
+        // Persist the binding before asking the host to spawn.
+        self.sidebar.persist(owner);
+        self.connect_terminal(key, true, shell_path, w, cx);
+    }
+
+    fn replace_terminal(&mut self, key: u64, w: &mut Window, cx: &mut Context<Self>) {
+        self.close_terminal(key, cx);
+        self.launch_terminal(key, None, w, cx);
+    }
+
+    fn retry_terminal(&mut self, key: u64, w: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.sidebar.terminals.get(&key) else {
+            return;
+        };
+        let TerminalConnection::Failed {
+            retry_create: create,
+            ..
+        } = tab.connection
+        else {
+            return;
+        };
+        let shell_path = tab.requested_shell.clone();
+        self.sidebar.terminals.remove(&key);
+        self.connect_terminal(key, create, shell_path, w, cx);
+    }
+
+    fn close_terminal(&mut self, key: u64, cx: &mut Context<Self>) {
+        self.cancel_closed_terminal_title(key);
+        if let Some(tab) = self.sidebar.terminals.remove(&key) {
+            tab.screen.update(cx, |screen, cx| screen.unbind(cx));
+        }
+        if let Some(saved) = self.sidebar.surface.terminals.remove(&key) {
+            invoke("stop_terminal", json!({"terminalId": saved.id}));
+        }
+    }
+
+    fn focus_terminal(&self, key: u64, w: &mut Window, cx: &mut Context<Self>) {
+        let active = self
+            .focused_right_pane(w, cx)
+            .and_then(|pane| self.sidebar.surface.layout.pane(pane))
+            .map(|pane| pane.active());
+        if !self.terminal_title_has_focus(w, cx)
+            && active == Some(RightPanelTab::Terminal(key))
+            && let Some(tab) = self.sidebar.terminals.get(&key)
+            && matches!(tab.connection, TerminalConnection::Connected)
+        {
+            tab.screen.update(cx, |screen, cx| screen.focus(w, cx));
+        }
     }
 
     fn rebuild_selectors(&mut self, w: &mut Window, cx: &mut Context<Self>) {
@@ -975,6 +3024,7 @@ impl DshApp {
         cx: &mut Context<Self>,
     ) -> Option<gpui::Entity<Select>> {
         let option = self
+            .conversation
             .config_options
             .iter()
             .find(|option| option.get("id").and_then(Value::as_str) == Some(config_id))?;
@@ -1016,21 +3066,134 @@ impl DshApp {
             ThemeMode::Dark
         };
         theme.set_mode(next);
+        self.sync_shell_window(cx);
+        self.save_workspace_preferences(cx);
         cx.refresh_windows();
+    }
+
+    fn sync_shell_window(&mut self, cx: &App) {
+        let dark = (!self.show_welcome).then(|| Theme::global(cx).mode == ThemeMode::Dark);
+        let presentation = (self.show_welcome, dark);
+        if self.shell_presentation != Some(presentation) {
+            self.shell_presentation = Some(presentation);
+            invoke(
+                "configure_shell_window",
+                json!({"welcome": self.show_welcome, "dark": dark}),
+            );
+        }
+    }
+
+    pub(crate) fn content_font_size(&self, base: f32) -> f32 {
+        (base + self.content_font_delta as f32).clamp(12., 20.)
+    }
+
+    pub(crate) fn set_content_font_delta(&mut self, delta: i32, cx: &mut Context<Self>) {
+        self.content_font_delta = delta.clamp(-2, 4);
+        self.save_workspace_preferences(cx);
+        cx.notify();
     }
 }
 
+mod browser;
+mod conversation;
+use conversation::Conversation;
+
+mod dock_controls;
+pub(crate) use dock_controls::dock_action_button;
+mod command_picker;
+mod composer_stats;
+mod dock_documents;
+mod dock_drag;
+mod dock_files;
+mod dock_strip;
+mod dock_tab_menu;
+mod document_code;
+pub(crate) mod document_fonts;
+mod document_frontmatter;
+mod document_html;
+mod document_selection;
 mod files;
+mod floating_panes;
+mod flow_motion;
+mod flow_scroll;
+mod header_chrome;
+mod menu_groups;
+mod menu_surface;
+mod message_feedback;
+mod model_menu;
+mod model_providers;
 mod panels;
 mod permission_dialog;
+mod permission_picker;
+mod plan;
+mod process_scroll;
+mod question_panel;
+mod runtime_settings;
+mod session_context_menu;
+mod session_download;
+mod session_feedback;
+mod session_markdown;
+mod shortcut_settings;
 mod start_panel;
+mod terminal;
+mod terminal_shell_menu;
+mod terminal_title;
+mod transcript_preferences;
 mod workspace;
 mod workspace_rows;
 mod workspace_search;
+mod workspace_watch;
 
 impl Render for DshApp {
     fn render(&mut self, w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.render_workspace(w, cx)
+        let width = f32::from(w.viewport_size().width);
+        let narrow = width < 1024.;
+        let drawer = width < 768. && !bridge::is_windows();
+        if self.sidebar_narrow != narrow || self.sidebar_drawer != drawer {
+            self.sidebar_narrow = narrow;
+            self.sidebar_drawer = drawer;
+            self.narrow_sidebar_expanded = false;
+            self.sidebar_dragging = false;
+            self.sidebar_slide = None;
+        }
+        document_html::begin_frames();
+        self.stats_dialog_bounds.set(None);
+        self.auto_open_plan_preview(w, cx);
+        self.update_right_panel_frame(w, cx);
+        self.update_float_panes(w, cx);
+        self.sync_dock_files(cx);
+        self.sync_dock_documents(cx);
+        self.sync_plan_previews(cx);
+        self.update_dock_strips(cx);
+        self.update_dock_tab_menu(w, cx);
+        self.update_terminal_shell_menu(cx);
+        self.header_menu_buttons.borrow_mut().clear();
+        self.update_header_menu(w, cx);
+        self.update_terminal_title(w, cx);
+        self.persist_right_sidebar();
+        self.dock_controls.begin_frame();
+        let workspace = self.render_workspace(w, cx);
+        self.dock_controls.end_frame();
+        if self.browser_shell.is_some() {
+            // The native surface needs the menu bounds measured during prepaint.
+            let owner = cx.weak_entity();
+            w.defer(cx, move |w, cx| {
+                if let Some(owner) = owner.upgrade() {
+                    owner.update(cx, |app, cx| app.sync_embedded_browser(w, cx));
+                }
+            });
+        }
+        workspace
+            .when_some(document_fonts::interface_family(cx), |root, family| {
+                root.font_family(family)
+            })
+            .when_some(
+                document_fonts::interface_fallbacks(cx),
+                |mut root, fallbacks| {
+                    root.text_style().font_fallbacks = Some(fallbacks);
+                    root
+                },
+            )
     }
 }
 
@@ -1056,10 +3219,42 @@ fn config_choices(option: &Value) -> Vec<PickerOption> {
 }
 
 fn picker_choice(value: &Value) -> Option<PickerOption> {
-    Some(PickerOption::new(
-        value.get("value")?.as_str()?.to_string(),
-        value.get("name")?.as_str()?.to_string(),
-    ))
+    let id = value.get("value")?.as_str()?;
+    let name = value.get("name")?.as_str()?;
+    let label = if id.is_empty() && name == "Provider default" {
+        "Default".to_string()
+    } else {
+        model_choice_name(id, Some(name))
+    };
+    Some(PickerOption::new(id.to_string(), label))
+}
+
+fn model_choice_name(value: &str, supplied: Option<&str>) -> String {
+    // The ACP controller can insert a legacy session's current model with
+    // only its route ID. Preserve explicit catalog names and custom labels.
+    if let Some(name) = supplied
+        && !matches!(
+            name,
+            "deepseek-flash" | "deepseek-v4-flash" | "deepseek-v4-pro"
+        )
+    {
+        return name.to_owned();
+    }
+    let route = serde_json::from_str::<[String; 2]>(value).ok();
+    let name = supplied.unwrap_or_else(|| route.as_ref().map_or(value, |[_, id]| id));
+    if route
+        .as_ref()
+        .is_some_and(|[provider, id]| provider == "deepseek-official" && id == name)
+    {
+        return match name {
+            "deepseek-flash" => "DeepSeek-V4.1-Flash",
+            "deepseek-v4-flash" => "DeepSeek-V4-Flash",
+            "deepseek-v4-pro" => "DeepSeek-V4-Pro",
+            _ => name,
+        }
+        .to_owned();
+    }
+    name.to_owned()
 }
 
 fn string_at(value: &Value, key: &str) -> String {
@@ -1068,4 +3263,112 @@ fn string_at(value: &Value, key: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
+}
+
+/// 组装 ACP `session/prompt` blocks：文本 + 内联图片（canonical base64）。
+fn build_prompt_payload(text: &str, attachments: &[DraftAttachment]) -> (String, Vec<Value>) {
+    let mut blocks = Vec::new();
+    let mut display_lines = Vec::new();
+    if !text.is_empty() {
+        blocks.push(json!({"type": "text", "text": text}));
+        display_lines.push(text.to_string());
+    }
+    let mut file_notes = Vec::new();
+    for item in attachments {
+        match item.kind {
+            AttachmentKind::Image => {
+                if let Some((mime, data)) = image_block_from_attachment(item) {
+                    blocks.push(json!({
+                        "type": "image",
+                        "mimeType": mime,
+                        "data": data,
+                    }));
+                    display_lines.push(format!("[图片] {}", item.name));
+                } else {
+                    let note = format!("[图片未就绪] {}", item.name);
+                    file_notes.push(note.clone());
+                    display_lines.push(note);
+                }
+            }
+            AttachmentKind::File => {
+                let note = format!("📎 {} ({})", item.name, format_bytes(item.size));
+                file_notes.push(note.clone());
+                display_lines.push(note);
+            }
+        }
+    }
+    if !file_notes.is_empty() {
+        let note = file_notes.join("\n");
+        if text.is_empty()
+            && blocks
+                .iter()
+                .all(|block| block.get("type") != Some(&json!("text")))
+        {
+            blocks.insert(0, json!({"type": "text", "text": note}));
+        } else if let Some(first) = blocks.first_mut() {
+            if first.get("type") == Some(&json!("text")) {
+                let existing = first
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let merged = if existing.is_empty() {
+                    note
+                } else {
+                    format!("{existing}\n\n{note}")
+                };
+                *first = json!({"type": "text", "text": merged});
+            } else {
+                blocks.insert(0, json!({"type": "text", "text": note}));
+            }
+        }
+    }
+    if blocks.is_empty() {
+        blocks.push(json!({"type": "text", "text": ""}));
+    }
+    (display_lines.join("\n"), blocks)
+}
+
+fn image_block_from_attachment(item: &DraftAttachment) -> Option<(String, String)> {
+    let preview = item.preview.as_deref()?;
+    let (header, data) = preview.split_once(",")?;
+    if !header.starts_with("data:") || !header.contains(";base64") {
+        return None;
+    }
+    let mime = header
+        .trim_start_matches("data:")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let mime = if mime.starts_with("image/") {
+        mime
+    } else if item.mime.starts_with("image/") {
+        item.mime.clone()
+    } else {
+        return None;
+    };
+    match mime.as_str() {
+        "image/png" | "image/jpeg" | "image/webp" | "image/gif" => {}
+        _ => return None,
+    }
+    let data = data.trim();
+    if data.is_empty() {
+        return None;
+    }
+    Some((mime, data.to_string()))
+}
+
+pub(crate) fn format_bytes(size: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = size as f64;
+    let mut unit = 0usize;
+    while value >= 1024. && unit + 1 < UNITS.len() {
+        value /= 1024.;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{size} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }

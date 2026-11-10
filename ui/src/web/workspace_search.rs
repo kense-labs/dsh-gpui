@@ -11,7 +11,7 @@ impl DshApp {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let p = Paint::get(cx);
+        let p = dsh(cx);
         self.search_slide
             .duration(if self.search_expanded { 1. } else { 0. }, 0.18, cx);
         let expanded = self.search_slide.get(w, cx).clamp(0., 1.);
@@ -67,23 +67,32 @@ impl DshApp {
                     .h(px(28. + 4. * expanded))
                     .flex_none()
                     .overflow_hidden()
-                    .rounded(px(6. + 6. * expanded))
+                    .rounded(px(8. + 4. * expanded))
+                    .pr(px(4. * expanded))
                     .border(px(0.5))
-                    .border_color(p.line.opacity(expanded))
-                    .child(
+                    .border_color(p.border_l4.opacity(expanded))
+                    .when(self.search_expanded, |search| {
+                        search.on_mouse_down_out(cx.listener(|this, _, w, cx| {
+                            if this.search_editor.read(cx).value().trim().is_empty() {
+                                this.close_workspace_search(w, cx);
+                            }
+                        }))
+                    })
+                    .child(super::dock_action_button(
                         div()
                             .id("expand-session-search")
                             .role(gpui::Role::Button)
                             .aria_label("搜索会话")
                             .aria_expanded(self.search_expanded)
                             .tab_index(0)
+                            .tab_stop(true)
                             .w(px(28.))
                             .h(px(28. + 4. * expanded))
                             .flex_none()
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded(px(6.))
+                            .rounded(px(8.))
                             .cursor_pointer()
                             .when(!self.search_expanded, |element| {
                                 element.hover(|style| style.bg(p.hover))
@@ -92,17 +101,14 @@ impl DshApp {
                                 svg()
                                     .data(include_bytes!("../../assets/workspace-search.svg"))
                                     .size(px(14. - 3. * expanded))
-                                    .text_color(p.secondary),
-                            )
-                            .on_click(cx.listener(|this, _, w, cx| {
-                                this.search_expanded = true;
-                                this.show_workspace_view_options = false;
-                                this.search_editor.update(cx, |editor, cx| {
-                                    editor.focus(w, cx);
-                                });
-                                cx.notify();
-                            })),
-                    )
+                                    .text_color(if self.search_expanded {
+                                        p.label_caption
+                                    } else {
+                                        p.label_tertiary
+                                    }),
+                            ),
+                        cx.listener(|this, _, w, cx| this.open_workspace_search(w, cx)),
+                    ))
                     .child(
                         div()
                             .flex_1()
@@ -113,7 +119,7 @@ impl DshApp {
                             .opacity(fade_in)
                             .child(self.search_editor.clone()),
                     )
-                    .child(
+                    .child(super::dock_action_button(
                         div()
                             .id("close-session-search")
                             .role(gpui::Role::Button)
@@ -127,17 +133,18 @@ impl DshApp {
                             .items_center()
                             .justify_center()
                             .overflow_hidden()
-                            .rounded(px(6.))
+                            .rounded(px(8.))
                             .opacity(fade_in)
                             .cursor_pointer()
                             .hover(|style| style.bg(p.hover))
-                            .child(icon(Glyph::Close, 12., p.secondary))
-                            .on_click(cx.listener(|this, _, w, cx| {
-                                replace(&this.search_editor, "", w, cx);
-                                this.search_expanded = false;
-                                cx.notify();
-                            })),
-                    ),
+                            .child(
+                                svg()
+                                    .data(include_bytes!("../../assets/dock-tab-close.svg"))
+                                    .size(px(14.))
+                                    .text_color(p.label_secondary),
+                            ),
+                        cx.listener(|this, _, w, cx| this.close_workspace_search(w, cx)),
+                    )),
             )
             .child(
                 row()
@@ -181,7 +188,7 @@ impl DshApp {
                                     this.show_workspace_view_options =
                                         !this.show_workspace_view_options;
                                     this.show_workspace_menu = false;
-                                    this.show_account_menu = false;
+                                    this.show_more_menu = false;
                                     this.composer_menu = None;
                                     cx.stop_propagation();
                                     cx.notify();
@@ -222,5 +229,30 @@ impl DshApp {
                             })),
                     ),
             )
+    }
+
+    pub(super) fn open_workspace_search(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        if self.rail_active(w) {
+            self.set_left_sidebar_collapsed(false, w, cx);
+        }
+        self.search_expanded = true;
+        self.show_workspace_view_options = false;
+        self.search_editor.update(cx, |editor, cx| {
+            editor.disabled = false;
+            editor.focus(w, cx);
+        });
+        cx.notify();
+    }
+
+    pub(super) fn close_workspace_search(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        self.search_editor.update(cx, |editor, cx| {
+            if editor.focus.is_focused(w) {
+                w.blur(cx);
+            }
+            editor.disabled = true;
+            editor.set_value("", w, cx);
+        });
+        self.search_expanded = false;
+        cx.notify();
     }
 }

@@ -13,6 +13,8 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, oneshot};
 
 const EVENT_NAME: &str = "acp-event";
+const SESSION_BRIDGE: &str = include_str!("../../services/acp-session-bridge.mjs");
+const ASK_USER_TOOL: &str = include_str!("../../services/vendor/dsh-tool-ask-user/index.mjs");
 
 /// Owns the single ACP connection shared by all windows and sessions.
 #[derive(Default)]
@@ -26,27 +28,40 @@ struct AcpConnection {
     child: Mutex<Child>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
     stopping: AtomicBool,
+    session_bridge: bool,
 }
 
 impl AcpConnection {
     async fn spawn(service_path: &Path, app: AppHandle) -> Result<Arc<Self>, String> {
         let built = service_path.join("apps/cli/lib/bin.js");
         let source = service_path.join("apps/cli/src/bin.ts");
-        let node = std::env::var_os("DSH_NODE").unwrap_or_else(|| "node".into());
+        let node = resolve_node();
         let mut command = Command::new(node);
         command.current_dir(service_path);
-        if built.is_file() {
-            command.arg(&built).args(["--profile", "acp"]);
+        let (entry, profile) = if built.is_file() {
+            (built, service_path.join("apps/cli/lib/profile-boot.js"))
         } else if source.is_file() {
-            command
-                .args(["--import", "tsx/esm"])
-                .arg(&source)
-                .args(["--profile", "acp"]);
+            command.args(["--import", "tsx/esm"]);
+            (source, service_path.join("apps/cli/src/profile-boot.ts"))
         } else {
             return Err(format!(
                 "未找到 dsh-acp 启动入口：{}。请先运行 pnpm install 和 pnpm run build。",
                 service_path.display()
             ));
+        };
+        let session_bridge = profile.is_file();
+        if session_bridge {
+            let ask_tool =
+                serde_json::to_string(ASK_USER_TOOL).map_err(|error| error.to_string())?;
+            let bridge = format!("const bundledAskUser = {ask_tool};\n{SESSION_BRIDGE}");
+            command
+                .args(["--input-type=module", "--eval"])
+                .arg(bridge)
+                .args(["--", "dsh-gpui-acp"])
+                .arg(service_path)
+                .arg(profile);
+        } else {
+            command.arg(entry).args(["--profile", "acp"]);
         }
         command
             .stdin(Stdio::piped())
@@ -67,6 +82,7 @@ impl AcpConnection {
             child: Mutex::new(child),
             pending: Mutex::new(HashMap::new()),
             stopping: AtomicBool::new(false),
+            session_bridge,
         });
 
         tokio::spawn(read_stdout(connection.clone(), stdout, app.clone()));
@@ -196,7 +212,10 @@ async fn route_message(connection: &Arc<AcpConnection>, app: &AppHandle, message
             }
         }
         (Some("session/update"), None) => {
-            let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
+            let mut params = message.get("params").cloned().unwrap_or_else(|| json!({}));
+            if let Some(options) = params.pointer_mut("/update/configOptions") {
+                filter_account_models(options);
+            }
             emit(
                 app,
                 "session_update",
@@ -267,6 +286,8 @@ pub struct StartServiceReply {
     pub agent: Value,
     pub workspace: String,
     pub service_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_providers: Option<Value>,
 }
 
 #[tauri::command]
@@ -294,6 +315,17 @@ pub async fn start_service(
             }),
         )
         .await?;
+    let model_providers = if connection.session_bridge {
+        connection
+            .request("_dsh/gpui/session/questions", json!({}))
+            .await?;
+        connection
+            .request("_dsh/gpui/providers/list", json!({}))
+            .await
+            .ok()
+    } else {
+        None
+    };
     emit(
         &app,
         "service",
@@ -304,6 +336,7 @@ pub async fn start_service(
         agent,
         workspace: workspace.display().to_string(),
         service_path: service_path.display().to_string(),
+        model_providers,
     })
 }
 
@@ -317,10 +350,14 @@ pub async fn stop_service(service: State<'_, AcpService>) -> Result<(), String> 
 
 #[tauri::command]
 pub async fn new_session(cwd: String, service: State<'_, AcpService>) -> Result<Value, String> {
-    connection(&service)
-        .await?
+    let connection = connection(&service).await?;
+    let mut reply = connection
         .request("session/new", json!({"cwd": cwd, "mcpServers": []}))
-        .await
+        .await?;
+    if let Some(id) = reply["sessionId"].as_str().map(str::to_owned) {
+        prepare_session_models(&connection, &id, &mut reply).await;
+    }
+    Ok(reply)
 }
 
 #[tauri::command]
@@ -341,13 +378,139 @@ pub async fn resume_session(
     cwd: String,
     service: State<'_, AcpService>,
 ) -> Result<Value, String> {
-    connection(&service)
-        .await?
+    let connection = connection(&service).await?;
+    resume_with_key_models(&connection, &session_id, &cwd).await
+}
+
+async fn resume_with_key_models(
+    connection: &AcpConnection,
+    session_id: &str,
+    cwd: &str,
+) -> Result<Value, String> {
+    let mut reply = connection
         .request(
             "session/resume",
             json!({"sessionId": session_id, "cwd": cwd, "mcpServers": []}),
         )
+        .await?;
+    prepare_session_models(connection, session_id, &mut reply).await;
+    Ok(reply)
+}
+
+fn model_address(value: &str) -> Option<[String; 2]> {
+    serde_json::from_str(value).ok()
+}
+
+fn fallback_key_model(config_options: &Value) -> Option<String> {
+    let model = config_options
+        .as_array()?
+        .iter()
+        .find(|option| option["id"] == "model")?;
+    let [provider, previous_model] = model_address(model["currentValue"].as_str()?)?;
+    if provider != "deepseek-account" {
+        return None;
+    }
+    let group = model["options"]
+        .as_array()?
+        .iter()
+        .find(|group| group["group"] == "deepseek-official")?;
+    let choices = group["options"].as_array()?;
+    choices
+        .iter()
+        .find(|choice| {
+            choice["value"]
+                .as_str()
+                .and_then(model_address)
+                .is_some_and(|[_, model]| model == previous_model)
+        })
+        .or_else(|| choices.first())?["value"]
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn filter_account_models(config_options: &mut Value) {
+    if let Some(options) = config_options.as_array_mut()
+        && let Some(model) = options.iter_mut().find(|option| option["id"] == "model")
+        && let Some(choices) = model["options"].as_array_mut()
+    {
+        choices.retain(|item| {
+            item["group"] != "deepseek-account"
+                && item["value"]
+                    .as_str()
+                    .and_then(model_address)
+                    .is_none_or(|[provider, _]| provider != "deepseek-account")
+        });
+    }
+}
+
+async fn prepare_session_models(connection: &AcpConnection, session_id: &str, reply: &mut Value) {
+    if let Some(value) = fallback_key_model(&reply["configOptions"])
+        && let Ok(mut changed) = connection
+            .request(
+                "session/set_config_option",
+                json!({"sessionId":session_id,"configId":"model","value":value}),
+            )
+            .await
+    {
+        reply["configOptions"] = changed["configOptions"].take();
+    }
+    if let Some(options) = reply.get_mut("configOptions") {
+        filter_account_models(options);
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn rename_session(
+    webview: tauri::Webview,
+    session_id: String,
+    title: String,
+    service: State<'_, AcpService>,
+) -> Result<Value, String> {
+    if webview.label() != "main" || session_id.is_empty() {
+        return Err("session/not-found".into());
+    }
+    let connection = connection(&service).await?;
+    if !connection.session_bridge {
+        return Err("当前服务不支持重命名会话。".into());
+    }
+    connection
+        .request(
+            "_dsh/gpui/session/rename",
+            json!({"sessionId": session_id, "title": title}),
+        )
         .await
+}
+
+#[tauri::command]
+pub(crate) async fn fork_session(
+    webview: tauri::Webview,
+    session_id: String,
+    at_seq: Option<u64>,
+    open: bool,
+    allow_migration: bool,
+    service: State<'_, AcpService>,
+) -> Result<Value, String> {
+    if webview.label() != "main" || session_id.is_empty() {
+        return Err("session/not-found".into());
+    }
+    let connection = connection(&service).await?;
+    if !connection.session_bridge {
+        return Err("session/fork-unavailable".into());
+    }
+    let mut params = json!({"sessionId": session_id, "allowMigration": allow_migration});
+    if let Some(seq) = at_seq {
+        params["atSeq"] = seq.into();
+    }
+    let mut child = connection.request("_dsh/gpui/session/fork", params).await?;
+    if open {
+        let id = child["sessionId"]
+            .as_str()
+            .ok_or("分支会话缺少 Session ID")?;
+        let cwd = child["cwd"].as_str().ok_or("分支会话缺少工作目录")?;
+        let resumed = resume_with_key_models(&connection, id, cwd).await?;
+        child["configOptions"] = resumed["configOptions"].clone();
+    }
+    Ok(child)
 }
 
 #[tauri::command]
@@ -364,14 +527,22 @@ pub async fn close_session(
 #[tauri::command]
 pub async fn prompt(
     session_id: String,
-    text: String,
+    text: Option<String>,
+    prompt: Option<Value>,
     service: State<'_, AcpService>,
 ) -> Result<Value, String> {
+    let blocks = match prompt {
+        Some(Value::Array(items)) if !items.is_empty() => Value::Array(items),
+        _ => {
+            let text = text.unwrap_or_default();
+            json!([{"type": "text", "text": text}])
+        }
+    };
     connection(&service)
         .await?
         .request(
             "session/prompt",
-            json!({"sessionId": session_id, "prompt": [{"type": "text", "text": text}]}),
+            json!({"sessionId": session_id, "prompt": blocks}),
         )
         .await
 }
@@ -394,13 +565,22 @@ pub async fn set_config_option(
     value: String,
     service: State<'_, AcpService>,
 ) -> Result<Value, String> {
-    connection(&service)
+    if config_id == "model"
+        && model_address(&value).is_some_and(|[provider, _]| provider == "deepseek-account")
+    {
+        return Err("请选择使用 API Key 的模型。".into());
+    }
+    let mut reply = connection(&service)
         .await?
         .request(
             "session/set_config_option",
             json!({"sessionId": session_id, "configId": config_id, "value": value}),
         )
-        .await
+        .await?;
+    if let Some(options) = reply.get_mut("configOptions") {
+        filter_account_models(options);
+    }
+    Ok(reply)
 }
 
 #[tauri::command]
@@ -416,6 +596,329 @@ pub async fn respond_permission(
             json!({"outcome": {"outcome": "selected", "optionId": option_id}}),
         )
         .await
+}
+
+#[tauri::command]
+pub(crate) async fn plan_mode(
+    webview: tauri::Webview,
+    session_id: String,
+    active: Option<bool>,
+    service: State<'_, AcpService>,
+) -> Result<Value, String> {
+    if webview.label() != "main" || session_id.is_empty() {
+        return Err("plan/unavailable".into());
+    }
+    let connection = connection(&service).await?;
+    if !connection.session_bridge {
+        return Err("当前服务不支持计划模式。".into());
+    }
+    connection
+        .request(
+            "_dsh/gpui/session/plan-mode",
+            json!({"sessionId": session_id, "active": active}),
+        )
+        .await
+}
+
+#[tauri::command]
+pub(crate) async fn permission_mode(
+    webview: tauri::Webview,
+    session_id: String,
+    preset: Option<String>,
+    acknowledged: Option<bool>,
+    service: State<'_, AcpService>,
+) -> Result<Value, String> {
+    if webview.label() != "main" || session_id.is_empty() {
+        return Err("permission/unavailable".into());
+    }
+    let connection = connection(&service).await?;
+    if !connection.session_bridge {
+        return Err("当前服务不支持切换权限。".into());
+    }
+    connection
+        .request(
+            "_dsh/gpui/session/permission-mode",
+            json!({"sessionId": session_id, "preset": preset, "acknowledged": acknowledged}),
+        )
+        .await
+}
+
+#[derive(serde::Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum PlanDecision {
+    Approve,
+    Discuss,
+}
+
+#[tauri::command]
+pub(crate) async fn respond_plan_review(
+    webview: tauri::Webview,
+    session_id: String,
+    request_id: String,
+    decision: PlanDecision,
+    service: State<'_, AcpService>,
+) -> Result<(), String> {
+    if webview.label() != "main" || session_id.is_empty() || request_id.is_empty() {
+        return Err("plan/review-closed".into());
+    }
+    let connection = connection(&service).await?;
+    if !connection.session_bridge {
+        return Err("当前服务不支持计划审阅。".into());
+    }
+    connection
+        .request(
+            "_dsh/gpui/session/plan-review",
+            json!({"sessionId": session_id, "requestId": request_id, "decision": decision}),
+        )
+        .await?;
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn question_state(
+    webview: tauri::Webview,
+    session_id: String,
+    service: State<'_, AcpService>,
+) -> Result<Value, String> {
+    if webview.label() != "main" || session_id.is_empty() {
+        return Err("question/unavailable".into());
+    }
+    let connection = connection(&service).await?;
+    if !connection.session_bridge {
+        return Ok(json!([]));
+    }
+    connection
+        .request(
+            "_dsh/gpui/session/questions",
+            json!({"sessionId": session_id}),
+        )
+        .await
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ModelProviderAction {
+    List,
+    Save,
+    Remove,
+    Discover,
+}
+
+#[tauri::command]
+pub(crate) async fn model_providers(
+    webview: tauri::Webview,
+    action: ModelProviderAction,
+    draft: Option<Value>,
+    service: State<'_, AcpService>,
+) -> Result<Value, String> {
+    if webview.label() != "main" {
+        return Err("仅主窗口可管理模型服务。".into());
+    }
+    let connection = connection(&service).await?;
+    if !connection.session_bridge {
+        return Err("当前 dsh-acp 不支持编辑模型服务。".into());
+    }
+    let method = match action {
+        ModelProviderAction::List => "_dsh/gpui/providers/list",
+        ModelProviderAction::Save => "_dsh/gpui/providers/save",
+        ModelProviderAction::Remove => "_dsh/gpui/providers/remove",
+        ModelProviderAction::Discover => "_dsh/gpui/providers/discover",
+    };
+    connection
+        .request(method, draft.unwrap_or_else(|| json!({})))
+        .await
+}
+
+#[derive(serde::Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum QuestionDecision {
+    Answer,
+    Cancel,
+    Timeout,
+}
+
+#[derive(serde::Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum RuntimeSettingsPage {
+    Shell,
+    AgentLoop,
+}
+
+#[tauri::command]
+pub(crate) async fn runtime_settings(
+    webview: tauri::Webview,
+    page: RuntimeSettingsPage,
+    change: Option<Value>,
+    service: State<'_, AcpService>,
+) -> Result<Value, String> {
+    if webview.label() != "main" {
+        return Err("仅主窗口可编辑运行设置。".into());
+    }
+    let connection = connection(&service).await?;
+    if !connection.session_bridge {
+        return Ok(Value::Null);
+    }
+    connection
+        .request(
+            "_dsh/gpui/runtime-settings",
+            json!({"page":page,"change":change}),
+        )
+        .await
+}
+
+#[tauri::command]
+pub(crate) async fn respond_question(
+    webview: tauri::Webview,
+    session_id: String,
+    request_id: String,
+    decision: QuestionDecision,
+    answers: Option<Vec<Value>>,
+    service: State<'_, AcpService>,
+) -> Result<(), String> {
+    if webview.label() != "main" || session_id.is_empty() || request_id.is_empty() {
+        return Err("question/unavailable".into());
+    }
+    let connection = connection(&service).await?;
+    if !connection.session_bridge {
+        return Err("当前服务不支持问答。".into());
+    }
+    connection
+        .request(
+            "_dsh/gpui/session/question-decision",
+            json!({"sessionId": session_id, "requestId": request_id, "decision": decision, "answers": answers}),
+        )
+        .await?;
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn record_session_feedback(
+    webview: tauri::Webview,
+    session_id: String,
+    text: Option<String>,
+    category: Option<FeedbackCategory>,
+    service: State<'_, AcpService>,
+) -> Result<(), String> {
+    if webview.label() != "main" || session_id.is_empty() {
+        return Err("session-not-found".into());
+    }
+    let connection = connection(&service).await?;
+    if !connection.session_bridge {
+        return Err("feedback-unavailable".into());
+    }
+    let mut params = json!({"sessionId": session_id});
+    if let Some(text) = text {
+        params["text"] = text.into();
+    }
+    if let Some(category) = category {
+        params["category"] = json!(category);
+    }
+    let reply = connection
+        .request("_dsh/gpui/session/feedback", params)
+        .await?;
+    if reply["ok"] == true && reply["value"]["recorded"] == true {
+        Ok(())
+    } else {
+        Err(reply["error"]["code"]
+            .as_str()
+            .unwrap_or("feedback-failed")
+            .to_owned())
+    }
+}
+
+#[derive(Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum FeedbackCategory {
+    TaskResult,
+    InstructionFollowing,
+    ProductInteraction,
+    ServiceStability,
+    ResourceCost,
+    SecurityPrivacyPermission,
+    Other,
+}
+
+#[derive(Serialize, serde::Deserialize)]
+#[serde(
+    tag = "operation",
+    rename_all = "lowercase",
+    rename_all_fields = "camelCase"
+)]
+pub(crate) enum MessageFeedbackRequest {
+    List,
+    Put {
+        message_id: String,
+        rating: MessageRating,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        category: Option<FeedbackCategory>,
+        if_version: Option<String>,
+    },
+    Delete {
+        message_id: String,
+        if_version: String,
+    },
+}
+
+#[derive(Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum MessageRating {
+    Positive,
+    Negative,
+}
+
+#[tauri::command]
+pub(crate) async fn message_feedback(
+    webview: tauri::Webview,
+    session_id: String,
+    request: MessageFeedbackRequest,
+    service: State<'_, AcpService>,
+) -> Result<Value, String> {
+    if webview.label() != "main" || session_id.is_empty() {
+        return Err("session-not-found".into());
+    }
+    let connection = connection(&service).await?;
+    if !connection.session_bridge {
+        return Err("feedback-unavailable".into());
+    }
+    let method = match &request {
+        MessageFeedbackRequest::List => "_dsh/gpui/message-feedback/list",
+        MessageFeedbackRequest::Put { .. } => "_dsh/gpui/message-feedback/put",
+        MessageFeedbackRequest::Delete { .. } => "_dsh/gpui/message-feedback/delete",
+    };
+    let mut params = serde_json::to_value(request).map_err(|error| error.to_string())?;
+    if let Value::Object(params) = &mut params {
+        params.remove("operation");
+        params.insert("sessionId".into(), session_id.into());
+    }
+    connection.request(method, params).await
+}
+
+/// Capture the current ACP process for an export. A later service restart
+/// cannot silently redirect the durability request to a different process.
+pub(crate) struct SessionFlush(Option<Arc<AcpConnection>>);
+
+impl SessionFlush {
+    pub(crate) async fn new(service: &AcpService) -> Self {
+        Self(
+            service
+                .connection
+                .lock()
+                .await
+                .clone()
+                .filter(|connection| connection.session_bridge),
+        )
+    }
+
+    pub(crate) async fn flush(&self, id: &str) -> Result<(), String> {
+        if let Some(connection) = &self.0 {
+            connection
+                .request("_dsh/gpui/session/flush", json!({"sessionId":id}))
+                .await?;
+        }
+        Ok(())
+    }
 }
 
 async fn connection(service: &AcpService) -> Result<Arc<AcpConnection>, String> {
@@ -441,6 +944,64 @@ fn resolve_workspace(value: Option<&str>) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
+/// Resolve a Node.js binary for spawning dsh-acp and the credential helper.
+/// GUI launches often have a minimal PATH, so probe known install locations.
+pub(crate) fn resolve_node() -> std::ffi::OsString {
+    if let Some(value) = std::env::var_os("DSH_NODE") {
+        let path = PathBuf::from(&value);
+        if path.is_file() || which_exists(&path) {
+            return value;
+        }
+    }
+    if which_exists(Path::new("node")) {
+        return "node".into();
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    // Prefer a full Node install (fnm/homebrew) over the Harness runtime Node —
+    // the latter can miss native addons built for a different ABI.
+    let mut candidates = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(home.join(".local/share/fnm/node-versions")) {
+        let mut versions: Vec<_> = entries.flatten().map(|entry| entry.path()).collect();
+        versions.sort();
+        versions.reverse();
+        for version in versions {
+            candidates.push(version.join("installation/bin/node"));
+        }
+    }
+    candidates.extend([
+        PathBuf::from("/opt/homebrew/bin/node"),
+        PathBuf::from("/usr/local/bin/node"),
+        home.join(".dsh/dsh-runtimes/dsh-primary-runtime/dependencies/node/bin/node"),
+    ]);
+    for candidate in candidates {
+        if candidate.is_file() {
+            return candidate.into_os_string();
+        }
+    }
+    // Fall back to bare name so the spawn error still mentions "node".
+    "node".into()
+}
+
+fn which_exists(path: &Path) -> bool {
+    if path.components().count() == 1 {
+        let Some(path_env) = std::env::var_os("PATH") else {
+            return false;
+        };
+        for dir in std::env::split_paths(&path_env) {
+            let candidate = dir.join(path);
+            if candidate.is_file() {
+                return true;
+            }
+        }
+        false
+    } else {
+        path.is_file()
+    }
+}
+
 pub(crate) fn resolve_service_path(value: Option<&str>) -> Result<PathBuf, String> {
     if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
         let path = absolute_path(Path::new(value))?;
@@ -451,7 +1012,9 @@ pub(crate) fn resolve_service_path(value: Option<&str>) -> Result<PathBuf, Strin
     if let Some(path) = std::env::var_os("DSH_ACP_PATH") {
         let path = PathBuf::from(path);
         if path.is_dir() {
-            return Ok(path);
+            return path
+                .canonicalize()
+                .map_err(|error| format!("dsh-acp 路径不可访问 {}：{error}", path.display()));
         }
     }
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -493,8 +1056,31 @@ impl AcpService {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_response;
+    use super::{
+        MessageFeedbackRequest, decode_response, fallback_key_model, filter_account_models,
+    };
     use serde_json::json;
+
+    #[test]
+    fn existing_account_session_prefers_the_same_model_with_an_api_key() {
+        let mut options = json!([{"id":"model","currentValue":"[\"deepseek-account\",\"deepseek-v4-pro\"]",
+            "options":[
+                {"group":"deepseek-account","options":[{"value":"[\"deepseek-account\",\"deepseek-v4-pro\"]"}]},
+                {"group":"deepseek-official","options":[
+                    {"value":"[\"deepseek-official\",\"deepseek-v4-flash\"]"},
+                    {"value":"[\"deepseek-official\",\"deepseek-v4-pro\"]"}
+                ]},
+                {"group":"custom","options":[{"value":"[\"custom\",\"private-model\"]"}]}
+            ]
+        }]);
+        let replacement = fallback_key_model(&options).unwrap();
+        assert_eq!(replacement, "[\"deepseek-official\",\"deepseek-v4-pro\"]");
+        options[0]["currentValue"] = replacement.into();
+        filter_account_models(&mut options);
+        assert_eq!(options[0]["options"][0]["group"], "deepseek-official");
+        assert_eq!(options[0]["options"][1]["group"], "custom");
+        assert_eq!(fallback_key_model(&options), None);
+    }
 
     #[test]
     fn response_returns_the_result_without_transport_fields() {
@@ -515,5 +1101,21 @@ mod tests {
         let error = decode_response(&response).expect_err("invalid response");
         assert!(error.contains("-32602"));
         assert!(error.contains("cwd must be absolute"));
+    }
+
+    #[test]
+    fn first_rating_sends_an_explicit_absence_precondition() {
+        let request: MessageFeedbackRequest = serde_json::from_value(json!({
+            "operation": "put", "messageId": "answer", "rating": "positive",
+        }))
+        .unwrap();
+        let wire = serde_json::to_value(request).unwrap();
+        assert_eq!(
+            wire,
+            json!({
+                "operation": "put", "messageId": "answer",
+                "rating": "positive", "ifVersion": null,
+            })
+        );
     }
 }

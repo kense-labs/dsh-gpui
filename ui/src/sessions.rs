@@ -6,6 +6,8 @@ pub(crate) struct SessionSummary {
     pub(crate) cwd: String,
     pub(crate) title: Option<String>,
     pub(crate) blank: bool,
+    /// Unix epoch milliseconds from ACP `session/list` `createdAt`（官方相对时间）。
+    pub(crate) created_at_ms: Option<u64>,
 }
 
 impl SessionSummary {
@@ -15,6 +17,80 @@ impl SessionSummary {
         } else {
             "未命名会话"
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SessionIndicator {
+    #[default]
+    Idle,
+    Running,
+    Subagents(usize),
+    Approval,
+    PlanReview,
+    Question,
+    Unread,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingInteraction {
+    Approval,
+    PlanReview,
+    Question,
+}
+
+#[derive(Default)]
+pub(crate) struct SessionActivity {
+    host_running: Option<bool>,
+    unread: bool,
+    pub(crate) last_prompt_at_ms: Option<u64>,
+}
+
+impl SessionActivity {
+    pub(crate) fn observe_host(&mut self, running: bool, local_running: bool, selected: bool) {
+        let previous = self.host_running.replace(running).unwrap_or(local_running);
+        self.transition(previous, running, selected);
+    }
+
+    pub(crate) fn observe_local(&mut self, previous: bool, running: bool, selected: bool) {
+        if self.host_running.is_none() {
+            self.transition(previous, running, selected);
+        }
+    }
+
+    fn transition(&mut self, previous: bool, running: bool, selected: bool) {
+        if running || selected {
+            self.unread = false;
+        } else if previous {
+            self.unread = true;
+        }
+    }
+
+    pub(crate) fn acknowledge(&mut self) {
+        self.unread = false;
+    }
+
+    pub(crate) fn indicator(
+        &self,
+        local_running: bool,
+        pending: Option<PendingInteraction>,
+        subagents: usize,
+    ) -> SessionIndicator {
+        if let Some(pending) = pending {
+            match pending {
+                PendingInteraction::Approval => SessionIndicator::Approval,
+                PendingInteraction::PlanReview => SessionIndicator::PlanReview,
+                PendingInteraction::Question => SessionIndicator::Question,
+            }
+        } else if self.host_running.unwrap_or(local_running) {
+            SessionIndicator::Running
+        } else if subagents > 0 {
+            SessionIndicator::Subagents(subagents)
+        } else if self.unread {
+            SessionIndicator::Unread
+        } else {
+            SessionIndicator::Idle
+        }
     }
 }
 
@@ -46,6 +122,7 @@ pub(crate) fn merge_session_page(
                     cwd: String::new(),
                     title: None,
                     blank: true,
+                    created_at_ms: None,
                 })
             })
     });
@@ -56,11 +133,13 @@ pub(crate) fn merge_session_page(
         {
             continue;
         }
-        if let Some(existing) = known
-            .iter()
-            .find(|existing| existing.id == session.id && existing.title.is_some())
-        {
-            session.title = existing.title.clone();
+        if let Some(existing) = known.iter().find(|existing| existing.id == session.id) {
+            if existing.title.is_some() {
+                session.title = existing.title.clone();
+            }
+            if session.created_at_ms.is_none() {
+                session.created_at_ms = existing.created_at_ms;
+            }
         }
         if let Some(existing) = known.iter_mut().find(|known| known.id == session.id) {
             *existing = session;
@@ -75,6 +154,30 @@ pub(crate) fn merge_session_page(
     }
 }
 
+/// Compact relative time used by the official workspace rows.
+pub(crate) fn relative_session_age(updated_at_ms: u64, now_ms: u64) -> String {
+    let delta = now_ms.saturating_sub(updated_at_ms);
+    let minutes = delta / 60_000;
+    if minutes < 1 {
+        return "刚刚".into();
+    }
+    if minutes < 60 {
+        return format!("{minutes}分钟");
+    }
+    let hours = minutes / 60;
+    if hours < 24 {
+        return format!("{hours}小时");
+    }
+    let days = hours / 24;
+    if days < 30 {
+        format!("{days}天")
+    } else if days < 365 {
+        format!("{}个月", days / 30)
+    } else {
+        format!("{}年", days / 365)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,7 +188,58 @@ mod tests {
             cwd: "/work".into(),
             title: title.map(str::to_string),
             blank,
+            created_at_ms: None,
         }
+    }
+
+    #[test]
+    fn relative_age_uses_the_official_buckets() {
+        assert_eq!(relative_session_age(10, 0), "刚刚");
+        assert_eq!(relative_session_age(0, 30_000), "刚刚");
+        assert_eq!(relative_session_age(0, 3 * 60 * 60 * 1000), "3小时");
+        assert_eq!(relative_session_age(0, 4 * 24 * 60 * 60 * 1000), "4天");
+        assert_eq!(relative_session_age(0, 30 * 86_400_000), "1个月");
+        assert_eq!(relative_session_age(0, 364 * 86_400_000), "12个月");
+        assert_eq!(relative_session_age(0, 365 * 86_400_000), "1年");
+    }
+
+    #[test]
+    fn unread_tracks_host_activity_and_yields_to_pending_work() {
+        use SessionIndicator::*;
+        let mut status = SessionActivity::default();
+        status.observe_host(false, false, false);
+        assert_eq!(status.indicator(false, None, 0), Idle);
+        status.observe_host(true, false, false);
+        assert_eq!(status.indicator(false, None, 0), Running);
+        assert_eq!(
+            status.indicator(false, Some(PendingInteraction::Approval), 1),
+            Approval
+        );
+        assert_eq!(
+            status.indicator(false, Some(PendingInteraction::PlanReview), 1),
+            PlanReview
+        );
+        status.observe_host(false, true, false);
+        assert_eq!(status.indicator(true, None, 2), Subagents(2));
+        assert_eq!(status.indicator(true, None, 0), Unread);
+        status.acknowledge();
+        assert_eq!(status.indicator(false, None, 0), Idle);
+        status.observe_host(true, false, true);
+        status.observe_host(false, true, true);
+        assert_eq!(status.indicator(false, None, 0), Idle);
+    }
+
+    #[test]
+    fn local_completion_is_only_a_fallback_for_an_unobserved_agent() {
+        use SessionIndicator::*;
+        let mut status = SessionActivity::default();
+        status.observe_local(true, false, false);
+        assert_eq!(status.indicator(false, None, 0), Unread);
+        status.observe_local(false, true, false);
+        assert_eq!(status.indicator(true, None, 0), Running);
+        status.observe_host(true, true, false);
+        status.observe_local(true, false, false);
+        assert_eq!(status.indicator(false, None, 0), Running);
     }
 
     #[test]

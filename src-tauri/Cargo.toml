@@ -3,20 +3,48 @@ name = "dsh-gpui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Tauri ACP host for the DeepSeek Harness GPUI client"
+description = "Tauri ACP host for KWork"
 build = "build.rs"
 
 [[bin]]
-name = "DeepSeekHarness"
+name = "KWork"
 path = "src/main.rs"
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri = { version = "2", features = ["tray-icon", "image-png", "unstable"] }
 tauri-plugin-opener = "2"
 url = "2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip", "preserve_order"] }
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+portable-pty = "0.8"
+rquickjs = { version = "0.11.0", features = ["parallel"] }
+uuid = { version = "1", features = ["v4"] }
+zstd = "0.13"
+zip = { version = "7.3.0", default-features = false, features = ["deflate-flate2"] }
+sha2 = "0.10"
+tempfile = "3"
+indexmap = "2"
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+notify = "8.2.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-text = "21"
+ttf-parser = "0.25"
+block2 = "0.6"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSButton", "NSEvent", "NSMenu", "NSMenuItem", "NSPasteboard", "NSSavePanel", "NSView", "NSWindow", "block2", "objc2-quartz-core"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGPath"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSDictionary", "NSError", "NSGeometry", "NSKeyValueObserving", "NSNotification", "NSOperation", "NSString", "NSURL", "NSURLAuthenticationChallenge", "NSURLCredential", "NSURLProtectionSpace", "NSURLRequest", "NSURLResponse", "NSURLSession", "NSURLError", "block2"] }
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "CALayer", "CAShapeLayer", "CATransaction", "objc2-core-graphics"] }
+objc2-web-kit = { version = "0.3.2", default-features = false, features = ["std", "WKBackForwardList", "WKBackForwardListItem", "WKDownload", "WKFrameInfo", "WKNavigation", "WKNavigationAction", "WKNavigationDelegate", "WKNavigationResponse", "WKSecurityOrigin", "WKUIDelegate", "WKWebView", "WKWebViewConfiguration", "WKWebsiteDataStore", "WKWindowFeatures", "block2", "objc2-app-kit"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
+webkit2gtk = "2.0.2"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
