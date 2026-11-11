@@ -3549,11 +3549,11 @@ impl DshApp {
         let stopping = self.conversation.running && empty;
         let queueing = self.conversation.running && !empty;
         let enabled = stopping
-            || (!self.conversation.permission_mode.changing()
+            || (!self.creating_session
+                && !self.conversation.permission_mode.changing()
                 && (self.conversation.running
                     || (self.connected()
                         && self.conversation.acp_open
-                        && !self.creating_session
                         && (!self.conversation.history_loading
                             || self.conversation.history_prepend_pending)
                         && !empty
@@ -3590,23 +3590,6 @@ impl DshApp {
         button = if stopping {
             // 官方停止图标：3,3 起 10×10、rx3 的方块。
             button.child(div().size(px(10.)).rounded(px(3.)).bg(ink))
-        } else if self.creating_session {
-            // 官方启动 spinner：白色弧线，0.8s 线性旋转。
-            button.child(
-                svg()
-                    .data(SPINNER_ARC_SVG)
-                    .size(px(18.))
-                    .text_color(gpui::Hsla::from(ink))
-                    .with_animation(
-                        gpui::ElementId::Name("send-spinner".into()),
-                        gpui::Animation::new(std::time::Duration::from_millis(800)).repeat(),
-                        |el, t| {
-                            el.with_transformation(gpui::Transformation::default().with_rotation(
-                                gpui::radians(t.clamp(0., 1.) * 2. * std::f32::consts::PI),
-                            ))
-                        },
-                    ),
-            )
         } else {
             button.child(icon(Glyph::ArrowUp, 18., ink.into()))
         };
@@ -3620,10 +3603,8 @@ impl DshApp {
             } else {
                 button.on_click(cx.listener(|this, _, w, cx| this.submit_prompt(w, cx)))
             }
-        } else if !self.creating_session {
-            button.opacity(0.4).cursor_default()
         } else {
-            button.cursor_default()
+            button.opacity(0.4).cursor_default()
         }
     }
 
