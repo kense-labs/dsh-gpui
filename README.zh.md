@@ -82,6 +82,30 @@ just dev-blaze                             # 构建并启动 macOS 开发应用
 
 **当前实测结论（2026-11-11，macOS arm64）**：stable `0.20261027.0` 在加载工作区时无法编译 `objc2-exception-helper` 的 build script（writable static `MIN` 无 rustc 符号）；canary `0.20261105.4` 在 `icu_collections` / `icu_provider` / `cargo_metadata` 等 crate 的 proc macro 展开上失败（退出码 101）。`blaze enable` 全局接管 cargo 的做法也不要用：它改 `~/.cargo/config.toml`，会影响同机其它项目，而且 KWork 用 stable 1.99.1、blaze 用自己的 nightly-2026-10-27，wrapper 模式下 daemon 实际链接 0 个程序，增量构建反而比纯 cargo 慢。按官方建议，`cargo check` 与 CI 始终是最终裁决。
 
+### 快速开发循环（基于 cargo，实测）
+
+blaze 构建不了本工作区，所以真正落地的提速来自「不让 cargo 重复做不必要的工作」。两者都不会改变默认流程：`just dev` 与 `npm run build` 仍使用同一份体积优化后的前端。
+
+**跳过未变更的前端构建。** `npm run ui:build` 把 `ui/dist` 的所有输入（`ui/**`（排除 `dist/`）、`shared/**`、`vendor/**`、各 manifest 与 lockfile、构建脚本自身）记入 `.tools/ui-build-stamp.json`：先用 `stat` 对约 220 个文件做 mtime + size 快检，只有发生变化时才计算内容哈希。输入未变时 **0.5–0.7s** 直接退出（原来 warm 构建 2.5–3.1s），因此只改原生 Rust 时 `just dev` 只需重建 Host（约 1.7s）。`KWORK_UI_BUILD=always` 可强制重建。
+
+**迭代 WASM 前端时去掉 LTO。** `release-wasm` 开了 `lto = true`，改一行前端 Rust 就要付约 20s 的全程序重链。`KWORK_UI_FAST=1` 切到独立的 `[profile.dev-wasm]`（`opt-level = "z"`、`lto = false`、`codegen-units = 16`、`debug = 0`），并跳过 `wasm-opt`：
+
+```sh
+just ui-fast        # 只构建快速前端
+just dev-fast       # 构建并启动使用它的 macOS 开发应用
+npm run ui:build    # 打包前恢复体积优化产物
+```
+
+| 2026-11-11，macOS arm64 | 默认 | `KWORK_UI_FAST=1` |
+| --- | ---: | ---: |
+| `npm run ui:build`，前端 Rust 改一行 | 28.6s（LTO 重链 20.7s） | 11.1s（cargo 3.0s） |
+| warm、源码无改动 | 2.5–3.1s | 0.5–0.7s（指纹跳过） |
+| `ui/dist/pkg/dsh_gpui_ui_bg.wasm` | 13,413,708 B | 33,798,006 B |
+
+若改动真的改变了 wasm 字节，默认路径还要再付约 11s 的 `wasm-opt -Oz`，快速路径则不执行这一步。快速产物未优化、体积约 2.5 倍，仅供本地迭代；`npm run build` 会先跑默认 `ui:build`，打包时自动恢复优化产物，切换 profile 也会让指纹自动失效。
+
+**评估过但未采用**：用 rust-lld 替换 ld64（stable 1.99.1 上 `-C linker-features=+lld` 仍是 unstable；LLD 23.1.1 无法解析本机 macOS SDK 的 TAPI `.tbd`）、原生 Host 的 `debug = 0` dev profile（交替增量实测 2.58s vs 3.45s，无稳定收益）、mold（不支持 macOS）。`sccache` 也未接入：cargo 自身的增量缓存已覆盖开发循环，sccache 主要对 CI / clean 重建有价值，后续可通过 `RUSTC_WRAPPER` 再加。
+
 ### 产物体积
 
 WASM 前端是 KWork 最大的产物。体积优化分成三段，全部由 `npm run ui:build` 完成：

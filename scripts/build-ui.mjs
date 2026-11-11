@@ -7,9 +7,16 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { build } from 'esbuild';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
+
+// `KWORK_UI_FAST=1` swaps the LTO-heavy release frontend for a fast dev build.
+// `KWORK_UI_BUILD=always` disables the content-fingerprint short circuit.
+const FAST = process.env.KWORK_UI_FAST === '1';
+const WASM_PROFILE = FAST ? 'dev-wasm' : 'release-wasm';
+const UI_BUILD_MODE = process.env.KWORK_UI_BUILD || 'auto';
+const dist = join(root, 'ui', 'dist');
+const stampPath = join(root, '.tools', 'ui-build-stamp.json');
 
 // wasm-opt is the second half of the size pipeline: cargo's `release-wasm`
 // profile makes small code, wasm-opt -Oz makes the wasm-bindgen output small.
@@ -35,16 +42,113 @@ const WASM_OPT_FEATURES = [
   '--enable-reference-types',
   '--enable-sign-ext',
 ];
-const rustc = execFileSync('rustup', ['which', 'rustc'], { encoding: 'utf8' }).trim();
-const env = {
-  ...process.env,
-  PATH: `${dirname(rustc)}:${process.env.PATH || ''}`,
-  // Keep wasm artifacts in-repo so wasm-bindgen never packs a stale sandbox target dir.
-  CARGO_TARGET_DIR: process.env.CARGO_TARGET_DIR || join(root, 'target'),
-};
+// Resolved lazily: the fingerprint short circuit must not start rustup just to
+// conclude that ui/dist is already up to date.
+let cachedEnv;
+function buildEnv() {
+  if (cachedEnv) return cachedEnv;
+  const rustc = execFileSync('rustup', ['which', 'rustc'], { encoding: 'utf8' }).trim();
+  cachedEnv = {
+    ...process.env,
+    PATH: `${dirname(rustc)}:${process.env.PATH || ''}`,
+    // Keep wasm artifacts in-repo so wasm-bindgen never packs a stale sandbox target dir.
+    CARGO_TARGET_DIR: process.env.CARGO_TARGET_DIR || join(root, 'target'),
+  };
+  return cachedEnv;
+}
 const run = (command, args) => {
-  execFileSync(command, args, { cwd: root, env, stdio: 'inherit' });
+  execFileSync(command, args, { cwd: root, env: buildEnv(), stdio: 'inherit' });
 };
+
+// Every file that can change the contents of ui/dist. ui/dist itself is
+// excluded, but ui/** (entry pages, CSS, assets, Rust sources), the shared and
+// vendored crates, the workspace manifests and the build script are included.
+// The check is two-level: stat() on ~200 files is essentially free, whereas
+// reading/hashing them all can be slow under fs-wrapping tooling, so the
+// content hash only runs when an mtime or size actually changed.
+function listInputFiles() {
+  const files = new Set();
+  const walk = (dir) => {
+    const abs = join(root, dir);
+    if (!existsSync(abs)) return;
+    for (const entry of readdirSync(abs, { withFileTypes: true })) {
+      if (dir === 'ui' && entry.name === 'dist') continue;
+      const rel = join(dir, entry.name);
+      if (entry.isDirectory()) walk(rel);
+      else if (entry.isFile()) files.add(rel);
+    }
+  };
+  for (const dir of ['ui', 'shared', 'vendor']) walk(dir);
+  for (const rel of [
+    'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml',
+    'package.json', 'package-lock.json',
+    'src-tauri/Cargo.toml', 'src-tauri/icons/32x32.png',
+    'scripts/build-ui.mjs', 'node_modules/.package-lock.json',
+    'node_modules/@xterm/headless/lib-headless/xterm-headless.mjs',
+    'node_modules/@xterm/addon-serialize/lib/addon-serialize.mjs',
+  ]) {
+    if (existsSync(join(root, rel))) files.add(rel);
+  }
+  return [...files].sort();
+}
+
+const statKey = (rel) => {
+  const st = statSync(join(root, rel));
+  return `${st.mtimeMs.toFixed(3)}:${st.size}`;
+};
+
+function snapshotEntries(files) {
+  const entries = {};
+  for (const rel of files) entries[rel] = statKey(rel);
+  return entries;
+}
+
+function unchangedByStat(stamp, files) {
+  if (!stamp?.entries || Object.keys(stamp.entries).length !== files.length) return false;
+  for (const rel of files) {
+    let key;
+    try { key = statKey(rel); } catch { return false; }
+    if (stamp.entries[rel] !== key) return false;
+  }
+  return true;
+}
+
+function inputFingerprint(files) {
+  const hash = createHash('sha256');
+  hash.update(`profile=${WASM_PROFILE}\nfast=${FAST}\nwasm-opt=${FAST ? 'off' : (process.env.KWORK_WASM_OPT || 'on')}\n`);
+  for (const rel of files) {
+    hash.update(rel).update('\0').update(readFileSync(join(root, rel))).update('\0');
+  }
+  return hash.digest('hex');
+}
+
+function readStamp() {
+  if (!existsSync(stampPath)) return null;
+  try { return JSON.parse(readFileSync(stampPath, 'utf8')); } catch { return null; }
+}
+
+function writeStamp(fingerprint, files, outputFiles) {
+  mkdirSync(dirname(stampPath), { recursive: true });
+  const stamp = {
+    fingerprint,
+    profile: WASM_PROFILE,
+    entries: snapshotEntries(files),
+    outputFiles,
+    at: new Date().toISOString(),
+  };
+  writeFileSync(stampPath, `${JSON.stringify(stamp, null, 2)}\n`);
+}
+
+// A partially deleted dist must never be mistaken for a valid cached build.
+function distIsComplete() {
+  for (const file of [
+    'index.html', 'bootstrap.js',
+    'pkg/dsh_gpui_ui.js', 'pkg/dsh_gpui_ui_bg.wasm',
+  ]) {
+    if (!existsSync(join(dist, file))) return false;
+  }
+  return true;
+}
 
 function ensureWasmOpt(tools) {
   if (process.env.KWORK_WASM_OPT === 'off') return null;
@@ -125,12 +229,31 @@ function syncOutputs(dist, outputs) {
   return { written, stale: stale.length };
 }
 
+if (FAST) {
+  console.log('ui:build: FAST dev frontend (dev-wasm, no wasm-opt) — unoptimized output, run `npm run ui:build` before packaging.');
+}
+const inputFiles = listInputFiles();
+const stamp = readStamp();
+const reusable = UI_BUILD_MODE !== 'always' && distIsComplete() && stamp?.profile === WASM_PROFILE;
+if (reusable && unchangedByStat(stamp, inputFiles)) {
+  console.log(`ui:build: frontend inputs unchanged (${inputFiles.length} files), reusing ${WASM_PROFILE} output in ui/dist.`);
+  console.log('ui:build: set KWORK_UI_BUILD=always to force a rebuild.');
+  process.exit(0);
+}
+const fingerprint = inputFingerprint(inputFiles);
+if (reusable && stamp.fingerprint === fingerprint) {
+  // e.g. a checkout or a touch moved mtimes without changing any content.
+  writeStamp(fingerprint, inputFiles, stamp.outputFiles ?? 0);
+  console.log(`ui:build: inputs touched but content unchanged (${fingerprint.slice(0, 12)}), reusing ${WASM_PROFILE} frontend.`);
+  process.exit(0);
+}
+
 run('rustup', ['target', 'add', 'wasm32-unknown-unknown']);
 run('rustup', [
   'run', 'stable', 'cargo', 'build',
   '-p', 'dsh-gpui-ui',
   '--target', 'wasm32-unknown-unknown',
-  '--profile', 'release-wasm',
+  '--profile', WASM_PROFILE,
 ]);
 
 const lock = readFileSync(join(root, 'Cargo.lock'), 'utf8');
@@ -138,7 +261,7 @@ const match = lock.match(/name = "wasm-bindgen"\nversion = "([^"]+)"/);
 if (!match) throw new Error('无法从 Cargo.lock 确定 wasm-bindgen 版本。');
 const version = match[1];
 const tools = process.env.CARGO_INSTALL_ROOT || join(root, '.tools');
-const wasmOpt = ensureWasmOpt(tools);
+const wasmOpt = FAST ? null : ensureWasmOpt(tools);
 const executable = process.platform === 'win32' ? 'wasm-bindgen.exe' : 'wasm-bindgen';
 const bindgen = join(tools, 'bin', executable);
 let installed = false;
@@ -153,7 +276,6 @@ if (!installed) {
   ]);
 }
 
-const dist = join(root, 'ui', 'dist');
 const stage = mkdtempSync(join(tmpdir(), 'kwork-ui-'));
 const outputs = new Map();
 try {
@@ -162,13 +284,15 @@ try {
   run(bindgen, [
     '--target', 'web', '--no-typescript',
     '--out-dir', stagePkg,
-    join(root, 'target', 'wasm32-unknown-unknown', 'release-wasm', 'dsh_gpui_ui.wasm'),
+    join(root, 'target', 'wasm32-unknown-unknown', WASM_PROFILE, 'dsh_gpui_ui.wasm'),
   ]);
   optimizeWasm(join(stagePkg, 'dsh_gpui_ui_bg.wasm'), wasmOpt, tools);
   collectFiles(stagePkg, 'pkg', outputs);
 
   // `write: false` keeps esbuild's output in memory so unchanged chunks are
-  // never rewritten to disk.
+  // never rewritten to disk. esbuild is imported here rather than at module
+  // load so the fingerprint short circuit stays cheap.
+  const { build } = await import('esbuild');
   const { outputFiles, metafile: preview } = await build({
     absWorkingDir: root,
     entryPoints: [
@@ -215,6 +339,7 @@ try {
 
   const { written, stale } = syncOutputs(dist, outputs);
   console.log(`KUI/GPUI frontend ready: ${dist} (${outputs.size} files, ${written} rewritten, ${stale} stale removed)`);
+  writeStamp(fingerprint, inputFiles, outputs.size);
 } finally {
   try { rmSync(stage, { recursive: true, force: true }); } catch { /* temp cleanup is best effort */ }
 }

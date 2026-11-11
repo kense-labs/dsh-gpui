@@ -82,6 +82,30 @@ just dev-blaze                             # build and launch the macOS dev app
 
 **Measured on macOS arm64 (2026-11-11)**: stable `0.20261027.0` cannot compile the `objc2-exception-helper` build script while loading the workspace; canary `0.20261105.4` fails on proc-macro expansion in `icu_collections` / `icu_provider` / `cargo_metadata`. Do not use `blaze enable`, which changes the user-level `~/.cargo/config.toml`: KWork builds with stable 1.99.1 while blaze uses its own nightly-2026-10-27, so in wrapper mode the daemon links zero programs and incremental builds are slower than plain cargo. `cargo check` and CI remain the final word.
 
+### Fast development loop (cargo, measured)
+
+blaze cannot build this workspace, so the speedups that actually landed come from avoiding work cargo does not need to redo. Neither one changes the default path: `just dev` and `npm run build` keep the same size-optimized frontend.
+
+**Skip unchanged frontend builds.** `npm run ui:build` fingerprints every input of `ui/dist` (`ui/**` except `dist/`, `shared/**`, `vendor/**`, manifests, lockfiles and the build script itself) into `.tools/ui-build-stamp.json`. A cheap `stat` pass over ~220 files runs first; the content hash is only computed when an mtime or size changed. An unchanged tree exits in **0.5–0.7s** instead of 2.5–3.1s, so a native-Rust-only edit in `just dev` rebuilds only the host (~1.7s). `KWORK_UI_BUILD=always` forces a rebuild.
+
+**Iterate on the WASM frontend without LTO.** `release-wasm` uses `lto = true`, so a one-line frontend Rust edit pays for a ~20s whole-program link. `KWORK_UI_FAST=1` switches to the separate `[profile.dev-wasm]` (`opt-level = "z"`, `lto = false`, `codegen-units = 16`, `debug = 0`) and skips `wasm-opt`:
+
+```sh
+just ui-fast        # fast frontend only
+just dev-fast       # build + launch the macOS dev app with it
+npm run ui:build    # restore the size-optimized frontend before packaging
+```
+
+| macOS arm64, 2026-11-11 | default | `KWORK_UI_FAST=1` |
+| --- | ---: | ---: |
+| `npm run ui:build`, one frontend Rust line changed | 28.6s (20.7s LTO link) | 11.1s (3.0s cargo) |
+| warmed, no source change | 2.5–3.1s | 0.5–0.7s (fingerprint skip) |
+| `ui/dist/pkg/dsh_gpui_ui_bg.wasm` | 13,413,708 B | 33,798,006 B |
+
+If the edit changes the wasm bytes, the default path additionally pays ~11s of `wasm-opt -Oz`; the fast path never runs it. The fast wasm is unoptimized and ~2.5x larger — local iteration only. `npm run build` runs the default `ui:build` first, so packaging always restores the optimized artifact, and switching profiles invalidates the fingerprint automatically.
+
+**Evaluated, not adopted**: rust-lld as a faster linker (`-C linker-features=+lld` is unstable on stable 1.99.1; LLD 23.1.1 cannot parse this macOS SDK's TAPI `.tbd` files), a `debug = 0` native dev profile (alternating incremental runs: 2.58s vs 3.45s, no consistent win), and mold (no macOS support). `sccache` is not wired in either: cargo's incremental cache already covers the dev loop, and sccache mainly pays off for CI / clean rebuilds; it can be added later with `RUSTC_WRAPPER`.
+
 ### Bundle size
 
 The WebAssembly frontend is KWork's largest artifact. `npm run ui:build` applies three steps:
