@@ -628,6 +628,8 @@ pub(crate) struct DshApp {
     session_title_focus: gpui::FocusHandle,
     pub(crate) collapsed_workspaces: std::collections::HashSet<String>,
     pub(crate) hidden_workspaces: std::collections::HashSet<String>,
+    added_workspaces: Vec<String>,
+    workspace_picker_pending: bool,
     pub(crate) workspace_aliases: std::collections::HashMap<String, String>,
     pub(crate) workspace_rename: Option<String>,
     pub(crate) workspace_delete: Option<String>,
@@ -979,6 +981,8 @@ impl DshApp {
             session_title_focus: cx.focus_handle(),
             collapsed_workspaces: std::collections::HashSet::new(),
             hidden_workspaces: std::collections::HashSet::new(),
+            added_workspaces: Vec::new(),
+            workspace_picker_pending: false,
             workspace_aliases: std::collections::HashMap::new(),
             workspace_rename: None,
             workspace_delete: None,
@@ -1417,6 +1421,52 @@ impl DshApp {
         };
         self.show_workspace_menu = false;
         self.show_workspace_view_options = false;
+    }
+
+    /// Harness-style "添加工作区": delegate to the host's native directory
+    /// picker. The chosen path is applied in `handle_reply`.
+    pub(super) fn request_workspace_picker(&mut self) {
+        if self.workspace_picker_pending {
+            return;
+        }
+        self.workspace_picker_pending = true;
+        invoke("pick_workspace_directory", json!({}));
+    }
+
+    fn finish_workspace_pick(
+        &mut self,
+        result: Result<Value, String>,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.workspace_picker_pending = false;
+        let reply = match result {
+            Ok(reply) => reply,
+            Err(error) => {
+                self.push_toast(error, cx);
+                return;
+            }
+        };
+        let Some(path) = reply.as_str().filter(|path| !path.is_empty()) else {
+            return;
+        };
+        if !self
+            .added_workspaces
+            .iter()
+            .any(|workspace| workspace == path)
+        {
+            self.added_workspaces.push(path.to_owned());
+        }
+        self.hidden_workspaces.remove(path);
+        self.collapsed_workspaces.remove(path);
+        self.save_workspace_preferences(cx);
+        if self.connected() {
+            self.new_session_at(path.to_owned(), None, w, cx);
+        } else if !self.service_starting {
+            replace(&self.workspace_editor, path.to_owned(), w, cx);
+            self.start_service(w, cx);
+        }
+        cx.notify();
     }
 
     fn start_service(&mut self, w: &mut Window, cx: &mut Context<Self>) {
@@ -2422,6 +2472,7 @@ impl DshApp {
                     self.error = Some(error);
                 }
             }
+            "pick_workspace_directory" => self.finish_workspace_pick(result, w, cx),
             "workspace_applications" => self.apply_workspace_applications(result, cx),
             "open_workspace_application" => self.finish_workspace_open(result, cx),
             "load_shortcuts" | "save_shortcuts" => {

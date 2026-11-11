@@ -31,6 +31,14 @@ impl DshApp {
             })
             .collect();
         self.hidden_workspaces = string_set(reply.get("hidden"));
+        self.added_workspaces = reply["addedWorkspaces"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned)
+            .collect();
         self.collapsed_workspaces = string_set(reply.get("collapsed"));
         if let Some(collapsed) = reply.get("sidebarCollapsed").and_then(Value::as_bool) {
             self.sidebar_collapsed = collapsed;
@@ -146,6 +154,7 @@ impl DshApp {
                 "preferences": {
                     "aliases": self.workspace_aliases,
                     "hidden": hidden,
+                    "addedWorkspaces": self.added_workspaces,
                     "collapsed": collapsed,
                     "sidebarCollapsed": self.sidebar_collapsed,
                     "sidebarWidth": self.sidebar_width,

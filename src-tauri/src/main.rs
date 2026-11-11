@@ -103,6 +103,7 @@ fn main() {
             acp::respond_question,
             acp::record_session_feedback,
             acp::message_feedback,
+            workspace::pick_workspace_directory,
             workspace::list_workspace_files,
             workspace::document::read_workspace_text,
             workspace::document::read_workspace_html,

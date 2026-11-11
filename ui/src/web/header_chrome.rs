@@ -27,8 +27,8 @@ const FEEDBACK: &[u8] = include_bytes!("../../assets/session-feedback.svg");
 const APPLICATION_MENU_WIDTH: f32 = 160.;
 const SESSION_MENU_WIDTH: f32 = 190.;
 const MENU_MIN_WIDTH: f32 = 144.;
-const MENU_MARGIN: f32 = 12.;
-const SUBMENU_GAP: f32 = 4.;
+pub(super) const MENU_MARGIN: f32 = 12.;
+pub(super) const MENU_GAP: f32 = 4.;
 const SUBMENU_MIN_WIDTH: f32 = 163.;
 const MENU_MAX_WIDTH: f32 = 360.;
 const SESSION_ROW_HEIGHT: f32 = 34.;
@@ -379,7 +379,7 @@ impl DshApp {
             HeaderMenu::Session => {
                 conversation
                     && self.active_session.is_some()
-                    && !self.conversation.entries.is_empty()
+                    && !self.conversation_header_is_blank()
             }
             HeaderMenu::SessionContext => menu.context.as_ref().is_some_and(|context| {
                 self.sessions
@@ -1562,8 +1562,8 @@ impl DshApp {
                         .into_any_element();
                     let measured = child.layout_as_root(natural, w, cx);
                     let x = match side {
-                        SubmenuPlacement::Right => origin.x + width + px(SUBMENU_GAP),
-                        SubmenuPlacement::Left => origin.x - child_width - px(SUBMENU_GAP),
+                        SubmenuPlacement::Right => origin.x + width + px(MENU_GAP),
+                        SubmenuPlacement::Left => origin.x - child_width - px(MENU_GAP),
                         // Chromium shifts a max-content page left when keeping
                         // the parent anchor would put its far edge off-screen.
                         SubmenuPlacement::Page => origin.x.min(viewport.width - measured.width),
@@ -1645,7 +1645,7 @@ fn submenu_placement(
     child: Pixels,
     viewport: Pixels,
 ) -> SubmenuPlacement {
-    let needed = child + px(SUBMENU_GAP);
+    let needed = child + px(MENU_GAP);
     if left + width + needed <= viewport - px(MENU_MARGIN) {
         SubmenuPlacement::Right
     } else if left - needed >= px(MENU_MARGIN) {
@@ -1655,24 +1655,24 @@ fn submenu_placement(
     }
 }
 
-fn menu_x(anchor: Bounds<Pixels>, width: Pixels, viewport: Pixels, session: bool) -> Pixels {
-    let rightmost = viewport - px(MENU_MARGIN) - width;
-    if session {
+fn menu_x(anchor: Bounds<Pixels>, width: Pixels, viewport: Pixels, align_start: bool) -> Pixels {
+    let rightmost = (viewport - px(MENU_MARGIN) - width).max(px(MENU_MARGIN));
+    if align_start {
         anchor.left().clamp(px(MENU_MARGIN), rightmost)
     } else {
         (anchor.right() - width).clamp(px(MENU_MARGIN), rightmost)
     }
 }
 
-fn menu_origin(
+pub(super) fn menu_origin(
     anchor: Bounds<Pixels>,
     menu: Size<Pixels>,
     viewport: Size<Pixels>,
-    session: bool,
+    align_start: bool,
 ) -> Point<Pixels> {
     let margin = px(MENU_MARGIN);
-    let below = anchor.bottom() + px(SUBMENU_GAP);
-    let above = anchor.top() - px(SUBMENU_GAP) - menu.height;
+    let below = anchor.bottom() + px(MENU_GAP);
+    let above = anchor.top() - px(MENU_GAP) - menu.height;
     let bottom_limit = (viewport.height - margin - menu.height).max(margin);
     let y = if below <= bottom_limit {
         below.max(margin)
@@ -1681,7 +1681,7 @@ fn menu_origin(
     } else {
         margin
     };
-    point(menu_x(anchor, menu.width, viewport.width, session), y)
+    point(menu_x(anchor, menu.width, viewport.width, align_start), y)
 }
 
 fn application_menu_content_width(names: &[String], w: &Window, cx: &App) -> Pixels {

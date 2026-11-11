@@ -31,6 +31,82 @@ pub struct WorkspaceFileList {
     pub truncated: bool,
 }
 
+/// "添加工作区" follows DeepSeek Harness: open the platform directory picker,
+/// then register the chosen directory as the active workspace. Cancelling
+/// yields `null`; a platform without a native picker reports an error instead
+/// of silently doing nothing.
+#[tauri::command]
+pub async fn pick_workspace_directory(webview: tauri::Webview) -> Result<Option<String>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        directory_picker::choose_directory(webview).await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = webview;
+        Err("当前平台暂不支持原生目录选择器，请在「通用设置」中填写工作区绝对路径。".to_owned())
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod directory_picker {
+    use block2::RcBlock;
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSModalResponseCancel, NSModalResponseOK, NSOpenPanel, NSWindow};
+    use std::cell::RefCell;
+
+    const PICKER_ERROR: &str = "无法打开系统目录选择器。";
+
+    /// NSOpenPanel as a window sheet, matching the AppKit save sheet helper in
+    /// `history::export::archive::macos`. The host never blocks on the panel.
+    pub(super) async fn choose_directory(
+        webview: tauri::Webview,
+    ) -> Result<Option<String>, String> {
+        let window = webview.window().clone();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        window
+            .clone()
+            .run_on_main_thread(move || {
+                let Some(mtm) = MainThreadMarker::new() else {
+                    let _ = send.send(Err(PICKER_ERROR.to_owned()));
+                    return;
+                };
+                let native = window
+                    .ns_window()
+                    .ok()
+                    .and_then(|window| unsafe { window.cast::<NSWindow>().as_ref() });
+                let Some(native) = native else {
+                    let _ = send.send(Err(PICKER_ERROR.to_owned()));
+                    return;
+                };
+                let panel = NSOpenPanel::openPanel(mtm);
+                panel.setCanChooseDirectories(true);
+                panel.setCanChooseFiles(false);
+                panel.setAllowsMultipleSelection(false);
+                panel.setCanCreateDirectories(true);
+                let send = RefCell::new(Some(send));
+                let retained = panel.clone();
+                let complete = RcBlock::new(move |response| {
+                    let result = match response {
+                        value if value == NSModalResponseCancel => Ok(None),
+                        value if value == NSModalResponseOK => retained
+                            .URL()
+                            .and_then(|url| url.path())
+                            .map(|path| Some(path.to_string()))
+                            .ok_or_else(|| PICKER_ERROR.to_owned()),
+                        _ => Err(PICKER_ERROR.to_owned()),
+                    };
+                    if let Some(send) = send.borrow_mut().take() {
+                        let _ = send.send(result);
+                    }
+                });
+                panel.beginSheetModalForWindow_completionHandler(native, &complete);
+            })
+            .map_err(|_| PICKER_ERROR.to_owned())?;
+        receive.await.map_err(|_| PICKER_ERROR.to_owned())?
+    }
+}
+
 #[tauri::command]
 pub async fn list_workspace_files(
     workspace: String,

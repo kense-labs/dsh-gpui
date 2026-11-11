@@ -10,6 +10,7 @@ use tauri::{AppHandle, Manager};
 pub struct WorkspacePreferences {
     pub aliases: HashMap<String, String>,
     pub hidden: Vec<String>,
+    pub added_workspaces: Vec<String>,
     pub collapsed: Vec<String>,
     pub sidebar_collapsed: Option<bool>,
     pub sidebar_width: Option<f32>,
