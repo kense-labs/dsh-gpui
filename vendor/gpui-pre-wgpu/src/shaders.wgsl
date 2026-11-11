@@ -989,7 +989,11 @@ fn vs_shadow(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) ins
 
     var out = ShadowVarying();
     out.position = to_device_position(unit_vertex, geometry);
-    out.color = hsla_to_rgba(shadow.color);
+    var color = shadow.color;
+    if (color.h >= 2.0) {
+        color.h -= 2.0;
+    }
+    out.color = hsla_to_rgba(color);
     out.shadow_id = instance_id;
     out.clip_distances = distance_from_clip_rect(unit_vertex, geometry, shadow.content_mask);
     return out;
@@ -1004,6 +1008,12 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
 
     let shadow = load_shadow(input.shadow_id);
     let radius = abs(shadow.blur_radius);
+    if (shadow.color.h >= 2.0) {
+        let distance = quad_sdf(input.position.xy, shadow.element_bounds,
+                                shadow.element_corner_radii);
+        let coverage = saturate(0.5 + radius - distance) - saturate(0.5 - distance);
+        return blend_color(input.color, coverage);
+    }
     let half_size = shadow.bounds.size / 2.0;
     let center = shadow.bounds.origin + half_size;
     let center_to_point = input.position.xy - center;

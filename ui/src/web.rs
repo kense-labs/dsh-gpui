@@ -296,9 +296,6 @@ pub(crate) enum SettingsPage {
     Providers,
     Plugins,
     AgentPresets,
-    Shell,
-    AgentLoop,
-    WebSearch,
     SessionLog,
 }
 
@@ -595,6 +592,13 @@ pub(crate) struct DshApp {
     transcript_preferences: transcript_preferences::TranscriptPreferences,
     model_providers: model_providers::ProviderSettings,
     runtime_settings: Option<runtime_settings::RuntimeSettings>,
+    web_search_settings: Option<web_search_settings::WebSearchSettings>,
+    plugin_center: plugin_center::PluginCenter,
+    automations: automations::Automations,
+    session_archival: session_archive::ArchiveUi,
+    plugin_installer: Option<plugin_install::Installer>,
+    plugin_install_trigger: Option<gpui::FocusHandle>,
+    plugin_add_menu: Option<plugin_install::AddMenu>,
     shortcuts: shortcut_settings::ShortcutUi,
     header_menu: Option<header_chrome::OpenHeaderMenu>,
     exiting_header_menu: Option<header_chrome::ExitingHeaderMenu>,
@@ -939,6 +943,13 @@ impl DshApp {
             transcript_preferences: transcript_preferences::TranscriptPreferences::new(cx),
             model_providers: model_providers::ProviderSettings::new(w, cx),
             runtime_settings: None,
+            web_search_settings: None,
+            plugin_center: plugin_center::PluginCenter::default(),
+            automations: automations::Automations::new(),
+            session_archival: session_archive::ArchiveUi::default(),
+            plugin_installer: None,
+            plugin_install_trigger: None,
+            plugin_add_menu: None,
             shortcuts: shortcut_settings::ShortcutUi::new(w, cx),
             header_menu: None,
             exiting_header_menu: None,
@@ -1417,6 +1428,7 @@ impl DshApp {
             || self.service_starting
             || self.creating_session
             || self.fork_pending.is_some()
+            || self.plugin_install_busy()
         {
             return;
         }
@@ -1424,6 +1436,11 @@ impl DshApp {
         let service_path = self.service_editor.read(cx).value().trim().to_string();
         self.service_starting = true;
         self.runtime_settings = None;
+        self.web_search_settings = None;
+        self.plugin_center = plugin_center::PluginCenter::default();
+        self.automations = automations::Automations::new();
+        self.plugin_installer = None;
+        self.close_plugin_add_menu();
         self.creating_session = false;
         self.pending_action = None;
         self.status = ServiceStatus::Starting;
@@ -1449,6 +1466,9 @@ impl DshApp {
 
     pub(crate) fn open_page(&mut self, page: WorkspacePage, cx: &mut Context<Self>) {
         self.page = page;
+        if page != WorkspacePage::Automations {
+            self.close_automation_create_menu();
+        }
         if self.sidebar_drawer {
             self.narrow_sidebar_expanded = false;
         }
@@ -1503,21 +1523,22 @@ impl DshApp {
             return;
         }
         if let Some(draft) = draft {
-            self.replace_composer_without_trigger(draft, w, cx);
+            let existing = self.composer.read(cx).value();
+            let draft = if existing.is_empty() {
+                draft.to_owned()
+            } else {
+                format!("{existing}\n\n{draft}")
+            };
+            self.replace_composer_without_trigger(&draft, w, cx);
         }
-    }
-
-    fn start_assisted_session(
-        &mut self,
-        prompt: &'static str,
-        w: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.new_session_at(self.workspace.clone(), Some(prompt), w, cx);
     }
 
     fn resume(&mut self, session: SessionSummary, w: &mut Window, cx: &mut Context<Self>) {
         if !self.connected() || self.creating_session {
+            return;
+        }
+        if self.archived_sessions.contains(&session.id) {
+            self.push_toast("已归档对话暂时无法查看，请取消归档后查看", cx);
             return;
         }
         if self.sidebar_drawer && self.narrow_sidebar_expanded {
@@ -1657,6 +1678,10 @@ impl DshApp {
             .and_then(|reply| reply["configOptions"].as_array())
             .cloned()
             .unwrap_or_default();
+        if reply.is_some_and(|reply| reply["hostRunning"] == true) && !self.conversation.running {
+            self.conversation.begin_turn();
+            self.start_turn_ticker(cx);
+        }
         if let Some(draft) = draft {
             self.replace_composer_without_trigger(draft, w, cx);
         }
@@ -2336,6 +2361,7 @@ impl DshApp {
                         replace(&self.workspace_editor, self.workspace.clone(), w, cx);
                         replace(&self.service_editor, self.service_path.clone(), w, cx);
                         self.error = None;
+                        self.apply_archive_snapshot(&reply["workspaceArchive"]);
                         self.load_startup_model_providers(&reply, w, cx);
                         self.new_session(w, cx);
                     }
@@ -2654,6 +2680,11 @@ impl DshApp {
                 self.native_fullscreen = event["value"].as_bool().unwrap_or(false);
             }
             Some("session_log_download_started") => self.session_downloads.started(&event),
+            Some("plugin_install") => self.plugin_install_event(&event, w, cx),
+            Some("schedule_changed") => self.invalidate_automations(cx),
+            Some("schedule_session") => {
+                self.apply_local_sessions(&json!({"sessions": [event["session"]]}));
+            }
             Some("service") => match event.get("status").and_then(Value::as_str) {
                 Some("starting") => self.status = ServiceStatus::Starting,
                 Some("running") => self.status = ServiceStatus::Connected,
@@ -2956,7 +2987,7 @@ impl DshApp {
         self.sidebar.surface.terminals.insert(
             key,
             TerminalCheckpoint {
-                id: bridge::terminal_id(),
+                id: bridge::random_id(),
                 title: None,
             },
         );
@@ -3100,6 +3131,7 @@ use conversation::Conversation;
 
 mod dock_controls;
 pub(crate) use dock_controls::dock_action_button;
+mod automations;
 mod command_picker;
 mod composer_stats;
 mod dock_documents;
@@ -3126,9 +3158,13 @@ mod panels;
 mod permission_dialog;
 mod permission_picker;
 mod plan;
+mod plugin_center;
+mod plugin_install;
+mod plugin_versions;
 mod process_scroll;
 mod question_panel;
 mod runtime_settings;
+mod session_archive;
 mod session_context_menu;
 mod session_download;
 mod session_feedback;
@@ -3139,6 +3175,7 @@ mod terminal;
 mod terminal_shell_menu;
 mod terminal_title;
 mod transcript_preferences;
+mod web_search_settings;
 mod workspace;
 mod workspace_rows;
 mod workspace_search;

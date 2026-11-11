@@ -342,10 +342,8 @@ impl DshApp {
                     return true;
                 }
                 Command::ArchiveSession => {
-                    if let Some(id) = &self.active_session {
-                        self.archived_sessions.insert(id.clone());
-                        self.save_workspace_preferences(cx);
-                        cx.notify();
+                    if let Some(id) = self.active_session.clone() {
+                        self.set_session_archived(id, true, false, w, cx);
                     }
                     return true;
                 }

@@ -58,6 +58,7 @@ pub struct Tokens {
     pub state_business_primary: Hsla, // --dsw-alias-state-business-primary（品牌蓝）
     pub state_business_tertiary: Hsla, // --dsw-alias-state-business-tertiary（徽章底）
     pub state_success_primary: Hsla,  // --dsw-alias-state-success-primary
+    pub state_success_secondary: Hsla, // --dsw-alias-state-success-secondary
     pub state_success_tertiary: Hsla, // --dsw-alias-state-success-tertiary
     pub state_error_primary: Hsla,    // --dsw-alias-state-error-primary
     pub state_error_secondary: Hsla,  // --dsw-alias-state-error-secondary
@@ -69,11 +70,12 @@ pub struct Tokens {
     pub link: Hsla,         // --dsw-alias-link
     pub brand_accent: Hsla, // --dsw-alias-brand-primary-new-colorprimary-new-color
     // 浮层
+    pub menu_stroke: Hsla, // --dsw-elevation-stroke-color on [data-menu-material]
     pub menu_surface_fill: Hsla, // --dsw-menu-surface-fill（磨砂层的着色）
-    pub menu_surface: Hsla,      // --dsw-specific-menu（darwin 不透明底衬）
+    pub menu_surface: Hsla, // --dsw-specific-menu（darwin 不透明底衬）
     pub menu_group_header: Hsla, // --dsw-alias-menu-group-header-fill
-    pub toast_bg: Hsla,          // --dsw-alias-toast-bg
-    pub tooltip_bg: Hsla,        // --dsw-alias-tooltip-bg
+    pub toast_bg: Hsla,    // --dsw-alias-toast-bg
+    pub tooltip_bg: Hsla,  // --dsw-alias-tooltip-bg
     // 滚动条
     pub scrollbar_l1: Hsla,       // --dsw-alias-scrollbar-bg-l1
     pub scrollbar_l1_hover: Hsla, // hover-l1
@@ -154,6 +156,7 @@ impl Tokens {
             state_business_primary: rgb(0x7aaaff).into(),
             state_business_tertiary: rgb(0x34415b).into(),
             state_success_primary: rgb(0x22c55e).into(),
+            state_success_secondary: rgb(0x4ed17e).into(),
             state_success_tertiary: rgb(0x233c2c).into(),
             state_error_primary: rgb(0xf25a5a).into(),
             state_error_secondary: rgb(0xf25a5a).into(),
@@ -163,6 +166,7 @@ impl Tokens {
             state_idle_primary: rgb(0x545557).into(),
             link: rgb(0x7aaaff).into(),
             brand_accent: rgb(0x5686fe).into(),
+            menu_stroke: rgba(0xffffff29).into(),
             menu_surface_fill: Hsla::from(rgb(0x303136)).alpha(0.64),
             menu_surface: rgb(0x303136).into(),
             menu_group_header: rgb(0x303136).into(),
@@ -235,6 +239,7 @@ impl Tokens {
             state_business_primary: rgb(0x4176e6).into(),
             state_business_tertiary: rgb(0xe4edfd).into(),
             state_success_primary: rgb(0x22c55e).into(),
+            state_success_secondary: rgb(0x4ed17e).into(),
             state_success_tertiary: rgb(0xe6faed).into(),
             state_error_primary: rgb(0xec1313).into(),
             state_error_secondary: rgb(0xf25a5a).into(),
@@ -244,6 +249,7 @@ impl Tokens {
             state_idle_primary: rgb(0xd4d4d4).into(),
             link: rgb(0x4176e6).into(),
             brand_accent: rgb(0x4176e6).into(),
+            menu_stroke: rgba(0x0000000a).into(),
             menu_surface_fill: Hsla::from(rgb(0xfcfdfe)).alpha(0.7),
             menu_surface: rgb(0xf8f9fa).into(),
             menu_group_header: rgb(0xf8f9fa).into(),

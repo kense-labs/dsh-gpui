@@ -74,7 +74,7 @@ export function dshReadSidebar(session) {
     catch { return ''; }
 }
 
-export function dshTerminalId() {
+export function dshRandomId() {
     return Array.from(crypto.getRandomValues(new Uint8Array(16)),
         byte => byte.toString(16).padStart(2, '0')).join('');
 }
@@ -409,8 +409,8 @@ extern "C" {
     #[wasm_bindgen(js_name = dshReadSidebar)]
     pub(crate) fn read_sidebar(session: &str) -> String;
 
-    #[wasm_bindgen(js_name = dshTerminalId)]
-    pub(crate) fn terminal_id() -> String;
+    #[wasm_bindgen(js_name = dshRandomId)]
+    pub(crate) fn random_id() -> String;
 
     #[wasm_bindgen(js_name = dshPreferredTerminalShell)]
     pub(crate) fn preferred_terminal_shell() -> String;

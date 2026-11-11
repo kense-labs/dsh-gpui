@@ -181,7 +181,7 @@ impl DshApp {
 }
 
 pub(super) fn dialog_header(
-    title: &'static str,
+    title: impl Into<gpui::SharedString>,
     id: &'static str,
     focus: Option<&gpui::FocusHandle>,
     cx: &mut Context<DshApp>,
@@ -205,7 +205,7 @@ pub(super) fn dialog_header(
                 .line_height(px(24.))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(p.ink)
-                .child(title),
+                .child(title.into()),
         )
         .child(super::dock_action_button(
             div()

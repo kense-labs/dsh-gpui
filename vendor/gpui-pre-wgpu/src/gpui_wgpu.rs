@@ -4,7 +4,7 @@ mod wgpu_atlas;
 mod wgpu_context;
 mod wgpu_renderer;
 
-pub use backdrop::{backdrop_quad, clip_backdrop_shadows};
+pub use backdrop::{backdrop_quad, backdrop_stroke, clip_backdrop_shadows};
 pub use cosmic_text_system::*;
 pub use wgpu;
 pub use wgpu_atlas::*;

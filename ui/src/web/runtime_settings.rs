@@ -29,6 +29,45 @@ const LOOP_FIELDS: &[NumberSpec] = &[NumberSpec {
     hint: "同一步内最多同时运行多少个可并行的调用。",
     integer: true,
 }];
+const SUBAGENT_FIELDS: &[NumberSpec] = &[
+    NumberSpec {
+        key: "maxDepth",
+        label: "最大递归深度",
+        hint: "0 表示关闭子智能体，1 表示仅主 Agent 可以创建子智能体。",
+        integer: true,
+    },
+    NumberSpec {
+        key: "maxActiveSubagents",
+        label: "子智能体并行数量上限",
+        hint: "同一主 Agent 下所有层级的存活子智能体总数上限，至少为 1。",
+        integer: true,
+    },
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum RuntimePage {
+    Shell,
+    AgentLoop,
+    Subagent,
+}
+
+impl RuntimePage {
+    fn command(self) -> &'static str {
+        match self {
+            Self::Shell => "shell",
+            Self::AgentLoop => "agentLoop",
+            Self::Subagent => "subagent",
+        }
+    }
+
+    fn fields(self) -> &'static [NumberSpec] {
+        match self {
+            Self::Shell => SHELL_FIELDS,
+            Self::AgentLoop => LOOP_FIELDS,
+            Self::Subagent => SUBAGENT_FIELDS,
+        }
+    }
+}
 
 #[derive(Deserialize)]
 struct NumberValue {
@@ -76,10 +115,13 @@ impl NumberField {
             return Ok(None);
         }
         let number: f64 = text.parse().map_err(|_| ())?;
-        if !number.is_finite()
-            || number <= 0.
-            || (self.spec.integer && (number.fract() != 0. || number > 9_007_199_254_740_991.))
-        {
+        let valid = if self.spec.integer {
+            let minimum = if self.spec.key == "maxDepth" { 0. } else { 1. };
+            (minimum..=9_007_199_254_740_991.).contains(&number) && number.fract() == 0.
+        } else {
+            number.is_finite() && number > 0.
+        };
+        if !valid {
             return Err(());
         }
         Ok(Some(Change::Set(number)))
@@ -87,7 +129,7 @@ impl NumberField {
 }
 
 pub(super) struct RuntimeSettings {
-    page: SettingsPage,
+    page: RuntimePage,
     identity: Rc<()>,
     fields: Vec<NumberField>,
     snapshot: Option<Snapshot>,
@@ -97,14 +139,6 @@ pub(super) struct RuntimeSettings {
 }
 
 impl RuntimeSettings {
-    fn command(&self) -> &'static str {
-        if self.page == SettingsPage::Shell {
-            "shell"
-        } else {
-            "agentLoop"
-        }
-    }
-
     fn changes(&self, snapshot: &Snapshot, cx: &App) -> Result<HashMap<&'static str, Change>, ()> {
         let mut changes = HashMap::new();
         for field in &self.fields {
@@ -117,16 +151,16 @@ impl RuntimeSettings {
 }
 
 impl DshApp {
-    pub(super) fn prepare_runtime_settings(&mut self, w: &mut Window, cx: &mut Context<Self>) {
-        let specs = match self.settings_page {
-            SettingsPage::Shell if self.connected() => SHELL_FIELDS,
-            SettingsPage::AgentLoop if self.connected() => LOOP_FIELDS,
-            _ => {
-                self.runtime_settings = None;
-                return;
-            }
-        };
-        let page = self.settings_page;
+    pub(super) fn prepare_runtime_settings(
+        &mut self,
+        page: RuntimePage,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.connected() {
+            self.runtime_settings = None;
+            return;
+        }
         if self
             .runtime_settings
             .as_ref()
@@ -134,7 +168,8 @@ impl DshApp {
         {
             return;
         }
-        let fields = specs
+        let fields = page
+            .fields()
             .iter()
             .map(|spec| {
                 let editor = editor(spec.label.into(), InputMode::Single, w, cx);
@@ -192,7 +227,7 @@ impl DshApp {
         let Some(form) = &self.runtime_settings else {
             return;
         };
-        let page = form.command();
+        let page = form.page.command();
         let identity = form.identity.clone();
         cx.spawn_in(w, async move |this, cx| {
             let result = bridge::invoke(
@@ -419,7 +454,9 @@ impl DshApp {
                                 p.label_tertiary
                             })
                             .child(if invalid {
-                                if spec.integer {
+                                if spec.key == "maxDepth" {
+                                    "请输入大于或等于 0 的整数，留空表示使用默认值。"
+                                } else if spec.integer {
                                     "请输入正整数，留空表示使用默认值。"
                                 } else {
                                     "请输入正数，留空表示使用默认值。"

@@ -86,7 +86,7 @@ impl TranscriptPreferences {
 impl DshApp {
     pub(super) fn close_settings(&mut self, cx: &mut Context<Self>) {
         self.transcript_preferences.clear_menu();
-        self.runtime_settings = None;
+        self.plugin_center.close_inventory();
         self.show_settings = false;
         cx.notify();
     }
