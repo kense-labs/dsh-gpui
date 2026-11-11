@@ -19,12 +19,12 @@ KWork 是基于 DeepSeek Harness ACP 的桌面客户端。Rust 界面使用 KUI 
 将 KWork 和配套的 [dsh-acp](https://github.com/kense-labs/dsh-acp) 服务克隆到同一个父目录下。
 
 ```sh
-git clone https://github.com/kense-labs/dsh-gpui.git
+git clone https://github.com/kense-labs/kwork.git
 git clone https://github.com/kense-labs/dsh-acp.git
 cd dsh-acp
 pnpm install
 pnpm run build
-cd ../dsh-gpui
+cd ../kwork
 npm ci
 ```
 

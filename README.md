@@ -19,12 +19,12 @@ Install Node.js 24.9 or later, pnpm 12.6.0, Rust stable with `rustup`, and the T
 Clone KWork and its companion [dsh-acp](https://github.com/kense-labs/dsh-acp) service into the same parent directory.
 
 ```sh
-git clone https://github.com/kense-labs/dsh-gpui.git
+git clone https://github.com/kense-labs/kwork.git
 git clone https://github.com/kense-labs/dsh-acp.git
 cd dsh-acp
 pnpm install
 pnpm run build
-cd ../dsh-gpui
+cd ../kwork
 npm ci
 ```
 
