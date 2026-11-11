@@ -133,4 +133,5 @@ KWork 采用 [MIT 许可证](LICENSE)。随项目分发的第三方组件保留�
 
 - DeepSeek Harness [资源](ui/assets/DeepSeek-LICENSE.txt)、[调度与工作区运行时](services/vendor/dsh-schedule/LICENSES.txt)和 [Ask User 工具](services/vendor/dsh-tool-ask-user/LICENSE)
 - [GPUI 渲染器](vendor/gpui-pre-wgpu/LICENSE-APACHE)
+- [GPUI Web 平台](vendor/gpui-pre-web/LICENSE-APACHE)
 - [Noto Sans](ui/assets/NotoSans-LICENSE)和 [xterm.js](ui/assets/xterm-LICENSE.txt)

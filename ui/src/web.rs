@@ -1870,6 +1870,13 @@ impl DshApp {
         if projected.entries.is_empty() {
             return;
         }
+        for entry in &projected.entries {
+            conversation.reconcile_assistant_stream(
+                entry.external_id.as_deref(),
+                entry.role,
+                &entry.key,
+            );
+        }
         // A call can start on an earlier history page or settle while hydration is in flight.
         let tools: std::collections::HashMap<_, _> = projected
             .entries
@@ -2607,6 +2614,15 @@ impl DshApp {
             conversation.plan_active = update["active"].as_bool();
             return;
         }
+        if update["sessionUpdate"] == "gpui_assistant_stream" {
+            if conversation.running {
+                conversation.assistant_stream.update(update);
+                if selected {
+                    self.maybe_follow_tail();
+                }
+            }
+            return;
+        }
         if update["sessionUpdate"] == "gpui_turn_tail" {
             if let (Some(id), Some(time)) = (
                 update["toolCall"]["toolCallId"].as_str(),
@@ -2651,6 +2667,25 @@ impl DshApp {
             }
         }
         let effect = apply_update(&mut conversation.entries, update);
+        if update["content"]["text"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty())
+        {
+            let role = match update["sessionUpdate"].as_str() {
+                Some("agent_thought_chunk") => Some(EntryRole::Thought),
+                Some("agent_message_chunk") => Some(EntryRole::Assistant),
+                _ => None,
+            };
+            if let (Some(role), Some(id)) = (role, update["messageId"].as_str())
+                && let Some(entry) =
+                    conversation.entries.iter().rev().find(|entry| {
+                        entry.role == role && entry.external_id.as_deref() == Some(id)
+                    })
+            {
+                let key = entry.key.clone();
+                conversation.reconcile_assistant_stream(Some(id), role, &key);
+            }
+        }
         if update["sessionUpdate"] == "tool_call"
             && let Some(id) = update["toolCallId"].as_str()
             && let Some(time) = conversation.turn_process.tool_time(id)

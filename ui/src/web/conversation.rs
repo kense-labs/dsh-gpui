@@ -21,6 +21,7 @@ pub(super) struct Conversation {
     pub(super) turn_tails: crate::history::turn_tails::TurnTails,
     pub(super) resumed_session: bool,
     pub(super) entries: Vec<ChatEntry>,
+    pub(super) assistant_stream: crate::assistant_stream::AssistantStream,
     pub(super) usage: Option<(u64, u64)>,
     pub(super) permission: Option<PermissionRequest>,
     pub(super) permission_mode: super::permission_picker::PermissionMode,
@@ -94,6 +95,7 @@ impl Conversation {
         self.last_turn_settled = Some(bridge::monotonic_ms());
         self.turn_summary = Some(TurnSummary { end, seconds, used });
         self.running = false;
+        self.assistant_stream.clear();
         self.permission = None;
     }
 
@@ -103,6 +105,23 @@ impl Conversation {
         let mut entry = ChatEntry::local(role, key, text);
         entry.at_ms = Some(bridge::now_ms());
         self.entries.push(entry);
+    }
+
+    pub(super) fn reconcile_assistant_stream(
+        &mut self,
+        message_id: Option<&str>,
+        role: EntryRole,
+        committed_key: &str,
+    ) {
+        for key in self.assistant_stream.reconcile(message_id, role) {
+            if self.expanded_entries.remove(&key) {
+                self.expanded_entries.insert(committed_key.to_owned());
+            }
+            if self.expanded_entries.remove(&format!("process-{key}")) {
+                self.expanded_entries
+                    .insert(format!("process-{committed_key}"));
+            }
+        }
     }
 
     pub(super) fn ingest_draft_items(&mut self, items: &[Value]) {
