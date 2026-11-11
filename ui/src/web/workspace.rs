@@ -1,5 +1,6 @@
 //! Harness-shaped workspace chrome over the ACP-backed application state.
 
+use super::header_chrome::{MENU_GAP, MENU_MARGIN, menu_origin};
 use super::menu_groups::{MenuHeading, heading_space};
 use super::menu_surface::{menu_elevation, menu_material};
 use super::session_context_menu::{
@@ -8,6 +9,19 @@ use super::session_context_menu::{
 use super::*;
 use gpui::{AvailableSpace, canvas, point, size, svg};
 use kui::primitives::ops_surface::icon_btn;
+
+const HERO_WORKSPACE_HEIGHT: f32 = 28.;
+const HERO_COMPOSER_GAP: f32 = 8.;
+
+fn workspace_menu_height(
+    anchor: gpui::Bounds<gpui::Pixels>,
+    viewport_height: gpui::Pixels,
+) -> gpui::Pixels {
+    let clearance = px(MENU_GAP + MENU_MARGIN);
+    let above = anchor.top() - clearance;
+    let below = viewport_height - anchor.bottom() - clearance;
+    above.max(below)
+}
 
 impl DshApp {
     pub(super) fn render_workspace(&mut self, w: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
@@ -431,6 +445,7 @@ impl DshApp {
             WorkspaceGroupBy::Workspace | WorkspaceGroupBy::WorkspaceTree => 4.,
             WorkspaceGroupBy::Flat => 2.,
         }));
+        let mut empty = filtered.is_empty();
         match self.workspace_group_by {
             WorkspaceGroupBy::Flat => {
                 for session in filtered {
@@ -448,13 +463,26 @@ impl DshApp {
                         groups.push((session.cwd.clone(), vec![session]));
                     }
                 }
+                if self.workspace_archived_filter != WorkspaceArchivedFilter::Only {
+                    for cwd in &self.added_workspaces {
+                        if !self.hidden_workspaces.contains(cwd)
+                            && !groups.iter().any(|(path, _)| path == cwd)
+                            && (query.is_empty()
+                                || cwd.to_lowercase().contains(&query)
+                                || self.workspace_name(cwd).to_lowercase().contains(&query))
+                        {
+                            groups.push((cwd.clone(), Vec::new()));
+                        }
+                    }
+                }
+                empty = groups.is_empty();
                 for (cwd, sessions) in groups {
                     session_groups =
                         session_groups.child(self.render_workspace_group(cwd, sessions, w, cx));
                 }
             }
         }
-        if filtered_count == 0 {
+        if empty {
             session_groups =
                 session_groups.child(self.render_empty_sessions(!query.is_empty(), cx));
         }
@@ -654,12 +682,7 @@ impl DshApp {
             let rail_opacity = 1. - progress;
             sidebar = sidebar.child(self.render_sidebar_rail(rail_opacity, cx));
         }
-        sidebar.when(self.show_workspace_view_options, |element| {
-            element.child(menu_in(
-                "view-options-in",
-                self.render_workspace_view_options(cx),
-            ))
-        })
+        sidebar
     }
 
     fn render_empty_sessions(&self, searching: bool, cx: &mut Context<Self>) -> gpui::Div {
@@ -821,25 +844,33 @@ impl DshApp {
         )
     }
 
-    fn render_workspace_view_options(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    pub(super) fn render_workspace_view_options(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let p = dsh(cx);
-        column()
+        let trigger_bounds = Rc::new(Cell::new(None::<gpui::Bounds<gpui::Pixels>>));
+        let outside_bounds = trigger_bounds.clone();
+        let card = column()
             .id("workspace-view-options-menu")
-            .absolute()
-            .top(px(312.))
-            .right(px(8.))
-            .min_w(px(200.))
-            .max_w(px(360.))
+            .role(gpui::Role::Menu)
             .gap_0()
             .p(px(4.))
             .rounded(px(12.))
             .bg(menu_bg(cx))
             .shadow(elevation_prominent())
             .occlude()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.show_workspace_view_options = false;
-                cx.notify();
-            }))
+            .on_mouse_down_out(
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    if !outside_bounds
+                        .get()
+                        .is_some_and(|bounds| bounds.contains(&event.position))
+                    {
+                        this.show_workspace_view_options = false;
+                        cx.notify();
+                    }
+                }),
+            )
             .child(view_option_label("分组方式", cx))
             .child(self.workspace_view_option(
                 "group-workspace",
@@ -914,7 +945,40 @@ impl DshApp {
                     this.workspace_archived_filter = WorkspaceArchivedFilter::Only;
                 },
                 cx,
-            ))
+            ));
+        canvas(
+            move |trigger, w, cx| {
+                trigger_bounds.set(Some(trigger));
+                let viewport = w.viewport_size();
+                let margin = px(MENU_MARGIN);
+                let max_width = viewport.width - margin * 2.;
+                let max_height = workspace_menu_height(trigger, viewport.height);
+                if max_width <= px(0.) || max_height <= px(0.) {
+                    return;
+                }
+                let mut card = menu_in(
+                    "view-options-in",
+                    card.w(px(200.).min(max_width))
+                        .max_h(max_height)
+                        .overflow_y_scroll(),
+                )
+                .into_any_element();
+                let measured = card.layout_as_root(
+                    size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+                    w,
+                    cx,
+                );
+                w.defer_draw(
+                    card,
+                    menu_origin(trigger, measured, viewport, false),
+                    4,
+                    None,
+                );
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0()
     }
 
     fn workspace_view_option(
@@ -1382,17 +1446,25 @@ impl DshApp {
             }))
     }
 
-    fn render_header(&mut self, w: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
-        let p = dsh(cx);
-        let session = self
-            .active_session
+    fn active_session_summary(&self) -> Option<&SessionSummary> {
+        self.active_session
             .as_ref()
-            .and_then(|id| self.sessions.iter().find(|session| &session.id == id));
-        let blank = session.is_none_or(|session| session.blank)
+            .and_then(|id| self.sessions.iter().find(|session| &session.id == id))
+    }
+
+    pub(super) fn conversation_header_is_blank(&self) -> bool {
+        self.active_session_summary()
+            .is_none_or(|session| session.blank)
             && self.conversation.entries.is_empty()
             && !self.conversation.running
             && self.conversation.permission.is_none()
-            && self.conversation.plan_reviews.is_empty();
+            && self.conversation.plan_reviews.is_empty()
+    }
+
+    fn render_header(&mut self, w: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
+        let p = dsh(cx);
+        let session = self.active_session_summary();
+        let blank = self.conversation_header_is_blank();
         let corner = !self.right_panel_visible();
         let left = if bridge::is_mac() && (self.sidebar_drawer || self.rail_active(w)) {
             if self.shell_fullscreen(w) { 84. } else { 160. }
@@ -1486,30 +1558,43 @@ impl DshApp {
         }
     }
 
-    fn render_hero(&mut self, w: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_hero_workspace_menu(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let p = dsh(cx);
-        let composer_width = self.composer_width(w);
-        let mut workspace_menu = column().w_full().gap(px(2.));
+        let anchor = Rc::new(Cell::new(None::<gpui::Bounds<gpui::Pixels>>));
+        let outside_anchor = anchor.clone();
+        let mut choices = column()
+            .id("workspace-menu-choices")
+            .w_full()
+            .min_h_0()
+            .gap(px(2.))
+            .overflow_y_scroll();
         let mut workspaces = self
             .sessions
             .iter()
             .map(|session| session.cwd.clone())
+            .chain(self.added_workspaces.iter().cloned())
+            .filter(|path| !self.hidden_workspaces.contains(path))
             .collect::<Vec<_>>();
         if !self.workspace.is_empty() {
             workspaces.push(self.workspace.clone());
         }
         workspaces.sort();
         workspaces.dedup();
+        let has_workspaces = !workspaces.is_empty();
         for workspace in workspaces {
             let selected = workspace == self.workspace;
-            let value = workspace.clone();
-            workspace_menu = workspace_menu.child(
+            let label = path_name(&workspace);
+            choices = choices.child(
                 row()
                     .id(gpui::ElementId::Name(
                         format!("workspace-{workspace}").into(),
                     ))
+                    .role(gpui::Role::MenuItem)
+                    .aria_label(label.clone())
+                    .tab_index(0)
                     .w_full()
                     .h(px(32.))
+                    .flex_none()
                     .px(px(8.))
                     .gap(px(8.))
                     .rounded(px(8.))
@@ -1523,17 +1608,109 @@ impl DshApp {
                             .truncate()
                             .text_size(px(13.))
                             .line_height(px(20.))
-                            .child(path_name(&workspace)),
+                            .child(label),
                     )
                     .when(selected, |element| {
                         element.child(icon(Glyph::Check, 14., p.ink))
                     })
                     .on_click(cx.listener(move |this, _, w, cx| {
                         this.show_workspace_menu = false;
-                        this.new_session_at(value.clone(), None, w, cx);
+                        this.new_session_at(workspace.clone(), None, w, cx);
+                        cx.notify();
                     })),
             );
         }
+        let card = column()
+            .id("workspace-menu")
+            .role(gpui::Role::Menu)
+            .gap(px(2.))
+            .p(px(4.))
+            .rounded(px(16.))
+            .bg(menu_bg(cx))
+            .shadow(elevation_prominent())
+            .occlude()
+            .on_mouse_down_out(
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    if !outside_anchor
+                        .get()
+                        .is_some_and(|bounds| bounds.contains(&event.position))
+                    {
+                        this.show_workspace_menu = false;
+                        cx.notify();
+                    }
+                }),
+            )
+            .when(has_workspaces, |card| {
+                card.child(choices).child(
+                    div()
+                        .h(px(0.5))
+                        .flex_none()
+                        .mx(px(4.))
+                        .my(px(3.))
+                        .bg(p.line),
+                )
+            })
+            .child(dock_action_button(
+                row()
+                    .id("manage-workspace")
+                    .role(gpui::Role::MenuItem)
+                    .aria_label("添加工作区")
+                    .tab_index(0)
+                    .w_full()
+                    .h(px(32.))
+                    .flex_none()
+                    .px(px(8.))
+                    .gap(px(8.))
+                    .rounded(px(8.))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(p.hover))
+                    .child(icon(Glyph::Plus, 16., p.secondary))
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .line_height(px(20.))
+                            .child("添加工作区"),
+                    ),
+                cx.listener(|this, _, _, cx| {
+                    this.show_workspace_menu = false;
+                    this.request_workspace_picker();
+                    cx.notify();
+                }),
+            ));
+        canvas(
+            move |trigger, w, cx| {
+                anchor.set(Some(trigger));
+                let viewport = w.viewport_size();
+                let max_width = viewport.width - px(2. * MENU_MARGIN);
+                let max_height = workspace_menu_height(trigger, viewport.height);
+                if max_width <= px(0.) || max_height <= px(0.) {
+                    return;
+                }
+                let mut card = card
+                    .w(px(360.).min(max_width))
+                    .max_h(px(330.).min(max_height))
+                    .into_any_element();
+                let measured = card.layout_as_root(
+                    size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+                    w,
+                    cx,
+                );
+                w.defer_draw(
+                    card,
+                    menu_origin(trigger, measured, viewport, true),
+                    4,
+                    None,
+                );
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0()
+    }
+
+    fn render_hero(&mut self, w: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
+        let p = dsh(cx);
+        let composer_width = self.composer_width(w);
         div()
             .flex_1()
             .min_h_0()
@@ -1610,96 +1787,53 @@ impl DshApp {
                             .relative()
                             .w_full()
                             .mt(px(4.))
-                            .gap(px(8.))
-                            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                                if this.show_workspace_menu {
-                                    this.show_workspace_menu = false;
-                                    cx.notify();
-                                }
-                            }))
+                            .gap(px(HERO_COMPOSER_GAP))
                             .child(
                                 row().w_full().pl(px(20.)).pr(px(16.)).gap(px(4.)).child(
                                     row()
-                                        .id("hero-workspace")
-                                        .h(px(28.))
+                                        .relative()
                                         .min_w_0()
                                         .max_w(px(360.))
-                                        .px(px(8.))
-                                        .gap(px(4.))
-                                        .rounded(px(8.))
-                                        .cursor_pointer()
-                                        .when(self.show_workspace_menu, |element| {
-                                            element.bg(p.hover)
-                                        })
-                                        .hover(|style| style.bg(p.hover))
-                                        .child(icon(Glyph::Folder, 16., p.ink))
-                                        .child(
-                                            div()
-                                                .min_w_0()
-                                                .truncate()
-                                                .text_size(px(13.))
-                                                .line_height(px(20.))
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .child(path_name(&self.workspace)),
-                                        )
-                                        .child(icon(Glyph::Down, 12., p.faint))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.show_workspace_menu = !this.show_workspace_menu;
-                                            this.composer_menu = None;
-                                            cx.notify();
-                                        })),
-                                ),
-                            )
-                            .child(self.render_composer(w, cx, true))
-                            // Paint the picker after the composer so its surface is never
-                            // covered by the card, matching the official portal layering.
-                            .when(self.show_workspace_menu, |element| {
-                                element.child(
-                                    column()
-                                        .id("workspace-menu")
-                                        .absolute()
-                                        .top(px(36.))
-                                        .left(px(20.))
-                                        .w(px(360.))
-                                        .max_h(px(330.))
-                                        .overflow_y_scroll()
-                                        .gap(px(2.))
-                                        .p(px(4.))
-                                        .rounded(px(16.))
-                                        .bg(menu_bg(cx))
-                                        .shadow(elevation_prominent())
-                                        .occlude()
-                                        .child(workspace_menu)
-                                        .child(div().h(px(0.5)).mx(px(4.)).my(px(3.)).bg(p.line))
-                                        .child(
+                                        .child(dock_action_button(
                                             row()
-                                                .id("manage-workspace")
+                                                .id("hero-workspace")
                                                 .role(gpui::Role::Button)
-                                                .aria_label("添加工作区")
+                                                .aria_expanded(self.show_workspace_menu)
                                                 .tab_index(0)
-                                                .w_full()
-                                                .h(px(32.))
+                                                .h(px(HERO_WORKSPACE_HEIGHT))
+                                                .min_w_0()
                                                 .px(px(8.))
-                                                .gap(px(8.))
+                                                .gap(px(4.))
                                                 .rounded(px(8.))
                                                 .cursor_pointer()
+                                                .when(self.show_workspace_menu, |element| {
+                                                    element.bg(p.hover)
+                                                })
                                                 .hover(|style| style.bg(p.hover))
-                                                .child(icon(Glyph::Plus, 16., p.secondary))
+                                                .child(icon(Glyph::Folder, 16., p.ink))
                                                 .child(
                                                     div()
+                                                        .min_w_0()
+                                                        .truncate()
                                                         .text_size(px(13.))
                                                         .line_height(px(20.))
-                                                        .child("添加工作区"),
+                                                        .font_weight(FontWeight::MEDIUM)
+                                                        .child(path_name(&self.workspace)),
                                                 )
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.show_workspace_menu = false;
-                                                    this.settings_page = SettingsPage::General;
-                                                    this.show_settings = true;
-                                                    cx.notify();
-                                                })),
-                                        ),
-                                )
-                            }),
+                                                .child(icon(Glyph::Down, 12., p.faint)),
+                                            cx.listener(|this, _, _, cx| {
+                                                this.show_workspace_menu =
+                                                    !this.show_workspace_menu;
+                                                this.composer_menu = None;
+                                                cx.notify();
+                                            }),
+                                        ))
+                                        .when(self.show_workspace_menu, |anchor| {
+                                            anchor.child(self.render_hero_workspace_menu(cx))
+                                        }),
+                                ),
+                            )
+                            .child(self.render_composer(w, cx, true)),
                     ),
             )
     }
@@ -3089,10 +3223,15 @@ impl DshApp {
                             menu.is_card_overlay() && self.confirm_permission.is_none()
                         }),
                         |element, menu| {
+                            let offset = px(if hero {
+                                HERO_WORKSPACE_HEIGHT + HERO_COMPOSER_GAP
+                            } else {
+                                0.
+                            });
                             let cap = px(if menu.is_command_picker() { 320. } else { 400. });
-                            let max_height = card_bounds
-                                .get()
-                                .map_or(cap, |card| (card.top() - px(88.)).clamp(px(0.), cap));
+                            let max_height = card_bounds.get().map_or(cap, |card| {
+                                (card.top() - offset - px(88.)).clamp(px(0.), cap)
+                            });
                             if max_height <= px(0.) {
                                 return element;
                             }
@@ -3113,7 +3252,7 @@ impl DshApp {
                             element.child(
                                 div()
                                     .absolute()
-                                    .top_0()
+                                    .top(-offset)
                                     .left_0()
                                     .right_0()
                                     .h_0()

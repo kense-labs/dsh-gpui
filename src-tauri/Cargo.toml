@@ -33,7 +33,7 @@ core-text = "21"
 ttf-parser = "0.25"
 block2 = "0.6"
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSButton", "NSEvent", "NSMenu", "NSMenuItem", "NSPasteboard", "NSSavePanel", "NSView", "NSWindow", "block2", "objc2-quartz-core"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSButton", "NSEvent", "NSMenu", "NSMenuItem", "NSOpenPanel", "NSPasteboard", "NSSavePanel", "NSView", "NSWindow", "block2", "objc2-quartz-core"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes"] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGPath"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSDictionary", "NSError", "NSGeometry", "NSKeyValueObserving", "NSNotification", "NSOperation", "NSString", "NSURL", "NSURLAuthenticationChallenge", "NSURLCredential", "NSURLProtectionSpace", "NSURLRequest", "NSURLResponse", "NSURLSession", "NSURLError", "block2"] }

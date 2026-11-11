@@ -156,31 +156,33 @@ impl DshApp {
                     .opacity(fade_out)
                     .child(
                         div()
-                            .id("workspace-view-options")
-                            .role(gpui::Role::Button)
-                            .aria_label("视图选项")
-                            .aria_expanded(self.show_workspace_view_options)
-                            .tab_index(0)
-                            .tab_stop(!self.search_expanded)
+                            .relative()
                             .size(px(28.))
                             .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(8.))
-                            .cursor_pointer()
-                            .when(self.show_workspace_view_options, |element| {
-                                element.bg(p.hover)
-                            })
-                            .hover(|style| style.bg(p.hover))
-                            .child(
-                                svg()
-                                    .data(include_bytes!("../../assets/view-options.svg"))
-                                    .size(px(16.))
-                                    .text_color(p.secondary),
-                            )
-                            .on_mouse_down(
-                                gpui::MouseButton::Left,
+                            .child(dock_action_button(
+                                div()
+                                    .id("workspace-view-options")
+                                    .role(gpui::Role::Button)
+                                    .aria_label("视图选项")
+                                    .aria_expanded(self.show_workspace_view_options)
+                                    .tab_index(0)
+                                    .tab_stop(!self.search_expanded)
+                                    .size_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(8.))
+                                    .cursor_pointer()
+                                    .when(self.show_workspace_view_options, |element| {
+                                        element.bg(p.hover)
+                                    })
+                                    .hover(|style| style.bg(p.hover))
+                                    .child(
+                                        svg()
+                                            .data(include_bytes!("../../assets/view-options.svg"))
+                                            .size(px(16.))
+                                            .text_color(p.secondary),
+                                    ),
                                 cx.listener(|this, _, _, cx| {
                                     if this.search_expanded {
                                         return;
@@ -190,10 +192,12 @@ impl DshApp {
                                     this.show_workspace_menu = false;
                                     this.show_more_menu = false;
                                     this.composer_menu = None;
-                                    cx.stop_propagation();
                                     cx.notify();
                                 }),
-                            ),
+                            ))
+                            .when(self.show_workspace_view_options, |element| {
+                                element.child(self.render_workspace_view_options(cx))
+                            }),
                     )
                     .child(
                         div()
@@ -223,8 +227,7 @@ impl DshApp {
                                 this.show_workspace_view_options = false;
                                 this.show_workspace_menu = false;
                                 this.composer_menu = None;
-                                this.settings_page = SettingsPage::General;
-                                this.show_settings = true;
+                                this.request_workspace_picker();
                                 cx.notify();
                             })),
                     ),
