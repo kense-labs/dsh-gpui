@@ -133,4 +133,5 @@ KWork is licensed under the [MIT License](LICENSE). Bundled third-party componen
 
 - DeepSeek Harness [assets](ui/assets/DeepSeek-LICENSE.txt), [Schedule and Workspace runtime](services/vendor/dsh-schedule/LICENSES.txt), and [Ask User tool](services/vendor/dsh-tool-ask-user/LICENSE)
 - [GPUI renderer](vendor/gpui-pre-wgpu/LICENSE-APACHE)
+- [GPUI web platform](vendor/gpui-pre-web/LICENSE-APACHE)
 - [Noto Sans](ui/assets/NotoSans-LICENSE) and [xterm.js](ui/assets/xterm-LICENSE.txt)

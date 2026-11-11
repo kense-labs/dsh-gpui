@@ -79,6 +79,12 @@ impl DshApp {
                 let plan = !self.conversation.plan_reviews.is_empty();
                 let question = self.conversation.visible_question().is_some();
                 if self.conversation.entries.is_empty()
+                    && self
+                        .conversation
+                        .assistant_stream
+                        .entries()
+                        .next()
+                        .is_none()
                     && !approval
                     && !plan
                     && self.conversation.questions.is_empty()
@@ -1931,6 +1937,7 @@ impl DshApp {
             .conversation
             .entries
             .iter()
+            .chain(self.conversation.assistant_stream.entries())
             .filter(|entry| !entry.is_subcall())
             .collect();
         let layout = self.conversation.turn_process.layout(
@@ -3838,9 +3845,10 @@ impl DshApp {
             ComposerMenu::Commands => {
                 let catalog = command_catalog();
                 let visible = visible_commands(&catalog, &self.command_filter);
-                let mut list = composer_overlay_card("commands-menu", max_height, cx)
-                    .left_0()
-                    .right_0()
+                let mut list = column()
+                    .id("command-list")
+                    .w_full()
+                    .min_h_0()
                     .gap_0()
                     .overflow_y_scroll();
                 let mut index = 0usize;
@@ -3859,7 +3867,11 @@ impl DshApp {
                         index += 1;
                     }
                 }
-                list
+                composer_overlay_card("commands-menu", max_height, cx)
+                    .left_0()
+                    .right_0()
+                    .overflow_hidden()
+                    .child(list)
             }
             ComposerMenu::Files => {
                 let files = self.visible_files();
