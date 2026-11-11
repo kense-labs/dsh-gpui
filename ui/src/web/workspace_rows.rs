@@ -84,13 +84,17 @@ impl DshApp {
                 })
                 .collect();
         }
-        if let Some(archived) = reply.get("archived").and_then(Value::as_array) {
+        if !self.session_archival.available
+            && let Some(archived) = reply.get("archived").and_then(Value::as_array)
+        {
             self.archived_sessions = archived
                 .iter()
                 .filter_map(Value::as_str)
                 .map(str::to_string)
                 .collect();
         }
+        self.pinned_sessions
+            .retain(|id| !self.archived_sessions.contains(id));
         if let Some(delta) = reply.get("contentFontDelta").and_then(Value::as_i64) {
             self.content_font_delta = (delta as i32).clamp(-2, 4);
         }

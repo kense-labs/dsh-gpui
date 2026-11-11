@@ -215,11 +215,13 @@ impl DshApp {
                             app.push_toast("已复制 Session ID", cx);
                         }
                         SessionContextAction::Archive => {
-                            if !app.archived_sessions.remove(&id) {
-                                app.archived_sessions.insert(id.clone());
-                            }
-                            app.save_workspace_preferences(cx);
-                            cx.notify();
+                            app.set_session_archived(
+                                id.clone(),
+                                !app.archived_sessions.contains(&id),
+                                false,
+                                w,
+                                cx,
+                            );
                         }
                         SessionContextAction::OpenIn => unreachable!(),
                     }

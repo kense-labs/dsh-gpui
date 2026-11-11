@@ -3,11 +3,13 @@
 import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { PassThrough } from 'node:stream';
 import { pathToFileURL } from 'node:url';
+import { stripVTControlCharacters } from 'node:util';
 
 const [service, profileEntry, ...patchFiles] = process.argv.slice(2);
 const require = createRequire(join(service, 'apps/cli/package.json'));
@@ -26,9 +28,11 @@ const ready = runProfile({
   profile: 'acp',
   patchFiles,
   args: [],
-}).then(runtime => {
+}).then(async runtime => {
   observeSessionUpdates(runtime.ctx);
   observeModelProviders(runtime.ctx);
+  observePluginInstall(runtime.ctx);
+  await startSchedule(runtime.ctx);
   return runtime;
 });
 
@@ -40,6 +44,12 @@ const planModeMethod = '_dsh/gpui/session/plan-mode';
 const planReviewMethod = '_dsh/gpui/session/plan-review';
 const permissionModeMethod = '_dsh/gpui/session/permission-mode';
 const runtimeSettingsMethod = '_dsh/gpui/runtime-settings';
+const webSettingsMethod = '_dsh/gpui/web-settings';
+const pluginCenterMethod = '_dsh/gpui/plugin-center';
+const pluginInstallMethod = '_dsh/gpui/plugin-install';
+const scheduleMethod = '_dsh/gpui/schedule';
+const openHostSessionMethod = '_dsh/gpui/session/open';
+const sessionArchiveMethod = '_dsh/gpui/session/archive';
 const modelProviderMethods = new Set([
   '_dsh/gpui/providers/list', '_dsh/gpui/providers/save',
   '_dsh/gpui/providers/remove', '_dsh/gpui/providers/discover',
@@ -55,8 +65,8 @@ const messageMethods = new Map([
 ]);
 const extensionMethods = [
   recordMethod, flushMethod, forkMethod, renameMethod, planModeMethod, planReviewMethod,
-  permissionModeMethod, runtimeSettingsMethod,
-  questionStateMethod, questionDecisionMethod,
+  permissionModeMethod, runtimeSettingsMethod, webSettingsMethod, pluginCenterMethod, pluginInstallMethod,
+  questionStateMethod, questionDecisionMethod, scheduleMethod, openHostSessionMethod, sessionArchiveMethod,
   ...modelProviderMethods, ...messageMethods.keys(),
 ];
 
@@ -83,15 +93,181 @@ class SessionOperationError extends Error {
   }
 }
 
-function runtimeSettings(ctx, { page, change } = {}) {
-  const sections = {
-    shell: { namespaces: ['pwsh-sandbox', 'bash-sandbox'], fields: ['timeoutMs', 'maxOutputBytes'] },
-    agentLoop: { namespaces: ['agent-loop'], fields: ['maxParallelToolCalls'] },
+async function startSchedule(ctx) {
+  ctx.on('schedule/changed', () => {
+    process.stdout.write('{"jsonrpc":"2.0","method":"_dsh/gpui/schedule-changed"}\n');
+  }, { global: true });
+  const sessions = ctx.get('acpSessionHost');
+  ctx.on('schedule/resolve-agent', (sessionId, next) => sessions
+    ? sessions.activate(sessionId)
+    : ctx.get('agents')?.get(sessionId) ?? next());
+  if (sessions && !ctx.get('sessionController')) {
+    ctx.provide('sessionController', {
+      async create({ sessionId, cwd, agentPreset }) {
+        if (agentPreset !== undefined) {
+          throw new SessionOperationError('schedule/preset', '当前 ACP 配置无法按预设创建会话。');
+        }
+        const { session } = await sessions.create(sessionId, cwd ?? process.env.KWORK_WORKSPACE ?? process.cwd());
+        process.stdout.write(JSON.stringify({
+          jsonrpc: '2.0', method: '_dsh/gpui/schedule-session', params: {
+            sessionId, cwd: session.header.cwd, createdAt: session.header.createdAt,
+          },
+        }) + '\n');
+        return { sessionId };
+      },
+      async resolveAgent(sessionId) { return { agent: await sessions.activate(sessionId) }; },
+    });
+  }
+  const runtime = process.env.KWORK_SCHEDULE_MODULE;
+  if (!runtime || !ctx.get('storageDomain') || !ctx.get('sessionPersistence')) return;
+  const existing = ctx.get('schedule');
+  const mountTools = ctx.get('sessionController') && ctx.get('tools') && ctx.get('systemPrompt') &&
+    !ctx.get('tools').get('schedule_create');
+  if (existing && !mountTools && ctx.get('workspaceRegistry')) {
+    await importArchivedSessions(ctx);
+    return;
+  }
+  const base = createRequire(require.resolve('@deepseek-ai/dsh-base/package.json'));
+  const manager = createRequire(require.resolve('@deepseek-ai/dsh-plugin-manager'));
+  const persistence = createRequire(base.resolve('@deepseek-ai/dsh-session-persistence-jsonl'));
+  const schemaPackage = manager.resolve('@deepseek-ai/schemastery/package.json');
+  const schemaEntry = JSON.parse(readFileSync(schemaPackage, 'utf8')).exports['.'].import;
+  const entries = {
+    '@deepseek-ai/schemastery': join(dirname(schemaPackage), schemaEntry),
+    '@deepseek-ai/cordis': require.resolve('@deepseek-ai/cordis'),
+    '@deepseek-ai/dsh-llm': base.resolve('@deepseek-ai/dsh-llm'),
+    '@deepseek-ai/dsh-llm/brand': base.resolve('@deepseek-ai/dsh-llm/brand'),
+    '@deepseek-ai/dsh-typert-protocol': manager.resolve('@deepseek-ai/dsh-typert-protocol'),
+    '@deepseek-ai/dsh-subagent': base.resolve('@deepseek-ai/dsh-subagent'),
+    '@deepseek-ai/dsh-session': base.resolve('@deepseek-ai/dsh-session'),
+    '@deepseek-ai/dsh-session-persistence': persistence.resolve('@deepseek-ai/dsh-session-persistence'),
+    '@deepseek-ai/dsh-storage-domain': base.resolve('@deepseek-ai/dsh-storage-domain'),
+    '@deepseek-ai/dsh-tools': base.resolve('@deepseek-ai/dsh-tools'),
+    zod: manager.resolve('zod'),
   };
-  if (!Object.hasOwn(sections, page)) {
+  const source = readFileSync(runtime, 'utf8').replace(/^import (.*) from "([^"]+)";$/gm,
+    (statement, bindings, name) => Object.hasOwn(entries, name)
+      ? `import ${bindings} from ${JSON.stringify(pathToFileURL(entries[name]).href)};`
+      : statement);
+  const { default: Schedule, scheduleTools, WorkspaceRegistry } = await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'));
+  if (!ctx.get('workspaceRegistry') && WorkspaceRegistry) await ctx.plugin(WorkspaceRegistry, {});
+  await importArchivedSessions(ctx);
+  if (!existing) await ctx.plugin(Schedule, {});
+  if (mountTools) {
+    try {
+      await ctx.plugin(scheduleTools, {});
+    } catch (error) {
+      ctx.logger.warn('GPUI could not mount Schedule tools: %s', String(error));
+    }
+  }
+}
+
+async function importArchivedSessions(ctx) {
+  const path = process.env.KWORK_WORKSPACE_PREFERENCES;
+  const registry = ctx.get('workspaceRegistry');
+  if (!path || !registry) return;
+  const { resolveDshHome } = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-home-paths')).href);
+  const marker = join(resolveDshHome(), 'kwork-archive-migration-v1.json');
+  try {
+    if (JSON.parse(await readFile(marker, 'utf8')).version === 1) return;
+    throw new Error('Invalid KWork archive migration record');
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  let archived;
+  try {
+    archived = JSON.parse(await readFile(path, 'utf8')).archived ?? [];
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    archived = [];
+  }
+  if (!Array.isArray(archived) || archived.some(id => typeof id !== 'string' || !id)) {
+    throw new Error('Invalid archived session list in KWork workspace preferences');
+  }
+  for (const sessionId of new Set(archived)) {
+    try {
+      await registry.archiveSession(sessionId);
+    } catch (error) {
+      if (error.name !== 'WorkspaceUnknownSessionError') throw error;
+      ctx.logger.warn('KWork archive migration skipped missing Session %s', sessionId);
+    }
+  }
+  await mkdir(dirname(marker), { recursive: true });
+  const temporary = marker + '.' + randomUUID() + '.tmp';
+  try {
+    await writeFile(temporary, JSON.stringify({ version: 1 }), { mode: 0o600 });
+    await rename(temporary, marker);
+  } finally {
+    await rm(temporary, { force: true });
+  }
+}
+
+async function sessionArchive(ctx, { action, sessionId, stopActivity } = {}) {
+  const registry = ctx.get('workspaceRegistry');
+  if (!registry) {
+    if (action === 'read') return { available: false };
+    throw new SessionOperationError('workspace/unavailable', '当前服务无法归档会话。');
+  }
+  if (action !== 'read') {
+    if (typeof sessionId !== 'string' || !sessionId) {
+      throw new SessionOperationError('workspace/session-id', '缺少会话 ID。');
+    }
+    if (action === 'archive') {
+      try {
+        await registry.archiveSession(sessionId, { stopActivity: stopActivity === true });
+      } catch (error) {
+        if (error.name === 'WorkspaceActiveSessionError') return { activity: error.activity };
+        throw error;
+      }
+    } else if (action === 'restore') {
+      await registry.unarchiveSession(sessionId);
+    } else {
+      throw new SessionOperationError('workspace/action', '找不到这个会话操作。');
+    }
+  }
+  return { available: true, archived: [...registry.archivedSessionIds] };
+}
+
+async function scheduleRequest(ctx, operation) {
+  const schedule = ctx.get('schedule');
+  if (operation?.action === 'catalog') {
+    return schedule ? {
+      available: true,
+      tasks: await schedule.catalog(),
+      limits: schedule.deliveryLimits(),
+      canCreateSession: ctx.get('sessionController') !== undefined,
+      conversationTools: ctx.get('tools')?.get('schedule_create') !== undefined,
+    } : { available: false };
+  }
+  if (!schedule) throw new SessionOperationError('schedule/unavailable', '当前 ACP 服务无法管理自动化任务。');
+  try {
+    switch (operation?.action) {
+      case 'create': return await schedule.remoteCreate(operation.request);
+      case 'edit': return await schedule.remoteEdit({ expectedUpdatedAt: null, ...operation.request });
+      case 'run': return await schedule.run({ id: operation.id });
+      case 'history': return await schedule.remoteHistory(operation.request);
+      case 'clearEnded': return await schedule.deleteInactive();
+      default: throw new SessionOperationError('schedule/action', '找不到这个自动化操作。');
+    }
+  } catch (error) {
+    if (typeof error?.code === 'string' && error.code.startsWith('schedule/')) {
+      throw new SessionOperationError(error.code, error.message);
+    }
+    throw error;
+  }
+}
+
+const runtimeSections = {
+  shell: { namespaces: ['pwsh-sandbox', 'bash-sandbox'], fields: ['timeoutMs', 'maxOutputBytes'] },
+  agentLoop: { namespaces: ['agent-loop'], fields: ['maxParallelToolCalls'] },
+  subagent: { namespaces: ['subagent'], fields: ['maxDepth', 'maxActiveSubagents'] },
+};
+
+function runtimeSettings(ctx, { page, change } = {}) {
+  if (!Object.hasOwn(runtimeSections, page)) {
     throw new SessionOperationError('settings/page', '找不到这个设置页面。');
   }
-  const { namespaces, fields } = sections[page];
+  const { namespaces, fields } = runtimeSections[page];
   const settings = ctx.get('settings');
   const read = () => {
     const entries = settings?.describe({ redactSecrets: true }) ?? [];
@@ -125,9 +301,11 @@ function runtimeSettings(ctx, { page, change } = {}) {
       }
       if (edit?.op === 'unset') return { op: 'unset', path: [field] };
       const value = edit?.value;
-      if (edit?.op !== 'set' || !Number.isFinite(value) || value <= 0 ||
-          (page === 'agentLoop' && !Number.isSafeInteger(value))) {
-        throw new SessionOperationError('settings/value', '请输入有效的正数，或留空以恢复默认值。');
+      const valid = page === 'shell'
+        ? Number.isFinite(value) && value > 0
+        : Number.isSafeInteger(value) && value >= (field === 'maxDepth' ? 0 : 1);
+      if (edit?.op !== 'set' || !valid) {
+        throw new SessionOperationError('settings/value', '请输入此字段允许的数字，或留空以恢复默认值。');
       }
       return { op: 'set', path: [field], value };
     });
@@ -142,6 +320,559 @@ function runtimeSettings(ctx, { page, change } = {}) {
 }
 
 let runtimeSettingsTail = Promise.resolve();
+
+// Older runtimes may not export the presentation sets. Keep profile layers
+// out of both the cards and the mutation endpoint on those runtimes as well.
+const hiddenProfileBundles = new Set([
+  'base', 'web-app', 'headless', 'sdk-app', 'acp-app', 'sdk-minimal', 'ui-app',
+  'experimental-terminal-bundle', 'experimental-tool-worktree',
+].map(name => '@deepseek-ai/dsh-' + name));
+let pluginCatalog;
+function pluginPresentation() {
+  return pluginCatalog ??= (async () => {
+    try {
+      return await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-official-bundles')).href);
+    } catch {
+      return {};
+    }
+  })();
+}
+
+async function pluginCenter(ctx) {
+  const manager = ctx.get('pluginManager');
+  const namespaces = new Set((ctx.get('settings')?.describe({ redactSecrets: true }) ?? [])
+    .map(entry => entry.ns));
+  const configs = Object.entries(runtimeSections)
+    .filter(([, section]) => section.namespaces.some(ns => namespaces.has(ns)))
+    .map(([page]) => page);
+  if (namespaces.has('web') && ctx.get('web')) configs.push('webSearch');
+  if (!manager) return { configs, entries: [], bundles: [], managementAvailable: false };
+
+  const [entries, bundles, catalog] = await Promise.all([
+    manager.listPlugins(), manager.listBundles(), pluginPresentation(),
+  ]);
+  const hidden = name => hiddenProfileBundles.has(name) || catalog.HIDDEN_BUNDLES?.has(name);
+  const live = new Set(entries.filter(entry => entry.enabled).map(entry => entry.entryId));
+  const mainOrder = catalog.EXTENSION_BUNDLES ?? [];
+  const moreOrder = catalog.MORE_BUNDLES ?? [];
+  return {
+    configs,
+    managementAvailable: true,
+    entries: entries.map(({ entryId, moduleName, enabled, fiberPhase, diagnostic, readOnlyReason, meta }) => ({
+      entryId, moduleName, enabled, fiberPhase, diagnostic, readOnlyReason,
+      title: localizedText(meta?.title), description: localizedText(meta?.description),
+    })),
+    bundles: bundles.filter(bundle => !hidden(bundle.name) &&
+      (bundle.installed || bundle.official || bundle.error !== undefined) &&
+      (bundle.listedByDefault !== false || bundle.enabled || bundle.installed ||
+        bundle.rows.some(row => live.has(row.entryId)))).map(bundle => {
+      const { name, version, enabled, installed, official, removable, availability,
+        readOnlyReason, error, meta, rows, installTarget, updatable } = bundle;
+      const first = mainOrder.indexOf(name);
+      const last = moreOrder.indexOf(name);
+      return {
+        name, version, enabled, installed, official, removable, availability, readOnlyReason, error: error?.code,
+        catalogVersion: installTarget?.version,
+        catalogUpdate: catalogUpdateAvailable(bundle),
+        updatable: updatable === true && typeof manager.listVersions === 'function' &&
+          typeof manager.updateBundle === 'function',
+        moreOnly: last >= 0 && !enabled,
+        rank: first >= 0 ? first : last >= 0 ? mainOrder.length + 1 + last : mainOrder.length,
+        title: localizedText(meta?.title),
+        description: localizedText(meta?.description) ?? bundle.description,
+        rows: rows.map(({ rowId, moduleName, entryId, meta }) => ({
+          rowId, moduleName, entryId,
+          title: localizedText(meta?.title), description: localizedText(meta?.description),
+        })),
+      };
+    }),
+  };
+}
+
+let pluginCenterTail = Promise.resolve();
+
+function pluginCenterRequest(ctx, { operation } = {}) {
+  if (operation == null) return pluginCenterTail.then(() => pluginCenter(ctx));
+  const task = pluginCenterTail.then(async () => {
+    const snapshot = await pluginCenter(ctx);
+    const manager = ctx.get('pluginManager');
+    const bundle = snapshot.bundles.find(item => item.name === operation.name);
+    const fail = (error) => ({ snapshot, outcome: { application: 'failed', error } });
+    if (pluginInstallJob?.running) return fail('install-running');
+    if (!manager || !bundle) return fail('unknown-bundle');
+    let result;
+    switch (operation.kind) {
+      case 'bundle':
+        if (typeof operation.enabled !== 'boolean') return fail('invalid-operation');
+        if (bundle.readOnlyReason) return fail(bundle.readOnlyReason);
+        if (operation.enabled && bundle.availability === 'missing') return fail('missing-bundle');
+        if (operation.enabled && bundle.error) return fail(bundle.error);
+        result = await manager.setBundleEnabled(bundle.name, operation.enabled);
+        break;
+      case 'entry': {
+        if (typeof operation.enabled !== 'boolean') return fail('invalid-operation');
+        const row = bundle.rows.find(item => item.rowId === operation.rowId);
+        const entry = row?.entryId && snapshot.entries.find(item => item.entryId === row.entryId);
+        if (!bundle.enabled || !entry) return fail('unknown-plugin');
+        if (entry.readOnlyReason) return fail(entry.readOnlyReason);
+        result = await manager.setPluginEnabled(entry.entryId, operation.enabled);
+        break;
+      }
+      case 'remove':
+        if (bundle.readOnlyReason || !bundle.removable) return fail(bundle.readOnlyReason ?? 'not-removable');
+        result = await manager.removeBundle(bundle.name);
+        break;
+      default: return fail('invalid-operation');
+    }
+    // A profile write can succeed even if re-reading the inventory fails.
+    // Keep the Host outcome separate from the refreshed presentation.
+    return {
+      outcome: {
+        application: result.application,
+        changed: result.changed,
+        restartReason: result.restartReason,
+        error: result.error?.code,
+      },
+      snapshot: await pluginCenter(ctx).catch(() => null),
+    };
+  });
+  pluginCenterTail = task.then(() => undefined, () => undefined);
+  return task;
+}
+
+let pluginInstallJob;
+const installRequestId = /^[0-9a-f]{32}$/;
+
+function pluginInstallEvent(requestId, event) {
+  process.stdout.write(JSON.stringify({
+    jsonrpc: '2.0', method: '_dsh/gpui/plugin-install-event', params: { requestId, ...event },
+  }) + '\n');
+}
+
+function observePluginInstall(ctx) {
+  ctx.on('plugin-manager/install-state', ({ requestId, phase, attempt }) => {
+    if (requestId === pluginInstallJob?.id && pluginInstallJob.running) {
+      pluginInstallEvent(requestId, { type: 'phase', phase, attempt });
+    }
+  }, { global: true });
+  ctx.on('plugin-manager/update-state', ({ requestId, step }) => {
+    if (requestId === pluginInstallJob?.id && pluginInstallJob.running) {
+      pluginInstallEvent(requestId, { type: 'update', step });
+    }
+  }, { global: true });
+  ctx.on('plugin-manager/install-log', ({ requestId, jobId, stream, text, exitCode }) => {
+    if (requestId === pluginInstallJob?.id && pluginInstallJob.running) {
+      // Install logs are for the main UI only. Do not forward argv, which can
+      // contain a user-supplied URL, or the local profile directory.
+      pluginInstallEvent(requestId, {
+        type: 'log', jobId, stream, text: stripVTControlCharacters(text), exitCode,
+      });
+    }
+  }, { global: true });
+}
+
+function safePluginRegistry(value) {
+  if (value == null) return value;
+  const url = typeof value === 'string' && URL.canParse(value) ? new URL(value) : null;
+  if (!url || !['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.hash) {
+    throw new SessionOperationError('plugins/registry', '请输入有效的 HTTP 或 HTTPS 安装源地址。');
+  }
+  return url.href;
+}
+
+function installSummary(result) {
+  return {
+    kind: 'settled',
+    application: result.application,
+    stage: result.stage,
+    changed: result.changed,
+    bundle: result.bundle,
+    version: result.version,
+    enabled: result.enabled,
+    restartReason: result.restartReason,
+    problem: result.error?.code,
+    failure: result.packageResult?.kind,
+    pendingBuilds: result.pendingBuilds,
+  };
+}
+
+function catalogUpdateAvailable(bundle) {
+  return bundle.official && bundle.installed && bundle.removable && !bundle.readOnlyReason &&
+    bundle.availability === 'profile' && bundle.installTarget !== undefined &&
+    !matchesCatalogTarget(bundle, bundle.installTarget);
+}
+
+function matchesCatalogTarget(bundle, target) {
+  return bundle.version === target.version &&
+    ((!target.spec.startsWith('link:') && !bundle.source?.startsWith('link:')) || bundle.source === target.spec);
+}
+
+async function updateSettlement(manager, name, from, to, result, restore, catalog) {
+  let observed;
+  let inventoryRead = false;
+  try {
+    observed = (await manager.listBundles()).find(bundle => bundle.name === name);
+    inventoryRead = true;
+  } catch { /* The Host result still describes the attempted change. */ }
+  const restored = restore && ['applied', 'restart-required'].includes(restore.application);
+  const changed = observed?.version !== from || (catalog && catalog.previous !== observed?.source);
+  const recovery = !inventoryRead ? 'unknown' : observed?.installed !== true ? 'missing' :
+    changed ? 'changed' : restored ? 'restored' : 'kept';
+  const installed = observed?.installed === true &&
+    (result.application === 'failed' || !catalog || matchesCatalogTarget(observed, catalog.target));
+  return {
+    ...installSummary(result),
+    bundle: installed ? name : undefined,
+    version: installed ? observed.version : undefined,
+    enabled: installed ? observed.enabled : undefined,
+    update: { from, to, recovery },
+  };
+}
+
+async function runPluginVersionUpdate(manager, job, input) {
+  const { name, from, version, registry } = input;
+  const bundle = (await manager.listBundles()).find(bundle => bundle.name === name);
+  if (bundle?.updatable !== true || bundle.version !== from || bundle.readOnlyReason ||
+      typeof manager.updateBundle !== 'function') {
+    return { kind: 'refused', problem: 'stale-version' };
+  }
+  pluginInstallEvent(job.id, { type: 'subject', subject: {
+    name, version, description: localizedText(bundle.meta?.description) ?? bundle.description,
+    source: 'registry',
+  } });
+  job.started = true;
+  const result = await manager.updateBundle(name, version, { registry, requestId: job.id });
+  return updateSettlement(manager, name, result.from || from, result.to, result.result, result.restore);
+}
+
+async function runCatalogInstall(ctx, manager, job, input, approvedBuilds) {
+  const { name, from, version, registry } = input;
+  const bundle = (await manager.listBundles()).find(bundle => bundle.name === name);
+  const target = bundle?.installTarget;
+  if (!bundle?.official || !target || target.version !== version || bundle.readOnlyReason ||
+      (from === null
+        ? bundle.installed || bundle.availability !== 'missing' || bundle.error
+        : (bundle.version ?? '') !== from || !catalogUpdateAvailable(bundle))) {
+    return { kind: 'refused', problem: 'stale-version' };
+  }
+  if (job.controller.signal.aborted) return { kind: 'cancelled' };
+  const enabled = from === null ? input.enabled : bundle.enabled;
+  const local = target.spec.startsWith('link:');
+  const subject = {
+    name, version, description: localizedText(bundle.meta?.description) ?? bundle.description,
+    source: local ? 'path' : 'registry',
+  };
+  const replaceLive = from !== null && ctx.get('hmr') !== undefined;
+  const source = bundle.source;
+  // HMR updates stop and remove the running package first. If the update fails
+  // after removal, reinstall the exact previous release or its saved source.
+  if (replaceLive && !source) return { kind: 'refused', problem: 'not-updatable' };
+  job.input = input;
+  pluginInstallEvent(job.id, { type: 'subject', subject });
+  job.started = true;
+  if (replaceLive) {
+    pluginInstallEvent(job.id, { type: 'update', step: 'removing' });
+    const removal = await manager.removeBundle(name).catch(() => ({
+      application: 'failed', stage: 'remove', changed: false, error: { code: 'operation-error' },
+    }));
+    if (removal.application === 'failed' || removal.application === 'cancelled') {
+      return updateSettlement(manager, name, from, version, removal);
+    }
+  }
+  if (from !== null) pluginInstallEvent(job.id, { type: 'update', step: 'installing' });
+  let result;
+  try {
+    result = await manager.installBundle(target.spec, {
+      requestId: job.id, registry, enabled, saveExact: !local,
+      ...(approvedBuilds === undefined ? {} : { approvedBuilds }),
+    });
+  } catch (error) {
+    if (!replaceLive) throw error;
+    result = { application: 'failed', stage: 'install', changed: false, error: { code: 'operation-error' } };
+  }
+  if (from === null) return installSummary(result);
+  let restore;
+  if (replaceLive && (result.application === 'failed' || result.application === 'cancelled')) {
+    pluginInstallEvent(job.id, { type: 'update', step: 'restoring' });
+    if (result.stage === 'enable') await manager.removeBundle(name).catch(() => undefined);
+    const range = source.startsWith(name + '@') ? source.slice(name.length + 1) : null;
+    const previous = from && range !== null && !range.includes(':') ? name + '@' + from : source;
+    restore = await manager.installBundle(previous, { enabled, saveExact: true }).catch(() => null);
+  }
+  return updateSettlement(manager, name, from, version, result, restore, { target, previous: source });
+}
+
+async function runPluginInstall(ctx, manager, job, input, approvedBuilds) {
+  await pluginCenterTail;
+  if (job.controller.signal.aborted) return { kind: 'cancelled' };
+  if (input.kind === 'update') return runPluginVersionUpdate(manager, job, input);
+  if (input.kind === 'catalog') return runCatalogInstall(ctx, manager, job, input, approvedBuilds);
+  const { spec, registry } = input;
+  let subject = input.subject;
+  if (!subject) {
+    const catalog = (await manager.listBundles()).find(bundle =>
+      bundle.name === spec && bundle.official && bundle.availability === 'missing' && bundle.installTarget);
+    if (catalog) return runCatalogInstall(ctx, manager, job, {
+      kind: 'catalog', name: spec, version: catalog.installTarget.version, from: null, enabled: false, registry,
+    });
+    if (job.controller.signal.aborted) return { kind: 'cancelled' };
+    const checked = await manager.inspect(spec, { registry }, job.controller.signal);
+    if (job.controller.signal.aborted) return { kind: 'cancelled' };
+    if (checked.status !== 'accepted') return { kind: 'refused', problem: checked.problem };
+    subject = {
+      name: checked.name, version: checked.version, description: checked.description,
+      registry: checked.registry, source: checked.kind,
+    };
+  }
+  job.input = { spec, registry, subject };
+  pluginInstallEvent(job.id, { type: 'subject', subject });
+  job.started = true;
+  const result = await manager.installBundle(spec, {
+    requestId: job.id, registry: subject.registry, enabled: false,
+    ...(approvedBuilds === undefined ? {} : { approvedBuilds }),
+  });
+  return installSummary(result);
+}
+
+async function pluginInstallRequest(ctx, operation) {
+  const manager = ctx.get('pluginManager');
+  if (!manager) throw new SessionOperationError('plugins/unavailable', '当前 ACP 服务无法安装插件。');
+  if (operation?.action === 'registries') return manager.registries();
+  if (operation?.action === 'versions') {
+    if (pluginInstallJob?.running || typeof manager.listVersions !== 'function') {
+      return { status: 'refused', problem: 'not-updatable', attempts: [] };
+    }
+    return manager.listVersions(operation.name, {});
+  }
+  const id = operation?.requestId;
+  if (typeof id !== 'string' || !installRequestId.test(id)) {
+    throw new SessionOperationError('plugins/request', '插件安装请求无效。');
+  }
+  if (operation.action === 'observe') {
+    return pluginInstallJob?.id === id ? pluginInstallJob.promise : null;
+  }
+  if (operation.action === 'cancel') {
+    const job = pluginInstallJob;
+    if (job?.id !== id || !job.running) return { status: 'not-running' };
+    if (job.nonCancellable) return { status: 'too-late' };
+    if (job.started) return manager.cancelInstall(id);
+    job.controller.abort();
+    await job.promise;
+    return { status: 'cancelled' };
+  }
+  if (['run', 'approve', 'catalog', 'update'].includes(operation.action) && pluginInstallJob?.id === id) {
+    return pluginInstallJob.promise;
+  }
+  if (pluginInstallJob?.running) {
+    throw new SessionOperationError('plugins/busy', '另一个插件安装仍在进行。');
+  }
+  let input;
+  let approvedBuilds;
+  if (operation.action === 'approve') {
+    const previous = pluginInstallJob;
+    approvedBuilds = previous?.result?.pendingBuilds;
+    if (!previous || previous.id !== operation.previousRequestId || id === previous.id ||
+        !previous.input || previous.result?.application !== 'failed' ||
+        !Array.isArray(approvedBuilds) || approvedBuilds.length === 0) {
+      throw new SessionOperationError('plugins/approval', '安装脚本的授权已失效，请重新检查插件。');
+    }
+    input = previous.input;
+  } else if (operation.action === 'catalog' || operation.action === 'update') {
+    const { name, from, version, enabled, registry } = operation;
+    if (typeof name !== 'string' || typeof version !== 'string' || (from !== null && typeof from !== 'string') ||
+        (operation.action === 'catalog' ? typeof enabled !== 'boolean' : from === null)) {
+      return { kind: 'refused', problem: 'invalid-spec' };
+    }
+    input = { kind: operation.action, name, from, version, enabled, registry: safePluginRegistry(registry) };
+  } else if (operation.action === 'run') {
+    const spec = typeof operation.spec === 'string' ? operation.spec.trim() : '';
+    if (!spec || spec.length > 4096 || spec.startsWith('-') || /[\x00-\x1f\x7f]/u.test(spec)) {
+      return { kind: 'refused', problem: 'invalid-spec' };
+    }
+    try {
+      input = { spec, registry: safePluginRegistry(operation.registry) };
+    } catch (error) {
+      if (error instanceof SessionOperationError) return { kind: 'refused', problem: 'invalid-registry' };
+      throw error;
+    }
+  } else {
+    throw new SessionOperationError('plugins/request', '插件安装请求无效。');
+  }
+  const nonCancellable = input.kind === 'update' || (input.kind === 'catalog' && input.from !== null);
+  const job = { id, running: true, started: false, nonCancellable, controller: new AbortController() };
+  pluginInstallJob = job;
+  job.promise = runPluginInstall(ctx, manager, job, input, approvedBuilds).catch(() => {
+    if (job.controller.signal.aborted) return { kind: 'cancelled' };
+    return job.started ? { kind: 'unknown' } : { kind: 'refused', problem: 'unknown' };
+  }).then(result => {
+    job.result = result;
+    job.running = false;
+    return result;
+  });
+  return job.promise;
+}
+
+const webFieldSections = {
+  count: 'web-deepseek-api',
+  baseURL: 'web-search-deepseek',
+  maxUses: 'web-search-deepseek',
+};
+const webSections = ['web-deepseek-api', 'web-search-deepseek', 'web'];
+const legacySearch = 'deepseek-official';
+let webSettingsTail = Promise.resolve();
+
+function webSettingsError(message) {
+  return new SessionOperationError('settings/web', message);
+}
+
+function webSettingsEntries(settings) {
+  return new Map((settings?.describe({ redactSecrets: true }) ?? [])
+    .filter(entry => webSections.includes(entry.ns)).map(entry => [entry.ns, entry]));
+}
+
+function legacyCredentialRef(entries) {
+  return entries.get('web-search-deepseek')?.value.apiKeyEnv || 'DEEPSEEK_API_KEY';
+}
+
+function localizedText(text) {
+  return typeof text === 'string' ? text : text?.zh ?? text?.en;
+}
+
+async function webSettingsSnapshot(ctx) {
+  const settings = ctx.get('settings');
+  const entries = webSettingsEntries(settings);
+  const web = entries.get('web');
+  const runtime = ctx.get('web');
+  if (!web || !runtime) return null;
+  let providers;
+  try { providers = runtime.listProviders(); } catch { /* Keep the current selection visible. */ }
+  const selection = capability => {
+    const key = capability + 'Provider';
+    return {
+      value: web.value[key], base: web.base[key],
+      options: providers?.[capability].map(({ id, title, description }) => ({
+        id, title: localizedText(title), description: localizedText(description),
+      })) ?? [],
+    };
+  };
+  const fields = {};
+  for (const [name, namespace] of Object.entries(webFieldSections)) {
+    const entry = entries.get(namespace);
+    if (entry) fields[name] = {
+      value: entry.value[name], base: entry.base[name], overridden: Object.hasOwn(entry.user, name),
+    };
+  }
+  let credential;
+  if (entries.has('web-search-deepseek')) {
+    const ref = legacyCredentialRef(entries);
+    try {
+      const info = await ctx.get('credentials')?.describe(ref);
+      if (info) credential = { ref, configured: info.configured, writable: info.writable };
+    } catch { /* Invalid or unavailable references cannot be edited here. */ }
+  }
+  return {
+    search: selection('search'), fetch: selection('fetch'), fields, credential,
+    writable: settings.writable, providersFailed: !providers,
+    revisions: Object.fromEntries([...entries].map(([ns, entry]) => [ns, entry.revision])),
+  };
+}
+
+function webFieldEdit(name, edit) {
+  if (edit?.op === 'unset') return { op: 'unset', path: [name] };
+  const value = edit?.value;
+  if (edit?.op !== 'set') throw webSettingsError('设置内容无效。');
+  if (name === 'baseURL') {
+    const url = typeof value === 'string' && URL.canParse(value) ? new URL(value) : undefined;
+    if (!url || !['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
+      throw webSettingsError('请输入有效的 HTTP 或 HTTPS 地址。');
+    }
+  } else if (!Number.isSafeInteger(value) || value < 1 || (name === 'count' && value > 50)) {
+    throw webSettingsError('搜索结果数须为 1–50 的整数，单次请求的搜索上限须为正整数。');
+  }
+  return { op: 'set', path: [name], value };
+}
+
+async function saveWebSettings(ctx, change) {
+  const settings = ctx.get('settings');
+  const entries = webSettingsEntries(settings);
+  const web = entries.get('web');
+  const runtime = ctx.get('web');
+  if (!web || !runtime) throw webSettingsError('该插件当前未加载，暂时无法配置。');
+  const sections = new Map();
+  const add = (namespace, edit) => {
+    if (!sections.has(namespace)) sections.set(namespace, []);
+    sections.get(namespace).push(edit);
+  };
+  for (const [name, edit] of Object.entries(change.fields ?? {})) {
+    if (!Object.hasOwn(webFieldSections, name)) throw webSettingsError('该字段无法在此页面编辑。');
+    add(webFieldSections[name], webFieldEdit(name, edit));
+  }
+  let search = web.value.searchProvider;
+  if (change.search !== undefined || change.fetch !== undefined) {
+    const providers = runtime.listProviders();
+    for (const capability of ['search', 'fetch']) {
+      const id = change[capability];
+      if (id === undefined) continue;
+      const name = capability + 'Provider';
+      const base = web.base[name];
+      if (typeof id !== 'string' || (id === '' ? base !== undefined :
+          !providers[capability].some(provider => provider.id === id))) {
+        throw webSettingsError('所选提供方已不可用，请重新打开页面后再试。');
+      }
+      if (capability === 'search') search = id || undefined;
+      add('web', id === '' || id === base ? { op: 'unset', path: [name] } :
+        { op: 'set', path: [name], value: id });
+    }
+  }
+  const credentials = ctx.get('credentials');
+  const credential = change.credential;
+  if (credential !== undefined) {
+    if (search !== legacySearch || !entries.has('web-search-deepseek') || !credentials ||
+        credential?.ref !== legacyCredentialRef(entries) || typeof credential.key !== 'string' ||
+        !credential.key.trim() || !(await credentials.describe(credential.ref)).writable) {
+      throw webSettingsError('当前提供方的 API Key 无法保存。');
+    }
+  }
+  if (sections.size && !settings.writable) throw webSettingsError('本部署的设置为只读。');
+  for (const namespace of sections.keys()) {
+    const entry = entries.get(namespace);
+    if (!entry || entry.revision !== change.revisions?.[namespace]) {
+      throw webSettingsError('设置已更新，请重新打开页面后再试。');
+    }
+  }
+
+  const applied = [];
+  let failure;
+  try {
+    for (const namespace of webSections) {
+      const edits = sections.get(namespace);
+      if (!edits) continue;
+      await settings.mutate(namespace, edits, entries.get(namespace).revision);
+      applied.push(...edits.map(edit => edit.path[0]));
+    }
+    if (credential !== undefined) {
+      // Revalidate the reference after settings writes. A draft must never be
+      // redirected to a different reference while saving.
+      const current = webSettingsEntries(settings);
+      if (current.get('web')?.value.searchProvider !== legacySearch ||
+          credential.ref !== legacyCredentialRef(current)) {
+        throw webSettingsError('提供方或 API Key 引用已更新。');
+      }
+      await credentials.set(credential.ref, credential.key.trim());
+      applied.push('credential');
+    }
+  } catch {
+    failure = '本部署没有接受全部设置，未保存的内容已保留供你修改。';
+  }
+  return { snapshot: await webSettingsSnapshot(ctx), applied, failure };
+}
+
+function webSettings(ctx, { change } = {}) {
+  if (change == null) return webSettingsTail.then(async () => ({ snapshot: await webSettingsSnapshot(ctx), applied: [] }));
+  const operation = webSettingsTail.then(() => saveWebSettings(ctx, change));
+  webSettingsTail = operation.then(() => undefined, () => undefined);
+  return operation;
+}
 
 async function checkpointTitle(ctx, session) {
   await ctx.get('sessionProjectionCache')?.write(session).catch(error => {
@@ -863,8 +1594,32 @@ async function extension({ id, method, params }) {
   let response;
   try {
     const { ctx } = await ready;
-    if (method === runtimeSettingsMethod) {
+    if (method === openHostSessionMethod) {
+      const sessions = ctx.get('acpSessionHost');
+      if (typeof params?.sessionId !== 'string' || !params.sessionId || typeof params.cwd !== 'string') {
+        throw new SessionOperationError('session/activate', '缺少会话 ID 或工作区路径。');
+      }
+      try {
+        const opened = sessions ? await sessions.openForClient(params.sessionId, params.cwd) : null;
+        response = { result: opened && {
+          ...opened,
+          hostRunning: ctx.get('agents')?.get(params.sessionId)?.status === 'running',
+        } };
+      } catch (error) {
+        throw new SessionOperationError('session/activate', error instanceof Error ? error.message : String(error));
+      }
+    } else if (method === sessionArchiveMethod) {
+      response = { result: await sessionArchive(ctx, params) };
+    } else if (method === scheduleMethod) {
+      response = { result: await scheduleRequest(ctx, params?.operation) };
+    } else if (method === runtimeSettingsMethod) {
       response = { result: await runtimeSettings(ctx, params) };
+    } else if (method === webSettingsMethod) {
+      response = { result: await webSettings(ctx, params) };
+    } else if (method === pluginCenterMethod) {
+      response = { result: await pluginCenterRequest(ctx, params) };
+    } else if (method === pluginInstallMethod) {
+      response = { result: await pluginInstallRequest(ctx, params?.operation) };
     } else if (modelProviderMethods.has(method)) {
       response = { result: await modelProviderOperation(ctx, method, params ?? {}) };
     } else if (method === questionStateMethod) {

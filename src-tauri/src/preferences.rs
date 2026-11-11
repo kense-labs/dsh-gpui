@@ -82,7 +82,7 @@ fn developer_tools_path(webview: &tauri::Webview) -> Result<PathBuf, String> {
     Ok(preferences_path(webview.app_handle())?.with_file_name("developer-tools.json"))
 }
 
-fn preferences_path(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn preferences_path(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_config_dir()
         .map(|directory| directory.join("workspaces.json"))

@@ -179,7 +179,7 @@ impl DshApp {
         self.focus_dock_pane(pane, w, cx);
         focus.focus(w, cx);
         self.dismiss_dock_tab_menu(false, w, cx);
-        let request = bridge::terminal_id();
+        let request = bridge::random_id();
         self.terminal_shell_menu.open = Some(ShellMenu {
             pane,
             request: request.clone(),

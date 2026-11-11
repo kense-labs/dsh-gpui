@@ -55,6 +55,9 @@ impl DshApp {
             .when(material, |main| {
                 main.border_l(px(0.5)).border_color(p.border_l3)
             });
+        if self.page != WorkspacePage::Plugins {
+            self.close_plugin_detail();
+        }
         match self.page {
             WorkspacePage::Conversation => {
                 main = main.child(self.render_header(w, cx));
@@ -81,8 +84,7 @@ impl DshApp {
                 }
             }
             WorkspacePage::Plugins => {
-                let panel = self.render_plugins_panel(w, cx);
-                main = main.child(self.render_global_panel(panel, w, cx));
+                main = main.child(self.render_plugins_panel(w, cx));
             }
             WorkspacePage::Automations => {
                 let panel = self.render_automations_panel(w, cx);
@@ -293,12 +295,21 @@ impl DshApp {
                     self.render_shortcut_reference(w, cx),
                 ))
             })
+            .children(
+                self.render_remove_confirmation(cx)
+                    .map(|dialog| modal_in("plugin-remove-in", dialog.into_any_element())),
+            )
+            .children(
+                self.render_plugin_installer(w, cx)
+                    .map(|dialog| modal_in("plugin-install-in", dialog.into_any_element())),
+            )
             .when(!self.toasts.is_empty(), |element| {
                 element.child(self.render_toasts(cx))
             })
             .children(self.render_session_download(w, cx))
             .children(self.render_session_feedback(w, cx))
             .children(self.render_session_feedback_notice(w, cx))
+            .children(self.render_archive_confirmation(cx))
             .children(self.render_session_markdown_notice(w, cx))
             .when(self.drop_active, |element| {
                 let p = dsh(cx);
@@ -3501,7 +3512,8 @@ impl DshApp {
             .aria_label(label)
             .when(model_menu, |card| card.overflow_hidden())
             .when(!model_menu, |card| {
-                card.overflow_y_scroll()
+                card.w_full()
+                    .overflow_y_scroll()
                     .track_scroll(&self.permission_menu.scroll)
             })
             .on_mouse_down_out(
@@ -3633,6 +3645,20 @@ impl DshApp {
                         w,
                         cx,
                     );
+                    let measured = if model_menu {
+                        measured
+                    } else {
+                        // Fill the resolved card width even when the minimum width
+                        // exceeds the intrinsic width of the permission labels.
+                        card.layout_as_root(
+                            size(
+                                AvailableSpace::Definite(measured.width),
+                                AvailableSpace::MaxContent,
+                            ),
+                            w,
+                            cx,
+                        )
+                    };
                     let x = if model_menu {
                         trigger.right() - measured.width
                     } else {
@@ -4175,7 +4201,7 @@ impl DshApp {
             .line_height(px(20.))
             .cursor_pointer()
             .hover(|style| style.bg(p.hover))
-            .children(permission_icon(&id, 16., p.secondary))
+            .children(permission_icon(&id, 14., p.secondary))
             .child(div().flex_1().min_w_0().truncate().child(label))
             .when(id == "auto", |element| {
                 element.child(
@@ -4428,7 +4454,9 @@ impl DshApp {
     }
 
     fn render_settings(&mut self, w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.prepare_runtime_settings(w, cx);
+        if self.settings_page != SettingsPage::Plugins {
+            self.plugin_center.close_inventory();
+        }
         let p = dsh(cx);
         let (status, detail) = match self.status {
             ServiceStatus::Starting => ("正在连接", "正在启动 ACP 服务"),
@@ -4462,7 +4490,7 @@ impl DshApp {
                             .label("应用并重新连接")
                             .secondary()
                             .loading(self.status == ServiceStatus::Starting)
-                            .disabled(self.conversation.running || self.creating_session)
+                            .disabled(self.conversation.running || self.creating_session || self.plugin_install_busy())
                             .on_click(cx.listener(|this, _, w, cx| this.start_service(w, cx)))
                             .into_themed(cx),
                     )
@@ -4582,27 +4610,10 @@ impl DshApp {
                 cx,
             ),
             SettingsPage::Providers => self.render_model_providers(compact, cx),
-            SettingsPage::Plugins => settings_section(
-                "内置插件",
-                column()
-                    .w_full()
-                    .gap(px(14.))
-                    .child(note(
-                        "当前 ACP 连接不提供内置插件配置清单。插件主面板可以通过真实会话检查环境，不会显示虚构的开关。",
-                        cx,
-                    ))
-                    .child(
-                        Button::new("settings-open-plugins")
-                            .label("打开插件面板")
-                            .secondary()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.close_settings(cx);
-                                this.open_page(WorkspacePage::Plugins, cx);
-                            }))
-                            .into_themed(cx),
-                    ),
-                cx,
-            ),
+            SettingsPage::Plugins => {
+                let inventory = self.render_plugin_inventory(w, cx);
+                settings_section("内置插件", inventory, cx)
+            }
             SettingsPage::AgentPresets => settings_section(
                 "Agent 预设",
                 column()
@@ -4612,18 +4623,6 @@ impl DshApp {
                         "当前 ACP 服务没有提供 Agent 预设读取或切换接口。工具执行仍会在会话中逐项请求审批。",
                         cx,
                     )),
-                cx,
-            ),
-            SettingsPage::Shell => settings_section("终端", self.render_runtime_settings(w, cx), cx),
-            SettingsPage::AgentLoop => {
-                settings_section("Agent 循环", self.render_runtime_settings(w, cx), cx)
-            }
-            SettingsPage::WebSearch => settings_section(
-                "网络搜索",
-                wrapped_settings_note(
-                    "官方网络搜索偏好尚未通过 ACP 暴露；不会伪造开关。",
-                    cx,
-                ),
                 cx,
             ),
             SettingsPage::SessionLog => settings_section(
@@ -4643,9 +4642,6 @@ impl DshApp {
             (SettingsPage::Providers, "模型服务", Glyph::Globe),
             (SettingsPage::Plugins, "内置插件", Glyph::Bulb),
             (SettingsPage::AgentPresets, "Agent 预设", Glyph::Archive),
-            (SettingsPage::Shell, "终端", Glyph::Play),
-            (SettingsPage::AgentLoop, "Agent 循环", Glyph::Redo),
-            (SettingsPage::WebSearch, "网络搜索", Glyph::Globe),
             (SettingsPage::SessionLog, "会话日志", Glyph::Book),
         ];
         let mut nav_list = column().w_full().gap(px(4.));
@@ -4852,7 +4848,7 @@ fn view_option_label(label: &'static str, cx: &App) -> gpui::Div {
 }
 
 /// 发送按钮启动 spinner 的弧线（官方 .8s conic 等效：白弧 + 线性旋转）。
-const SPINNER_ARC_SVG: &[u8] = b"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 20 20\"><circle cx=\"10\" cy=\"10\" r=\"8\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-dasharray=\"12 38\" stroke-linecap=\"round\"/></svg>";
+pub(super) const SPINNER_ARC_SVG: &[u8] = b"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 20 20\"><circle cx=\"10\" cy=\"10\" r=\"8\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-dasharray=\"12 38\" stroke-linecap=\"round\"/></svg>";
 
 fn command_section_title(label: &'static str, separated: bool, cx: &App) -> gpui::Div {
     div()

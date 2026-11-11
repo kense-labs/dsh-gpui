@@ -55,10 +55,9 @@ pub(super) fn menu_elevation(tokens: Tokens) -> Vec<BoxShadow> {
         // CSS box-shadow's blur radius is twice the Gaussian standard deviation.
         shadow.blur_radius *= 0.5;
     }
-    shadows.insert(
-        0,
-        BoxShadow::new(px(0.), px(0.), tokens.border_l1).spread_radius(px(0.5)),
-    );
     gpui_wgpu::clip_backdrop_shadows(&mut shadows);
+    // CSS paints the first listed shadow on top.
+    shadows.reverse();
+    shadows.push(gpui_wgpu::backdrop_stroke(px(0.5), tokens.menu_stroke));
     shadows
 }

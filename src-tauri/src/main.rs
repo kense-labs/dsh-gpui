@@ -73,6 +73,10 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             acp::model_providers,
             acp::runtime_settings,
+            acp::web_settings,
+            acp::plugin_center,
+            acp::plugin_install,
+            acp::schedule_tasks,
             acp::start_service,
             acp::stop_service,
             acp::new_session,
@@ -87,6 +91,7 @@ fn main() {
             history::peek_session_titles,
             history::list_local_sessions,
             acp::close_session,
+            acp::set_session_archived,
             acp::prompt,
             acp::cancel_session,
             acp::set_config_option,

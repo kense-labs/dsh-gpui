@@ -44,6 +44,16 @@ pub fn clip_backdrop_shadows(shadows: &mut [BoxShadow]) {
     }
 }
 
+/// A sharp exterior stroke whose width survives GPUI's shadow bounds snapping.
+pub fn backdrop_stroke(width: Pixels, mut color: Hsla) -> BoxShadow {
+    // Carry the exact device-scaled width in the blur field. The reserved hue
+    // range identifies a stroke so the shader uses it for coverage, not blur.
+    color.h += 2.;
+    BoxShadow::new(gpui::px(0.), gpui::px(0.), color)
+        .spread_radius(width)
+        .blur_radius(-width)
+}
+
 pub(crate) fn is_backdrop(quad: &Quad) -> bool {
     quad.border_color.a < 0.
         && quad.border_color.h >= 1.

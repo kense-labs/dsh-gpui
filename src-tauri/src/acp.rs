@@ -3,6 +3,7 @@
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use tokio::sync::{Mutex, oneshot};
 const EVENT_NAME: &str = "acp-event";
 const SESSION_BRIDGE: &str = include_str!("../../services/acp-session-bridge.mjs");
 const ASK_USER_TOOL: &str = include_str!("../../services/vendor/dsh-tool-ask-user/index.mjs");
+const SCHEDULE_RUNTIME: &[u8] = include_bytes!("../../services/vendor/dsh-schedule/index.mjs");
 
 /// Owns the single ACP connection shared by all windows and sessions.
 #[derive(Default)]
@@ -29,10 +31,15 @@ struct AcpConnection {
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
     stopping: AtomicBool,
     session_bridge: bool,
+    _schedule_runtime: Option<tempfile::NamedTempFile>,
 }
 
 impl AcpConnection {
-    async fn spawn(service_path: &Path, app: AppHandle) -> Result<Arc<Self>, String> {
+    async fn spawn(
+        service_path: &Path,
+        workspace: &Path,
+        app: AppHandle,
+    ) -> Result<Arc<Self>, String> {
         let built = service_path.join("apps/cli/lib/bin.js");
         let source = service_path.join("apps/cli/src/bin.ts");
         let node = resolve_node();
@@ -50,6 +57,7 @@ impl AcpConnection {
             ));
         };
         let session_bridge = profile.is_file();
+        let mut schedule_runtime = None;
         if session_bridge {
             let ask_tool =
                 serde_json::to_string(ASK_USER_TOOL).map_err(|error| error.to_string())?;
@@ -59,7 +67,27 @@ impl AcpConnection {
                 .arg(bridge)
                 .args(["--", "dsh-gpui-acp"])
                 .arg(service_path)
-                .arg(profile);
+                .arg(profile)
+                .env("KWORK_WORKSPACE", workspace)
+                .env(
+                    "KWORK_WORKSPACE_PREFERENCES",
+                    crate::preferences::preferences_path(&app)?,
+                );
+            // The scheduler bundle is larger than macOS's process argument limit.
+            // Retain the private file until the child connection is released.
+            match tempfile::NamedTempFile::new().and_then(|mut file| {
+                file.write_all(SCHEDULE_RUNTIME)?;
+                Ok(file)
+            }) {
+                Ok(file) => {
+                    command.env("KWORK_SCHEDULE_MODULE", file.path());
+                    schedule_runtime = Some(file);
+                }
+                Err(error) => {
+                    command.env_remove("KWORK_SCHEDULE_MODULE");
+                    eprintln!("dsh-gpui schedule runtime: {error}");
+                }
+            }
         } else {
             command.arg(entry).args(["--profile", "acp"]);
         }
@@ -83,6 +111,7 @@ impl AcpConnection {
             pending: Mutex::new(HashMap::new()),
             stopping: AtomicBool::new(false),
             session_bridge,
+            _schedule_runtime: schedule_runtime,
         });
 
         tokio::spawn(read_stdout(connection.clone(), stdout, app.clone()));
@@ -225,6 +254,37 @@ async fn route_message(connection: &Arc<AcpConnection>, app: &AppHandle, message
                 }),
             );
         }
+        (Some("_dsh/gpui/plugin-install-event"), None)
+            if connection.session_bridge && !connection.stopping.load(Ordering::Acquire) =>
+        {
+            if let Some(mut params) = message.get("params").and_then(Value::as_object).cloned() {
+                params.insert("kind".into(), Value::String("plugin_install".into()));
+                if let Err(error) = app.emit_to("main", EVENT_NAME, params) {
+                    eprintln!("dsh-gpui plugin install event emission: {error}");
+                }
+            }
+        }
+        (Some("_dsh/gpui/schedule-changed"), None)
+            if connection.session_bridge && !connection.stopping.load(Ordering::Acquire) =>
+        {
+            if let Err(error) = app.emit_to("main", EVENT_NAME, json!({"kind": "schedule_changed"}))
+            {
+                eprintln!("dsh-gpui schedule event emission: {error}");
+            }
+        }
+        (Some("_dsh/gpui/schedule-session"), None)
+            if connection.session_bridge && !connection.stopping.load(Ordering::Acquire) =>
+        {
+            if let Some(session) = message.get("params").filter(|value| value.is_object())
+                && let Err(error) = app.emit_to(
+                    "main",
+                    EVENT_NAME,
+                    json!({"kind": "schedule_session", "session": session}),
+                )
+            {
+                eprintln!("dsh-gpui schedule session event emission: {error}");
+            }
+        }
         (Some(_), None) => {}
         (None, Some(id)) => {
             let Some(id) = id.as_u64() else {
@@ -288,6 +348,8 @@ pub struct StartServiceReply {
     pub service_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_providers: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_archive: Option<Value>,
 }
 
 #[tauri::command]
@@ -304,7 +366,7 @@ pub async fn start_service(
         previous.stop().await;
     }
     emit(&app, "service", json!({"status": "starting"}));
-    let connection = AcpConnection::spawn(&service_path, app.clone()).await?;
+    let connection = AcpConnection::spawn(&service_path, &workspace, app.clone()).await?;
     let agent = connection
         .request(
             "initialize",
@@ -326,6 +388,15 @@ pub async fn start_service(
     } else {
         None
     };
+    let workspace_archive = if connection.session_bridge {
+        Some(
+            connection
+                .request("_dsh/gpui/session/archive", json!({"action":"read"}))
+                .await?,
+        )
+    } else {
+        None
+    };
     emit(
         &app,
         "service",
@@ -337,6 +408,7 @@ pub async fn start_service(
         workspace: workspace.display().to_string(),
         service_path: service_path.display().to_string(),
         model_providers,
+        workspace_archive,
     })
 }
 
@@ -387,12 +459,17 @@ async fn resume_with_key_models(
     session_id: &str,
     cwd: &str,
 ) -> Result<Value, String> {
-    let mut reply = connection
-        .request(
-            "session/resume",
-            json!({"sessionId": session_id, "cwd": cwd, "mcpServers": []}),
-        )
-        .await?;
+    let params = json!({"sessionId": session_id, "cwd": cwd, "mcpServers": []});
+    let mut reply = if connection.session_bridge {
+        connection
+            .request("_dsh/gpui/session/open", params.clone())
+            .await?
+    } else {
+        Value::Null
+    };
+    if reply.is_null() {
+        reply = connection.request("session/resume", params).await?;
+    }
     prepare_session_models(connection, session_id, &mut reply).await;
     Ok(reply)
 }
@@ -742,6 +819,7 @@ pub(crate) enum QuestionDecision {
 pub(crate) enum RuntimeSettingsPage {
     Shell,
     AgentLoop,
+    Subagent,
 }
 
 #[tauri::command]
@@ -762,6 +840,176 @@ pub(crate) async fn runtime_settings(
         .request(
             "_dsh/gpui/runtime-settings",
             json!({"page":page,"change":change}),
+        )
+        .await
+}
+
+#[tauri::command]
+pub(crate) async fn web_settings(
+    webview: tauri::Webview,
+    change: Option<Value>,
+    service: State<'_, AcpService>,
+) -> Result<Value, String> {
+    if webview.label() != "main" {
+        return Err("仅主窗口可编辑网页搜索与获取设置。".into());
+    }
+    let connection = connection(&service).await?;
+    if !connection.session_bridge {
+        return Ok(json!({"snapshot": null, "applied": []}));
+    }
+    connection
+        .request("_dsh/gpui/web-settings", json!({"change":change}))
+        .await
+}
+
+#[tauri::command]
+pub(crate) async fn plugin_center(
+    webview: tauri::Webview,
+    operation: Option<PluginCenterOperation>,
+    service: State<'_, AcpService>,
+) -> Result<Value, String> {
+    if webview.label() != "main" {
+        return Err("仅主窗口可管理插件。".into());
+    }
+    let connection = connection(&service).await?;
+    if !connection.session_bridge {
+        return Ok(Value::Null);
+    }
+    connection
+        .request("_dsh/gpui/plugin-center", json!({"operation": operation}))
+        .await
+}
+
+#[derive(serde::Deserialize, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub(crate) enum PluginCenterOperation {
+    Bundle {
+        name: String,
+        enabled: bool,
+    },
+    Entry {
+        name: String,
+        row_id: String,
+        enabled: bool,
+    },
+    Remove {
+        name: String,
+    },
+}
+
+#[derive(serde::Deserialize, Serialize)]
+#[serde(
+    tag = "action",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub(crate) enum PluginInstallOperation {
+    Registries,
+    Versions {
+        name: String,
+    },
+    Run {
+        request_id: String,
+        spec: String,
+        registry: Option<String>,
+    },
+    Catalog {
+        request_id: String,
+        name: String,
+        from: Option<String>,
+        version: String,
+        enabled: bool,
+    },
+    Update {
+        request_id: String,
+        name: String,
+        from: String,
+        version: String,
+        registry: Option<String>,
+    },
+    Approve {
+        request_id: String,
+        previous_request_id: String,
+    },
+    Cancel {
+        request_id: String,
+    },
+    Observe {
+        request_id: String,
+    },
+}
+
+#[tauri::command]
+pub(crate) async fn plugin_install(
+    webview: tauri::Webview,
+    operation: PluginInstallOperation,
+    service: State<'_, AcpService>,
+) -> Result<Value, String> {
+    if webview.label() != "main" {
+        return Err("仅主窗口可安装插件。".into());
+    }
+    let connection = connection(&service).await?;
+    if !connection.session_bridge {
+        return Err("当前 ACP 服务无法安装插件。".into());
+    }
+    connection
+        .request("_dsh/gpui/plugin-install", json!({"operation":operation}))
+        .await
+}
+
+#[derive(serde::Deserialize, Serialize)]
+#[serde(tag = "action", rename_all = "camelCase")]
+pub(crate) enum ScheduleOperation {
+    Catalog,
+    Create { request: Value },
+    Edit { request: Value },
+    Run { id: String },
+    History { request: Value },
+    ClearEnded,
+}
+
+#[tauri::command]
+pub(crate) async fn schedule_tasks(
+    webview: tauri::Webview,
+    operation: ScheduleOperation,
+    service: State<'_, AcpService>,
+) -> Result<Value, String> {
+    if webview.label() != "main" {
+        return Err("仅主窗口可管理自动化任务。".into());
+    }
+    let connection = connection(&service).await?;
+    if !connection.session_bridge {
+        return Ok(json!({"available": false}));
+    }
+    connection
+        .request("_dsh/gpui/schedule", json!({"operation": operation}))
+        .await
+}
+
+#[tauri::command]
+pub(crate) async fn set_session_archived(
+    webview: tauri::Webview,
+    session_id: String,
+    archived: bool,
+    stop_activity: bool,
+    service: State<'_, AcpService>,
+) -> Result<Value, String> {
+    if webview.label() != "main" {
+        return Err("仅主窗口可归档会话。".into());
+    }
+    connection(&service)
+        .await?
+        .request(
+            "_dsh/gpui/session/archive",
+            json!({
+                "action": if archived { "archive" } else { "restore" },
+                "sessionId": session_id,
+                "stopActivity": stop_activity,
+            }),
         )
         .await
 }
