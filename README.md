@@ -1,116 +1,79 @@
 # KWork
 
-KWork 是基于 DeepSeek Harness ACP 的桌面 GPUI 客户端。Tauri 负责桌面窗口、子进程和 IPC；KUI 提供 GPUI 组件，前端编译为 WebAssembly 后在 Tauri WebView 中运行。
+English · [简体中文](README.zh.md) · [MIT License](LICENSE)
 
-当前实现覆盖 API Key 配置和 ACP 对话主流程，并参照官方 Harness 重构了主工作区和设置模态框。完整的功能与界面一致性仍待验证。
+KWork is a desktop client for DeepSeek Harness ACP. Its Rust interface uses KUI and GPUI, compiles to WebAssembly, and runs in a Tauri WebView. Tauri also manages the native window, system tray, and local Harness processes.
 
-## 已实现
+## Features
 
-- API Key 配置：密码掩码输入、校验、保存、更新和移除
-- 主工作区：可动画折叠的会话侧栏、本地会话搜索、按工作区分组、新建和恢复会话
-- Kense 品牌标志、深色界面、欢迎区、工作区与模型菜单、蓝色圆形发送／停止按钮
-- 设置模态框：模型、API Key、工作区与连接、外观等页面
-- 发送任务、取消执行、展示助手消息与思考内容
-- 展示工具输入、执行状态和结果，人工批准或拒绝一次性工具权限请求
-- 切换模型和推理强度，显示上下文用量
-- 明暗主题、中文界面、工作区与服务路径设置
-- 凭据就绪后的服务重建，以及发送失败后的草稿恢复
-- `KWork` 应用名称、Kense Dock 与打包图标，以及带打开窗口和退出菜单的状态栏图标
-- 插件中心、插件安装与更新、网络搜索和运行时设置
-- 自动化任务的创建、编辑、暂停、运行记录与实际 ACP 投递，以及归档会话的确认、恢复和持久化
+- Organize conversations by workspace, search local history, and create, resume, or archive sessions.
+- Configure DeepSeek or another OpenAI-compatible model provider. Switch models and reasoning effort from the composer.
+- Send and cancel tasks, inspect tool calls and results, and respond to one-time permission requests.
+- Create, edit, pause, and run scheduled tasks. Delivery history opens the session that received the task.
+- Browse and manage plugins, configure web search, and use the Simplified Chinese interface in light or dark mode.
 
-DeepSeek API Key 使用 `deepseek-official` 路由。
+## Quick start
 
-在「设置 → 模型服务」可搜索并选用硅基流动、深度求索、OpenRouter、OpenAI 和 Ollama 的预设，也可添加自定义 OpenAI 兼容服务商。选择 Chat Completions 或 Responses，填写 API 基础地址和所需的 API Key，再同步并筛选模型列表，或手动填写模型 ID。保存后可在对话的模型菜单中切换。API Key 由 Harness 本机凭据服务保存。
+Install Node.js 24.9 or later, pnpm 12.6.0, Rust stable with `rustup`, and the Tauri prerequisites for your platform. On macOS, install the Xcode Command Line Tools and `just`.
 
-Composer 左下角的“＋”打开与官方 Harness 相同层级的指令面板，模型和思考强度使用 ACP 返回的真实选项。ACP 尚未提供的文件、目标、计划、反馈和权限预设会明确标记为不可用，不会伪装成已经支持。
-
-## 架构与凭据
-
-DeepSeek Harness 采用 Cordis 插件架构。`dsh-base` 提供模型、工具、持久化和审批能力，`dsh-acp-app` 将 Agent 生命周期映射到标准 ACP。一个 ACP 连接可以承载多个独立会话，每个会话同时只允许一个进行中的 prompt。
-
-客户端启动两个独立的 Node 子进程：
-
-- `dsh-acp`：标准 ACP stdio 服务，负责会话、模型、工具和权限。
-- `services/credential-service.mjs`：Host-only NDJSON 辅助服务，通过同级 `dsh-acp` 的 `LocalCredentialProvider` 管理 API Key。
-
-两个进程共享 `$DSH_HOME/.credentials.yaml`。API Key 只从 Tauri Host 写入官方凭据服务，前端只读取配置状态。凭据文件在隔离测试中权限为 `0600`，但它是凭据文件而非界面加密保险库，应继续保护用户主目录。
-
-ACP 恢复会话但不回放历史消息；ACP 发送提交后的语义消息块，而不是模型原始 token 流。
-
-## 目录
-
-```text
-src-tauri/             Tauri 后端、ACP、凭据子进程与原生托盘
-src-tauri/icons/       KWork 应用图标和状态栏模板
-services/              Host-only 官方凭据桥
-ui/                    KUI/GPUI Rust 前端与 WASM 入口
-ui/src/web/workspace.rs 主工作区、对话、Composer 与设置模态框
-ui/src/welcome.rs      首次配置 API Key 和设置页凭据控件
-ui/src/state.rs        可测试的消息归并与凭据草稿校验
-scripts/               可重复的 WASM 与开发应用构建脚本
-justfile               本地快捷启动
-```
-
-## 准备
-
-- Node.js 24.9+
-- pnpm 12.6.0
-- Rust stable、`wasm32-unknown-unknown` target
-- Tauri 的平台依赖；macOS 需要 Xcode Command Line Tools
-- 同级目录中的 `../dsh-acp`
-
-安装并构建 ACP 服务：
+Clone KWork and its companion [dsh-acp](https://github.com/kense-labs/dsh-acp) service into the same parent directory.
 
 ```sh
-cd ../dsh-acp
+git clone https://github.com/kense-labs/kwork.git
+git clone https://github.com/kense-labs/dsh-acp.git
+cd dsh-acp
 pnpm install
 pnpm run build
-cd ../dsh-gpui
-npm install
+cd ../kwork
+npm ci
 ```
 
-未构建 `dsh-acp` 时，客户端会尝试通过 `node --import tsx/esm apps/cli/src/bin.ts --profile acp` 从源码启动。生产使用建议先构建服务。
+On macOS, run `just dev` to build and launch `.tools/dev-app/KWork.app`. On other platforms, use `npm run dev` to start the Tauri development client.
 
-## 启动
+You can add a DeepSeek API key on first launch or select **Set up later** (`稍后配置`) to enter the workspace. To manage the key later, open **More → Settings → API Key** from the sidebar. KWork also accepts the `DEEPSEEK_API_KEY` environment variable and uses the `deepseek-official` route for that key.
 
-```sh
-just dev
-```
+## Model providers
 
-macOS 上该命令构建前端和 debug Host，并在 `.tools/dev-app/` 生成轻量 `KWork.app` 后运行，使开发模式的 Dock 名称和图标也与正式应用一致。其他平台使用 `npm run dev` 启动 Tauri 开发客户端。
+Open **Settings → Model Providers** (`设置 → 模型服务`) to choose a preset for SiliconFlow, DeepSeek, OpenRouter, OpenAI, or Ollama. For a custom provider, choose Chat Completions or Responses, enter the API base URL and any required key, then sync the model list or enter a model ID. Select a saved model from the composer menu.
 
-首次启动可直接添加 API Key，也可选择「稍后配置」进入工作区。以后通过侧栏底部「更多」菜单打开设置，在「API Key」页管理密钥。已有的 `DEEPSEEK_API_KEY` 环境变量也可用。
+The Tauri host writes keys through the local Harness credential service. The frontend reads credential status. Harness stores credentials in `.credentials.yaml` under its home directory.
 
-可选环境变量：
+## Configuration
 
-```sh
-export DSH_ACP_PATH=/absolute/path/to/dsh-acp
-export DSH_NODE=/absolute/path/to/node         # 可选
-export DSH_HOME=/absolute/path/to/harness-home # 可选，默认 ~/.dsh
-```
+| Variable | Purpose |
+| --- | --- |
+| `DSH_ACP_PATH` | Path to the `dsh-acp` checkout. The default lookup includes `../dsh-acp`. |
+| `DSH_NODE` | Path to the Node.js executable used by the host. |
+| `DSH_HOME` | Harness data directory. Defaults to `~/.dsh`. |
 
-工作区必须在发起任务的机器上存在；会话使用其规范化绝对路径。
+The workspace directory must exist on the machine running KWork. ACP uses its canonical absolute path. Resuming a session reattaches to the Harness agent. KWork loads persisted history separately from the ACP update stream.
 
-## 构建与检查
+## Build and verify
 
 ```sh
-npm run ui:build   # release WASM + wasm-bindgen，工具安装在 .tools/
-npm run build      # Tauri release Host，不生成安装包
-npm exec -- tauri build --bundles app  # macOS .app，包含名称和图标
+npm run ui:build
+cargo fmt --all --check
 cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo clippy -p dsh-gpui-ui --target wasm32-unknown-unknown -- -D warnings
+node --test scripts/*.test.mjs
 ```
 
-WASM 构建会依据 `Cargo.lock` 安装匹配版本的 `wasm-bindgen-cli` 到项目 `.tools/`，不污染全局 Rust 工具目录。
+`npm run build` builds the release host executable. To package a macOS application, build the frontend first and run `npm exec -- tauri build --bundles app`. The frontend build installs the `wasm-bindgen-cli` version pinned in `Cargo.lock` under `.tools/`.
 
-## 尚未对齐与验收边界
+| Path | Contents |
+| --- | --- |
+| `ui/` | Rust UI, WebAssembly entry point, and assets |
+| `src-tauri/` | Native shell, IPC, ACP process management, and application icons |
+| `services/` | Credential and ACP bridges, plus bundled Harness services |
+| `scripts/` | Build tools and JavaScript tests |
 
-当前版本仍在对照本地官方 Harness 逐项验收。自动化按指定 Agent 预设创建会话、完整工作区管理，以及全界面和动画的一致性仍待完成。菜单阴影已在明暗主题和 1×、2× 下与官方 CSS 对照，其余视图需要各自的视觉验收。
+## Project status
 
-隔离测试已验证 API Key 管理、真实 ACP 自动化投递、从运行记录打开同一会话、旧归档迁移、停止并归档以及恢复后的投递。自动化的冷启动恢复和预留会话需要配套 `dsh-acp` 提供 `ctx.acpSessionHost`。当前 macOS 开发应用已完成构建和隔离启动检查。
+The macOS development build, API key management, ACP automation delivery, delivery-history navigation, and session archival and restoration have been tested. Cold delivery and reserved sessions require the companion `dsh-acp` build with `ctx.acpSessionHost`. Scheduled sessions with an explicit Agent preset, full workspace management, and visual and animation parity with DeepSeek Harness remain in progress.
 
-## 许可
+## License
 
-MIT。KUI 与 DeepSeek Harness 的各自许可和第三方声明仍适用。
+KWork is licensed under the [MIT License](LICENSE). Bundled third-party components retain their own license notices.
+
+- DeepSeek Harness [assets](ui/assets/DeepSeek-LICENSE.txt), [Schedule and Workspace runtime](services/vendor/dsh-schedule/LICENSES.txt), and [Ask User tool](services/vendor/dsh-tool-ask-user/LICENSE)
+- [GPUI renderer](vendor/gpui-pre-wgpu/LICENSE-APACHE)
+- [Noto Sans](ui/assets/NotoSans-LICENSE) and [xterm.js](ui/assets/xterm-LICENSE.txt)
