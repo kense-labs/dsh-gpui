@@ -57,7 +57,7 @@ cargo test --workspace
 node --test scripts/*.test.mjs
 ```
 
-`npm run build` 构建发布版主程序。打包 macOS 应用时，先构建前端，再运行 `npm exec -- tauri build --bundles app`。前端构建会将 `Cargo.lock` 锁定版本的 `wasm-bindgen-cli` 安装到 `.tools/`。
+`npm run build` 构建发布版主程序。打包 macOS 应用时，先构建前端，再运行 `npm exec -- tauri build --bundles app`。前端构建会把 `Cargo.lock` 锁定版本的 `wasm-bindgen-cli` 和按平台匹配的 `wasm-opt` 安装到 `.tools/`，不写入 `package.json`。
 
 | 路径 | 内容 |
 | --- | --- |
@@ -65,6 +65,39 @@ node --test scripts/*.test.mjs
 | `src-tauri/` | 原生窗口、IPC、ACP 进程管理和应用图标 |
 | `services/` | 凭据桥、ACP 桥和内置 Harness 服务 |
 | `scripts/` | 构建工具和 JavaScript 测试 |
+
+## 构建提速与产物体积
+
+### blaze（只用于原生 Host 的开发增量构建）
+
+[blaze](https://github.com/indexable-inc/blaze) 是 Rust 的常驻增量编译器，用 `blaze` 代替 `cargo` 可以在改一个函数后只重编改动部分。它**不是体积优化工具**：拒绝 `lto = true/thin`、不做跨函数优化，官方支持矩阵里 wasm32 模块体积是 rustc 的 8–50 倍。因此 KWork 的 WASM 前端和所有 release 构建**始终走 cargo**，blaze 只作为 macOS 原生 Host 开发循环的可选加速器：
+
+```sh
+curl -fsSL https://ix.dev/blaze | sh       # 需要 ~/.cargo/bin 在 PATH 中
+just host-blaze                            # 只构建原生 Host
+just dev-blaze                             # 构建并启动 macOS 开发应用
+```
+
+`scripts/blaze-build.mjs` 会按「blaze 版本 + `Cargo.lock` + 平台」做一次兼容性探测，结果记在 `.tools/blaze-compat.json`：探测失败就永久回退 `cargo build -p dsh-gpui`，所以 `just dev` 默认路径不会变慢也不会失败。上游修复后可用 `KWORK_BLAZE=force node scripts/blaze-build.mjs` 重新探测；`KWORK_BLAZE=off` 强制只用 cargo。blaze v2 默认把产物写到 checkout 之外，需要 `KWORK_BLAZE_ARGS='--target-dir target'`；容器/CI 里若沙箱不可用可设 `BLAZE_SANDBOX=off`。
+
+**当前实测结论（2026-11-11，macOS arm64）**：stable `0.20261027.0` 在加载工作区时无法编译 `objc2-exception-helper` 的 build script（writable static `MIN` 无 rustc 符号）；canary `0.20261105.4` 在 `icu_collections` / `icu_provider` / `cargo_metadata` 等 crate 的 proc macro 展开上失败（退出码 101）。`blaze enable` 全局接管 cargo 的做法也不要用：它改 `~/.cargo/config.toml`，会影响同机其它项目，而且 KWork 用 stable 1.99.1、blaze 用自己的 nightly-2026-10-27，wrapper 模式下 daemon 实际链接 0 个程序，增量构建反而比纯 cargo 慢。按官方建议，`cargo check` 与 CI 始终是最终裁决。
+
+### 产物体积
+
+WASM 前端是 KWork 最大的产物。体积优化分成三段，全部由 `npm run ui:build` 完成：
+
+1. `Cargo.toml` 的 `[profile.release-wasm]`（继承 release，独立设置 `opt-level = "z"`、`lto = true`、`panic = "abort"`、`strip = false`）；`strip = false` 保留 `target_features` 自定义段，否则 wasm-bindgen 无法识别 rustc 启用的 bulk-memory / reference-types 等特性。
+2. `wasm-bindgen` 输出到临时目录后，用 `wasm-opt -Oz` 处理（这是官方在 `strip = true` 警告里推荐的替代方案），结果按内容哈希缓存在 `.tools/wasm-opt-cache/`。
+3. 生成的文件按内容与 `ui/dist/` 增量同步：内容没变就不重写，只删除真正过时的 content-hash chunk，warm build 不再删除并重建上百个文件。
+
+实测（本机）：
+
+| 产物 | 优化前 | 优化后 |
+| --- | ---: | ---: |
+| `ui/dist/pkg/dsh_gpui_ui_bg.wasm` | 18,650,990 B | 13,413,708 B（−28.1%） |
+| `ui/dist/` 整体 | 23 MB | 18 MB（−22%） |
+
+原生 Host 的 `[profile.release]` 保持 `lto = "thin"` + `codegen-units = 1` + `strip = true`，不受 WASM profile 影响。开发时如需跳过优化步骤可设 `KWORK_WASM_OPT=off`。优化后的 wasm 已验证 `WebAssembly.validate`、imports/exports 与 wasm-bindgen 原始输出一致（28 个导出不变，仅删掉 4 个未使用导入），并可正常实例化。
 
 ## 项目状态
 

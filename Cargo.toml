@@ -15,5 +15,19 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
+# The WebAssembly frontend is the largest thing KWork ships. Keep its size
+# settings in a separate profile so the native Tauri host stays on opt-level 3
+# + thin LTO. `strip = false` preserves the `target_features` custom section:
+# wasm-bindgen needs it to detect the Wasm features rustc enabled, and stripping
+# it makes wasm-bindgen fall back to MVP assumptions. build-ui.mjs runs wasm-opt
+# on the wasm-bindgen output instead, which shrinks far more than strip did.
+[profile.release-wasm]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = false
+
 [patch.crates-io]
 gpui-pre-wgpu = { path = "vendor/gpui-pre-wgpu" }

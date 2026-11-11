@@ -6,7 +6,14 @@ cd "$ROOT"
 export PATH="$(dirname "$(rustup which rustc)"):$PATH"
 
 npm run ui:build
-cargo build -p dsh-gpui
+# blaze is an opt-in accelerator for the native Host only (never for the WASM
+# frontend or release builds). The wrapper probes compatibility once and falls
+# back to cargo for good when blaze cannot build this workspace yet.
+if [[ "${KWORK_USE_BLAZE:-0}" == "1" ]]; then
+    node scripts/blaze-build.mjs
+else
+    cargo build -p dsh-gpui
+fi
 
 APP="$ROOT/.tools/dev-app/KWork.app"
 CONTENTS="$APP/Contents"
