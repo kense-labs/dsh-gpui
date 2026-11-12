@@ -1313,6 +1313,10 @@ pub(crate) fn resolve_node() -> std::ffi::OsString {
         PathBuf::from("/usr/local/bin/node"),
         home.join(".dsh/dsh-runtimes/dsh-primary-runtime/dependencies/node/bin/node"),
     ]);
+    #[cfg(windows)]
+    {
+        candidates.extend(windows_node_candidates());
+    }
     for candidate in candidates {
         if candidate.is_file() {
             return candidate.into_os_string();
@@ -1322,15 +1326,55 @@ pub(crate) fn resolve_node() -> std::ffi::OsString {
     "node".into()
 }
 
+/// Common Windows Node install locations. Also compiled on macOS so the
+/// path handling here is always type-checked.
+#[allow(dead_code)]
+fn windows_node_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    for key in [
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "LOCALAPPDATA",
+        "APPDATA",
+    ] {
+        if let Some(base) = std::env::var_os(key) {
+            let base = PathBuf::from(base);
+            candidates.push(base.join("nodejs").join("node.exe"));
+            candidates.push(base.join("Programs").join("nodejs").join("node.exe"));
+        }
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA")
+        && let Ok(entries) = std::fs::read_dir(PathBuf::from(local).join("fnm_multishells"))
+    {
+        for entry in entries.flatten() {
+            candidates.push(entry.path().join("node.exe"));
+        }
+    }
+    if let Some(appdata) = std::env::var_os("APPDATA")
+        && let Ok(entries) = std::fs::read_dir(PathBuf::from(appdata).join("nvm"))
+    {
+        for entry in entries.flatten() {
+            candidates.push(entry.path().join("node.exe"));
+        }
+    }
+    candidates
+}
+
 fn which_exists(path: &Path) -> bool {
     if path.components().count() == 1 {
         let Some(path_env) = std::env::var_os("PATH") else {
             return false;
         };
         for dir in std::env::split_paths(&path_env) {
-            let candidate = dir.join(path);
-            if candidate.is_file() {
+            if dir.join(path).is_file() {
                 return true;
+            }
+            if cfg!(windows) && path.extension().is_none() {
+                let mut exe = path.to_path_buf();
+                exe.set_extension("exe");
+                if dir.join(exe).is_file() {
+                    return true;
+                }
             }
         }
         false

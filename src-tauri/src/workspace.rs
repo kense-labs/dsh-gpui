@@ -41,11 +41,47 @@ pub async fn pick_workspace_directory(webview: tauri::Webview) -> Result<Option<
     {
         directory_picker::choose_directory(webview).await
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        let _ = webview;
+        windows_pick_folder().await
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = webview;
         Err("当前平台暂不支持原生目录选择器，请在「通用设置」中填写工作区绝对路径。".to_owned())
     }
+}
+
+/// Windows folder picker. Kept outside `#[cfg(windows)]` so the host build on
+/// macOS also type-checks this standard-library-only implementation.
+#[allow(dead_code)]
+async fn windows_pick_folder() -> Result<Option<String>, String> {
+    // Windows has no AppKit sheet. Use the system folder dialog through
+    // PowerShell: no extra native dependency, and it stays on the GUI
+    // session so the user can actually see it.
+    const SCRIPT: &str = "Add-Type -AssemblyName System.Windows.Forms; \
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog; \
+$dialog.Description = '选择工作区目录'; \
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { \
+[Console]::Out.Write($dialog.SelectedPath) }";
+    let output = tokio::task::spawn_blocking(|| {
+        std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-STA",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                SCRIPT,
+            ])
+            .output()
+    })
+    .await
+    .map_err(|error| format!("无法打开系统目录选择器：{error}"))?
+    .map_err(|error| format!("无法打开系统目录选择器：{error}"))?;
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    Ok((!path.is_empty()).then_some(path))
 }
 
 #[cfg(target_os = "macos")]
@@ -170,7 +206,31 @@ fn open_url(raw: &str) -> Result<String, String> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+fn open_url(raw: &str) -> Result<String, String> {
+    let url = normalize_url(raw)?;
+    windows_open_url(&url)?;
+    Ok(url)
+}
+
+/// Windows `start` implementation; compiled on every host for type checking.
+#[allow(dead_code)]
+fn windows_open_url(url: &str) -> Result<(), String> {
+    // `start` is a cmd builtin; the empty title keeps quoted URLs intact.
+    let target = url.replace('"', "");
+    let status = std::process::Command::new("cmd")
+        .arg("/C")
+        .arg(format!("start \"\" \"{target}\""))
+        .status()
+        .map_err(|error| format!("无法打开链接：{error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("打开链接失败：{status}"))
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 fn open_url(raw: &str) -> Result<String, String> {
     let url = normalize_url(raw)?;
     let status = std::process::Command::new("xdg-open")
@@ -210,7 +270,60 @@ fn open_tool(workspace: &str, tool: &str) -> Result<(), String> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+fn open_tool(workspace: &str, tool: &str) -> Result<(), String> {
+    let root = canonical_root(Path::new(workspace))?;
+    windows_open_tool(&root, tool)
+}
+
+/// Windows workspace actions; compiled on every host for type checking.
+#[allow(dead_code)]
+fn windows_open_tool(root: &Path, tool: &str) -> Result<(), String> {
+    match tool {
+        // explorer.exe often reports a non-zero exit code even on success, so
+        // only a failed spawn is an error here.
+        "files" => {
+            std::process::Command::new("explorer.exe")
+                .arg(root)
+                .spawn()
+                .map_err(|error| format!("无法打开工作区工具：{error}"))?;
+            Ok(())
+        }
+        "terminal" => {
+            let status = std::process::Command::new("cmd")
+                .args([
+                    "/C",
+                    "start",
+                    "",
+                    "powershell",
+                    "-NoExit",
+                    "-WorkingDirectory",
+                ])
+                .arg(root)
+                .status()
+                .map_err(|error| format!("无法打开工作区工具：{error}"))?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(format!("工作区工具打开失败：{status}"))
+            }
+        }
+        "browser" => {
+            let status = std::process::Command::new("cmd")
+                .args(["/C", "start", "", "https://www.deepseek.com/"])
+                .status()
+                .map_err(|error| format!("无法打开工作区工具：{error}"))?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(format!("工作区工具打开失败：{status}"))
+            }
+        }
+        _ => Err("未知的工作区工具".to_string()),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 fn open_tool(_workspace: &str, _tool: &str) -> Result<(), String> {
     Err("当前桌面平台暂不支持此工作区工具".to_string())
 }

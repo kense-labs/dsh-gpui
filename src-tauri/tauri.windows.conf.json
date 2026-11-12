@@ -1,0 +1,18 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "windows": [
+      {
+        "title": "KWork",
+        "width": 1200,
+        "height": 800,
+        "center": true,
+        "resizable": true,
+        "maximizable": true
+      }
+    ]
+  },
+  "bundle": {
+    "targets": ["nsis"]
+  }
+}

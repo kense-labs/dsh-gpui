@@ -613,14 +613,19 @@ fn browser_history_availability(view: &PlatformWebview) -> (bool, bool) {
         return (view.can_go_back(), view.can_go_forward());
     }
     #[cfg(windows)]
-    unsafe {
-        if let Ok(view) = view.controller().CoreWebView2() {
+    {
+        // SAFETY: `view` is a live Tauri-owned WebView2 widget; the COM
+        // pointer is only read inside this block.
+        let core = unsafe { view.controller().CoreWebView2() };
+        if let Ok(view) = core {
             let mut back = Default::default();
             let mut forward = Default::default();
-            return (
-                view.CanGoBack(&mut back).is_ok() && back.as_bool(),
-                view.CanGoForward(&mut forward).is_ok() && forward.as_bool(),
-            );
+            // SAFETY: both BOOL receivers live in this stack frame and stay
+            // valid for the duration of each call.
+            let can_back = unsafe { view.CanGoBack(&mut back) }.is_ok() && back.as_bool();
+            let can_forward =
+                unsafe { view.CanGoForward(&mut forward) }.is_ok() && forward.as_bool();
+            return (can_back, can_forward);
         }
     }
     #[allow(unreachable_code)]
@@ -661,12 +666,18 @@ fn move_browser_history(view: &PlatformWebview, forward: bool) {
         }
     }
     #[cfg(windows)]
-    unsafe {
-        if let Ok(view) = view.controller().CoreWebView2() {
+    {
+        // SAFETY: `view` is a live Tauri-owned WebView2 widget; the COM
+        // pointer is only read inside this block.
+        let core = unsafe { view.controller().CoreWebView2() };
+        if let Ok(view) = core {
             if forward {
-                let _ = view.GoForward();
+                // SAFETY: navigation enqueues a load on the live webview; its
+                // result is deliberately discarded.
+                let _ = unsafe { view.GoForward() };
             } else {
-                let _ = view.GoBack();
+                // SAFETY: as above, for the backward navigation.
+                let _ = unsafe { view.GoBack() };
             }
         }
     }

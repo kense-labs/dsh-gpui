@@ -68,6 +68,22 @@ bun test scripts/*.test.mjs
 | `services/` | 凭据桥、ACP 桥和内置 Harness 服务 |
 | `scripts/` | 构建工具和 JavaScript 测试 |
 
+## Windows
+
+Rust 宿主已包含 Windows 分支：ConPTY 终端、`pwsh` / `powershell` / `cmd` shell 探测、`cmd /c start` 打开链接、`explorer.exe`、Windows 系统字体、Node 可执行文件探测（`node.exe`、fnm、nvm、Program Files），以及通过 PowerShell 调用的系统目录选择器。`src-tauri/tauri.windows.conf.json` 覆盖窗口尺寸并指定 NSIS 打包目标，Tauri 在 Windows 上会自动把它与 `tauri.conf.json` 合并。
+
+在 Windows 机器上：
+
+```sh
+bun install --no-save
+bun run ui:build
+bun x tauri build --bundles nsis
+```
+
+`just dev` 和 `scripts/dev-app.sh` 仅适用于 macOS；开发调试请用 `bun run dev`。运行时仍需要配套的 `dsh-acp` 检出，可在「设置」或环境变量中指定 `DSH_ACP_PATH` 与 `DSH_NODE`（例如 `C:\Program Files\nodejs\node.exe`）。
+
+`.github/workflows/windows.yml` 会在 `windows-latest` 上构建 NSIS 安装包和便携版 `target/release/KWork.exe`，并作为 `KWork-Windows-x64` 产物上传。
+
 ### 内嵌的 Node 模块
 
 `services/acp-session-bridge.mjs` 与 `services/credential-service.mjs` 通过 `include_str!` 编进主进程二进制，并不作为散落文件分发，也不再通过 `node --eval` 注入（约 90 KB 命令行参数，叠加环境变量后已接近 macOS 的 `ARG_MAX` 上限）。`src-tauri/src/embedded_script.rs` 会在启动子进程前把它们写成私有的 `.mjs` 临时文件：堆栈信息指向真实路径，连接释放时文件随之删除。574 KB 的调度运行时（`services/vendor/dsh-schedule/index.mjs`）则按内容 SHA-256 寻址缓存在用户临时目录，只写一次，供所有 ACP 连接和每次启动复用。两个脚本仍从 `process.argv.slice(2)` 读取参数，只是原本占着 `argv[1]` 的 `[eval]` 标签换成了脚本路径。

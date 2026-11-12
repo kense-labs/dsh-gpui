@@ -5,7 +5,7 @@ import {
   rmSync, statSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, relative } from 'node:path';
+import { delimiter, dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -50,7 +50,9 @@ function buildEnv() {
   const rustc = execFileSync('rustup', ['which', 'rustc'], { encoding: 'utf8' }).trim();
   cachedEnv = {
     ...process.env,
-    PATH: `${dirname(rustc)}:${process.env.PATH || ''}`,
+    // Windows uses ';' between PATH entries; ':' would glue the rustc dir
+    // and the inherited PATH into one invalid entry.
+    PATH: `${dirname(rustc)}${delimiter}${process.env.PATH || ''}`,
     // Keep wasm artifacts in-repo so wasm-bindgen never packs a stale sandbox target dir.
     CARGO_TARGET_DIR: process.env.CARGO_TARGET_DIR || join(root, 'target'),
   };

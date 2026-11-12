@@ -68,6 +68,22 @@ bun test scripts/*.test.mjs
 | `services/` | Credential and ACP bridges, plus bundled Harness services |
 | `scripts/` | Build tools and JavaScript tests |
 
+## Windows
+
+The Rust host has Windows branches for ConPTY terminals, `pwsh` / `powershell` / `cmd` shell discovery, `cmd /c start` links, `explorer.exe`, Windows system fonts, Node detection (`node.exe`, fnm, nvm, Program Files) and a native folder picker through PowerShell. `src-tauri/tauri.windows.conf.json` overrides the window size and selects the NSIS bundle target; Tauri merges it with `tauri.conf.json` on Windows.
+
+On a Windows machine:
+
+```sh
+bun install --no-save
+bun run ui:build
+bun x tauri build --bundles nsis
+```
+
+`just dev` and `scripts/dev-app.sh` are macOS-only; use `bun run dev` for the development client. The app still needs a companion `dsh-acp` checkout at runtime — set `DSH_ACP_PATH` and `DSH_NODE` (for example `C:\Program Files\nodejs\node.exe`) in Settings or the environment.
+
+`.github/workflows/windows.yml` builds the NSIS installer and the portable `target/release/KWork.exe` on a `windows-latest` runner and uploads both as the `KWork-Windows-x64` artifact.
+
 ### Embedded Node modules
 
 `services/acp-session-bridge.mjs` and `services/credential-service.mjs` are compiled into the host binary with `include_str!`. They are **not** shipped as loose files and are no longer passed through `node --eval` (~90 KB of command line, close to the macOS `ARG_MAX` budget). `src-tauri/src/embedded_script.rs` materialises each as a private `.mjs` temp file before spawn, so stack traces point at a real path and the file is deleted when the connection is dropped. The 574 KB scheduler bundle (`services/vendor/dsh-schedule/index.mjs`) is instead content-addressed by SHA-256 in the per-user temp directory: it is written once and reused by every ACP connection and every app launch. Both scripts still read their arguments from `process.argv.slice(2)`; the script path simply replaces the former `[eval]` label at `argv[1]`.

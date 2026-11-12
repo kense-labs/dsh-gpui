@@ -396,7 +396,11 @@ fn welcome_button(
         .border_color(border)
         .bg(fill)
         .text_color(ink)
-        .font_family(".SystemUIFont")
+        .font_family(if crate::bridge::is_windows() {
+            "Segoe UI"
+        } else {
+            ".SystemUIFont"
+        })
         .when_some(
             crate::web::document_fonts::interface_family(cx),
             |button, family| button.font_family(family),

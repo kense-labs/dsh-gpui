@@ -1208,7 +1208,11 @@ impl DshApp {
                     .flex_none()
                     .text_size(px(11.))
                     .line_height(px(16.))
-                    .font_family(".SystemUIFont")
+                    .font_family(if bridge::is_windows() {
+                        "Segoe UI"
+                    } else {
+                        ".SystemUIFont"
+                    })
                     .text_color(p.faint)
                     .child(shortcut)
             }))

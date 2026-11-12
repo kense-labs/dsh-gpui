@@ -137,14 +137,25 @@ impl TerminalState {
 
 #[tauri::command]
 pub async fn terminal_font() -> Result<tauri::ipc::Response, String> {
-    #[cfg(target_os = "macos")]
-    {
+    if cfg!(target_os = "macos") {
         std::fs::read("/System/Library/Fonts/Menlo.ttc")
             .map(tauri::ipc::Response::new)
             .map_err(|error| error.to_string())
+    } else if cfg!(windows) {
+        // Ship the platform monospace face when available; otherwise the
+        // frontend falls back to its bundled font without an error toast.
+        for path in [
+            r"C:\Windows\Fonts\consola.ttf",
+            r"C:\Windows\Fonts\cascadiamono.ttf",
+        ] {
+            if let Ok(bytes) = std::fs::read(path) {
+                return Ok(tauri::ipc::Response::new(bytes));
+            }
+        }
+        Ok(tauri::ipc::Response::new(Vec::<u8>::new()))
+    } else {
+        Ok(tauri::ipc::Response::new(Vec::<u8>::new()))
     }
-    #[cfg(not(target_os = "macos"))]
-    Err("Menlo is unavailable on this platform".into())
 }
 
 #[tauri::command]

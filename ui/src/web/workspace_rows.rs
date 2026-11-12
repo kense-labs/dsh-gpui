@@ -511,8 +511,12 @@ impl DshApp {
             ))
             .child(workspace_menu_row(
                 "reveal",
-                if cfg!(target_os = "macos") {
+                // The frontend is compiled to wasm32, so compile-time target
+                // checks are always false here — use the runtime host platform.
+                if bridge::is_mac() {
                     "在 Finder 中显示"
+                } else if bridge::is_windows() {
+                    "在资源管理器中显示"
                 } else {
                     "在文件夹中显示"
                 },

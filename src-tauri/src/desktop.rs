@@ -119,12 +119,15 @@ pub(crate) async fn document_system_font(
     if webview.label() != "main" {
         return Err("System fonts are available to the main interface".into());
     }
-    #[cfg(target_os = "macos")]
-    return std::fs::read("/System/Library/Fonts/SFNS.ttf")
-        .map(tauri::ipc::Response::new)
-        .map_err(|error| error.to_string());
-    #[cfg(not(target_os = "macos"))]
-    Err("The macOS system font is unavailable on this platform".into())
+    if cfg!(target_os = "macos") {
+        std::fs::read("/System/Library/Fonts/SFNS.ttf")
+            .map(tauri::ipc::Response::new)
+            .map_err(|error| error.to_string())
+    } else {
+        // An empty body lets the frontend fall back to its bundled Noto Sans
+        // instead of surfacing a "macOS font unavailable" error on Windows/Linux.
+        Ok(tauri::ipc::Response::new(Vec::<u8>::new()))
+    }
 }
 
 #[tauri::command]
@@ -140,7 +143,7 @@ pub(crate) async fn chinese_system_font(
         .map_err(|error| error.to_string())?
         .map(tauri::ipc::Response::new);
     #[cfg(not(target_os = "macos"))]
-    Err("The macOS system font is unavailable on this platform".into())
+    Ok(tauri::ipc::Response::new(Vec::<u8>::new()))
 }
 
 #[tauri::command]
@@ -156,5 +159,7 @@ pub(crate) async fn show_document_copy_menu(
     #[cfg(target_os = "macos")]
     return document_selection::show(webview, text, x, y);
     #[cfg(not(target_os = "macos"))]
-    Err("当前平台暂不支持原生预览复制菜单".into())
+    // The GPUI document view already offers copy; don't surface an error for
+    // the optional native context menu on Windows/Linux.
+    Ok(())
 }
