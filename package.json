@@ -4,9 +4,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "ui:build": "node scripts/build-ui.mjs",
-    "dev": "npm run ui:build && tauri dev",
-    "build": "npm run ui:build && tauri build --no-bundle",
+    "ui:build": "bun scripts/build-ui.mjs",
+    "dev": "bun run ui:build && tauri dev",
+    "build": "bun run ui:build && tauri build --no-bundle",
+    "test:js": "bun test scripts/*.test.mjs",
     "check": "cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace"
   },
   "dependencies": {

@@ -81,7 +81,7 @@ function listInputFiles() {
   for (const dir of ['ui', 'shared', 'vendor']) walk(dir);
   for (const rel of [
     'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml',
-    'package.json', 'package-lock.json',
+    'package.json', 'package-lock.json', 'bun.lock', 'bun.lockb',
     'src-tauri/Cargo.toml', 'src-tauri/icons/32x32.png',
     'scripts/build-ui.mjs', 'node_modules/.package-lock.json',
     'node_modules/@xterm/headless/lib-headless/xterm-headless.mjs',
@@ -161,9 +161,16 @@ function ensureWasmOpt(tools) {
     ? [`wasm-opt@${WASM_OPT_VERSION}`, `${native}@${WASM_OPT_VERSION}`]
     : [`binaryen@${BINARYEN_VERSION}`];
   console.log(`Installing wasm-opt (${native ? 'native' : 'portable'}) into ${prefix} ...`);
-  run('npm', [
-    'install', '--prefix', prefix, '--no-save', '--no-package-lock',
-    '--no-audit', '--no-fund', ...packages,
+  // Bun is the only package manager in the build chain. `bun install --cwd`
+  // replaces npm's `--prefix`; `--no-save` keeps the scratch manifest and the
+  // repository lockfiles untouched.
+  mkdirSync(prefix, { recursive: true });
+  const manifest = join(prefix, 'package.json');
+  if (!existsSync(manifest)) {
+    writeFileSync(manifest, '{"name":"kwork-wasm-opt-tools","private":true}\n');
+  }
+  run(process.env.KWORK_BUN || 'bun', [
+    'install', `--cwd=${prefix}`, '--no-save', ...packages,
   ]);
   if (!existsSync(bin)) throw new Error('wasm-opt 安装失败：找不到可执行文件。');
   return bin;
@@ -230,7 +237,7 @@ function syncOutputs(dist, outputs) {
 }
 
 if (FAST) {
-  console.log('ui:build: FAST dev frontend (dev-wasm, no wasm-opt) — unoptimized output, run `npm run ui:build` before packaging.');
+  console.log('ui:build: FAST dev frontend (dev-wasm, no wasm-opt) — unoptimized output, run `bun run ui:build` before packaging.');
 }
 const inputFiles = listInputFiles();
 const stamp = readStamp();

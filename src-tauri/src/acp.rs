@@ -1,9 +1,9 @@
 //! ACP stdio transport and Tauri commands for DeepSeek Harness.
 
+use crate::embedded_script::{cached_module, write_module};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -31,7 +31,8 @@ struct AcpConnection {
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
     stopping: AtomicBool,
     session_bridge: bool,
-    _schedule_runtime: Option<tempfile::NamedTempFile>,
+    // Kept alive for as long as the child may still be reading the module.
+    _session_bridge_script: Option<tempfile::NamedTempFile>,
 }
 
 impl AcpConnection {
@@ -57,15 +58,18 @@ impl AcpConnection {
             ));
         };
         let session_bridge = profile.is_file();
-        let mut schedule_runtime = None;
+        let mut bridge_script = None;
         if session_bridge {
             let ask_tool =
                 serde_json::to_string(ASK_USER_TOOL).map_err(|error| error.to_string())?;
             let bridge = format!("const bundledAskUser = {ask_tool};\n{SESSION_BRIDGE}");
+            let script = write_module("acp-session-bridge", bridge.as_bytes())?;
+            // With `--eval` the label "dsh-gpui-acp" occupied argv[1] and the
+            // bridge read service/profile from process.argv.slice(2). A real
+            // .mjs file takes that slot instead, so the same slice still yields
+            // [service, profile, ...patchFiles] without any bridge changes.
             command
-                .args(["--input-type=module", "--eval"])
-                .arg(bridge)
-                .args(["--", "dsh-gpui-acp"])
+                .arg(script.path())
                 .arg(service_path)
                 .arg(profile)
                 .env("KWORK_WORKSPACE", workspace)
@@ -73,21 +77,19 @@ impl AcpConnection {
                     "KWORK_WORKSPACE_PREFERENCES",
                     crate::preferences::preferences_path(&app)?,
                 );
-            // The scheduler bundle is larger than macOS's process argument limit.
-            // Retain the private file until the child connection is released.
-            match tempfile::NamedTempFile::new().and_then(|mut file| {
-                file.write_all(SCHEDULE_RUNTIME)?;
-                Ok(file)
-            }) {
-                Ok(file) => {
-                    command.env("KWORK_SCHEDULE_MODULE", file.path());
-                    schedule_runtime = Some(file);
+            // The 574 KB scheduler bundle is immutable: content-address it once
+            // instead of rewriting a private copy for every ACP connection.
+            match cached_module("dsh-schedule", SCHEDULE_RUNTIME) {
+                Ok(path) => {
+                    command.env("KWORK_SCHEDULE_MODULE", path);
                 }
                 Err(error) => {
+                    // The scheduler is optional; the ACP conversation still works.
                     command.env_remove("KWORK_SCHEDULE_MODULE");
                     eprintln!("dsh-gpui schedule runtime: {error}");
                 }
             }
+            bridge_script = Some(script);
         } else {
             command.arg(entry).args(["--profile", "acp"]);
         }
@@ -111,7 +113,7 @@ impl AcpConnection {
             pending: Mutex::new(HashMap::new()),
             stopping: AtomicBool::new(false),
             session_bridge,
-            _schedule_runtime: schedule_runtime,
+            _session_bridge_script: bridge_script,
         });
 
         tokio::spawn(read_stdout(connection.clone(), stdout, app.clone()));

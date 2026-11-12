@@ -22,7 +22,7 @@ debug = "limited"
 # stays reasonably small) but drops LTO, which is what makes every edit to the
 # release-wasm frontend pay for a full ~20s whole-program link. wasm-opt is also skipped in
 # this mode. The default `dev` and `release-wasm` profiles are untouched, so
-# `npm run build` still produces the size-optimized frontend.
+# `bun run build` still produces the size-optimized frontend.
 [profile.dev-wasm]
 inherits = "dev"
 opt-level = "z"

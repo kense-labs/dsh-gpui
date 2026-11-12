@@ -4,6 +4,7 @@ mod acp;
 mod auth;
 mod browser;
 mod desktop;
+mod embedded_script;
 mod history;
 mod preferences;
 #[allow(dead_code)]
