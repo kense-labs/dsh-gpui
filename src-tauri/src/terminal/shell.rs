@@ -105,9 +105,16 @@ fn resolve_executable(command: &str, path: &[PathBuf], cwd: &Path) -> Option<Pat
 #[cfg(unix)]
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
-    path.is_file()
-        && std::ffi::CString::new(path.as_os_str().as_bytes())
-            .is_ok_and(|path| unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 })
+    if !path.is_file() {
+        return false;
+    }
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `path` is a NUL-terminated C string that outlives the call, which is
+    // all `access` requires; the mode is a plain flag. It only reports whether the
+    // current process may execute the file and has no other precondition.
+    unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 }
 }
 
 #[cfg(not(unix))]
@@ -138,10 +145,18 @@ fn login_shell() -> Option<String> {
     loop {
         let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
         let mut result = std::ptr::null_mut();
-        // passwd strings refer into storage and are copied before it is dropped.
+        // SAFETY: `getuid` takes no arguments, cannot fail, and reads no memory
+        // through a pointer; it simply returns the real user ID of this process.
+        let uid = unsafe { libc::getuid() };
+        // SAFETY: `entry` is a valid, suitably aligned, writable `passwd`, and
+        // `storage` is a live buffer of the length passed alongside it, which is
+        // the contract `getpwuid_r` expects for its result and scratch space. On
+        // success `result` points at `entry`; on ERANGE nothing is assumed and the
+        // buffer is retried larger. No aliasing: both buffers are local and no
+        // reference to them exists while the call runs.
         let status = unsafe {
             libc::getpwuid_r(
-                libc::getuid(),
+                uid,
                 entry.as_mut_ptr(),
                 storage.as_mut_ptr(),
                 storage.len(),
@@ -151,10 +166,17 @@ fn login_shell() -> Option<String> {
         match status {
             libc::ERANGE if storage.len() < 64 * 1024 => storage.resize(storage.len() * 2, 0),
             0 if !result.is_null() => {
-                let shell = unsafe { entry.assume_init().pw_shell };
+                // SAFETY: the call returned 0 and reported a non-null result, so
+                // `getpwuid_r` initialized `entry`; `assume_init` is therefore
+                // sound. `storage` is still alive, so any pointer it holds remains
+                // valid, and the field is only read as a pointer below.
+                let shell = unsafe { entry.assume_init() }.pw_shell;
                 if shell.is_null() {
                     return None;
                 }
+                // SAFETY: `pw_shell` is either null (handled above) or a
+                // NUL-terminated string owned by the still-live `storage`; the
+                // borrow ends before `storage` is dropped or resized.
                 return unsafe { std::ffi::CStr::from_ptr(shell) }
                     .to_str()
                     .ok()

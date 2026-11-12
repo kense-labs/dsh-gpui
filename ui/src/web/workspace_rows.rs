@@ -195,7 +195,7 @@ impl DshApp {
     }
 
     pub(super) fn render_workspace_group(
-        &self,
+        &mut self,
         cwd: String,
         sessions: Vec<SessionSummary>,
         w: &Window,
@@ -208,7 +208,8 @@ impl DshApp {
             .workspace_context_menu
             .as_ref()
             .is_some_and(|(path, _)| path == &cwd);
-        let revealed = hovered || menu_open;
+        // 官方：工作区操作只在展开时显示；无 hover 的设备上展开行常显。
+        let revealed = expanded && (hovered || menu_open || !bridge::has_pointer_hover());
         let active = self
             .sessions
             .iter()
@@ -254,6 +255,8 @@ impl DshApp {
                     this.workspace_context_menu = None;
                     if !this.collapsed_workspaces.remove(&for_toggle) {
                         this.collapsed_workspaces.insert(for_toggle.clone());
+                        // 官方：折叠 Workspace 会重置它的水位线。
+                        this.workspace_watermarks.remove(&for_toggle);
                     }
                     this.save_workspace_preferences(cx);
                     cx.notify();
@@ -383,8 +386,77 @@ impl DshApp {
                 }),
         );
         if expanded {
-            for session in sessions {
-                group = group.child(self.render_session_row(session, w, cx));
+            // 官方水位线：初始 5 行；前 50 条里最后一条正在运行、等待用户、
+            // 未读或在主视图打开的会话把水位线抬到它，之后不自行回落。
+            const WATERMARK_BASE: usize = 5;
+            let total = sessions.len();
+            let active = self.active_session.clone();
+            let mut limit = self
+                .workspace_watermarks
+                .get(&cwd)
+                .copied()
+                .unwrap_or(WATERMARK_BASE)
+                .max(WATERMARK_BASE);
+            for (index, session) in sessions.iter().take(50).enumerate() {
+                let notable = self.session_indicator(&session.id).0
+                    != crate::sessions::SessionIndicator::Idle
+                    || active.as_deref() == Some(session.id.as_str());
+                if notable {
+                    limit = limit.max(index + 1);
+                }
+            }
+            self.workspace_watermarks.insert(cwd.clone(), limit);
+            // 当前选中的空白「新会话」是水位线之外的额外行。
+            let extra_blank = active.as_deref().and_then(|id| {
+                sessions
+                    .iter()
+                    .enumerate()
+                    .find(|(index, session)| session.id == id && session.blank && *index >= limit)
+                    .map(|(index, _)| index)
+            });
+            for (index, session) in sessions.into_iter().enumerate() {
+                if index < limit || Some(index) == extra_blank {
+                    group = group.child(self.render_session_row(session, w, cx));
+                }
+            }
+            let remaining = total.saturating_sub(limit);
+            if remaining > 0 || limit > WATERMARK_BASE {
+                // 剩余五条或更少时一次显示全部；最后一批之后提供「收起」。
+                let expand = remaining > 0;
+                let target = if remaining <= 5 { total } else { limit + 5 };
+                let for_watermark = cwd.clone();
+                group = group.child(
+                    div()
+                        .id(gpui::ElementId::Name(
+                            format!("workspace-watermark-{cwd}").into(),
+                        ))
+                        .role(gpui::Role::Button)
+                        .tab_index(0)
+                        .w_full()
+                        .h(px(28.))
+                        .pl(px(32.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .text_size(px(12.))
+                        .text_color(p.label_tertiary)
+                        .hover(|style| style.text_color(p.label_primary))
+                        .child(if expand {
+                            format!("展开其余（{remaining}）")
+                        } else {
+                            "收起".to_owned()
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if expand {
+                                this.workspace_watermarks
+                                    .insert(for_watermark.clone(), target);
+                            } else {
+                                this.workspace_watermarks.remove(&for_watermark);
+                            }
+                            cx.notify();
+                        })),
+                );
             }
         }
         group
@@ -459,7 +531,7 @@ impl DshApp {
             .child(div().h(px(0.5)).mx(px(8.)).my(px(3.)).bg(p.line))
             .child(workspace_menu_row(
                 "delete",
-                "删除工作区",
+                "移除工作区",
                 include_bytes!("../../assets/workspace-trash.svg"),
                 true,
                 cx,
@@ -633,7 +705,7 @@ impl DshApp {
         } else if rename {
             "重命名工作区"
         } else {
-            "删除工作区"
+            "移除工作区"
         };
         let path = self
             .workspace_rename
@@ -807,7 +879,7 @@ impl DshApp {
                             .child(
                                 super::permission_dialog::dialog_action(
                                     "workspace-dialog-confirm",
-                                    if rename { "重命名" } else { "删除工作区" },
+                                    if rename { "重命名" } else { "移除" },
                                     rename,
                                     rename && blocked,
                                     0.,
@@ -821,6 +893,10 @@ impl DshApp {
                                             this.hidden_workspaces.insert(path.clone());
                                             this.workspace_delete = None;
                                             this.save_workspace_preferences(cx);
+                                            this.push_toast(
+                                                "已从侧栏移除工作区分组；可在「设置 → 通用」中恢复。",
+                                                cx,
+                                            );
                                         }
                                         cx.notify();
                                     },

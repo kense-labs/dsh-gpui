@@ -422,6 +422,67 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                     at_ms,
                 });
             }
+            // Slash-command results are log-only events; replay rebuilds the
+            // command card so a reopened session keeps showing it.
+            "command/run" | "command/done" => {
+                let run = kind == "command/run";
+                let Some(id) = data.get("commandId").and_then(Value::as_str) else {
+                    continue;
+                };
+                let name = data
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if let Some(entry) = out.entries.iter_mut().find(|entry| {
+                    entry.role == EntryRole::Command && entry.external_id.as_deref() == Some(id)
+                }) {
+                    if run {
+                        if !name.is_empty() {
+                            entry.title = name;
+                        }
+                        if let Some(args) = data.get("args").and_then(Value::as_str) {
+                            entry.input = args.to_owned();
+                        }
+                    } else {
+                        entry.status = data
+                            .get("kind")
+                            .and_then(Value::as_str)
+                            .unwrap_or("success")
+                            .to_owned();
+                        if let Some(text) = data.get("text").and_then(Value::as_str) {
+                            entry.text = text.to_owned();
+                        }
+                    }
+                } else if run || !name.is_empty() {
+                    out.entries.push(ChatEntry {
+                        key: format!("hist-command-{id}"),
+                        external_id: Some(id.to_owned()),
+                        role: EntryRole::Command,
+                        title: name,
+                        text: data
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned(),
+                        input: data
+                            .get("args")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned(),
+                        status: if run {
+                            String::new()
+                        } else {
+                            data.get("kind")
+                                .and_then(Value::as_str)
+                                .unwrap_or("success")
+                                .to_owned()
+                        },
+                        tool: None,
+                        at_ms,
+                    });
+                }
+            }
             "turn/end" => {
                 let reason = data
                     .pointer("/reason/kind")
@@ -539,6 +600,41 @@ mod tests {
                 "Options — Where?\n回答：Local (Recommended), extra\n\nWhat else?\n已跳过"
             );
         }
+    }
+
+    #[test]
+    fn replays_command_cards_from_log_only_events() {
+        // Copied from a real `/goal create` session log so the projection stays
+        // pinned to the payload the Host actually writes.
+        let result = "Goal created\nStatus: active\nObjective: 帮我算出圆周率第100位\n\
+                      Rounds: 0/256\nActivation: armed\n\n\
+                      Commands: /goal edit <objective>, /goal pause, /goal clear";
+        let projection = project_session_events(&[
+            json!({
+                "type": "command/run", "seq": 3, "time": 1794454152068.0,
+                "data": {
+                    "commandId": "cmd-3192330d-1", "name": "goal",
+                    "args": " 帮我算出圆周率第100位", "source": {"kind": "user"}
+                }
+            }),
+            json!({
+                "type": "command/done", "seq": 5, "time": 1794454152070.0,
+                "data": {
+                    "commandId": "cmd-3192330d-1", "kind": "success",
+                    "text": result
+                }
+            }),
+        ]);
+        assert_eq!(projection.entries.len(), 1);
+        let entry = &projection.entries[0];
+        assert_eq!(entry.role, EntryRole::Command);
+        assert_eq!(entry.title, "goal");
+        assert_eq!(entry.input, " 帮我算出圆周率第100位");
+        assert_eq!(entry.status, "success");
+        assert_eq!(entry.text, result);
+        // The card collapses to the first line and expands because it is multiline.
+        assert_eq!(entry.text.lines().next(), Some("Goal created"));
+        assert!(entry.text.contains('\n'));
     }
 
     #[test]

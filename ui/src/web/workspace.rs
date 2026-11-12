@@ -410,32 +410,68 @@ impl DshApp {
             .sessions
             .iter()
             .filter(|session| {
-                !self.hidden_workspaces.contains(&session.cwd)
-                    && match self.workspace_archived_filter {
-                        WorkspaceArchivedFilter::Hide => {
-                            !self.archived_sessions.contains(&session.id)
-                        }
-                        WorkspaceArchivedFilter::Only => {
-                            self.archived_sessions.contains(&session.id)
-                        }
-                        WorkspaceArchivedFilter::Show => true,
-                    }
-                    && (query.is_empty()
-                        || self
-                            .session_display_title(session)
-                            .to_lowercase()
-                            .contains(&query)
-                        || session.cwd.to_lowercase().contains(&query)
-                        || self
-                            .workspace_name(&session.cwd)
-                            .to_lowercase()
-                            .contains(&query))
+                // 官方：移除 Workspace 分组后，它的 Session 仍留在 Ungrouped 下。
+                // 真实 cwd 保留在 SessionSummary 上供 ACP resume 使用，只在
+                // 分组时把隐藏路径映射到空 cwd。
+                (match self.workspace_archived_filter {
+                    WorkspaceArchivedFilter::Hide => !self.archived_sessions.contains(&session.id),
+                    WorkspaceArchivedFilter::Only => self.archived_sessions.contains(&session.id),
+                    WorkspaceArchivedFilter::Show => true,
+                }) && (query.is_empty()
+                    || self
+                        .session_display_title(session)
+                        .to_lowercase()
+                        .contains(&query)
+                    || session.cwd.to_lowercase().contains(&query)
+                    || self
+                        .workspace_name(&session.cwd)
+                        .to_lowercase()
+                        .contains(&query))
             })
             .cloned()
             .collect::<Vec<_>>();
-        // 官方排序：置顶会话稳定排在组内最前。
+        // 官方：非空白查询以单一扁平列表呈现，最多 20 条结果。
+        if !query.is_empty() {
+            filtered.truncate(20);
+        }
+        // 官方排序：置顶会话稳定排在组内最前；「最近更新」在置顶/普通分区内
+        // 严格按最近一次用户提示词或 steering 时间降序，置顶时间不影响它；
+        // 「手动排序」沿用服务端完整序列（sort_by 是稳定排序）。
         let pinned = &self.pinned_sessions;
-        filtered.sort_by_key(|session| !pinned.contains(&session.id));
+        let activity = &self.session_activity;
+        let order_by = self.workspace_order_by;
+        filtered.sort_by(|a, b| {
+            let a_pinned = pinned.contains(&a.id);
+            let b_pinned = pinned.contains(&b.id);
+            b_pinned.cmp(&a_pinned).then_with(|| {
+                if order_by == WorkspaceOrderBy::Updated {
+                    let at = |session: &crate::sessions::SessionSummary| {
+                        activity
+                            .get(&session.id)
+                            .and_then(|item| item.last_prompt_at_ms)
+                            .max(session.created_at_ms)
+                            .unwrap_or(0)
+                    };
+                    at(b).cmp(&at(a))
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+        });
+        // 官方：当前选中的空白「新会话」在首条提示词落地前保留临时首位。
+        let pinned_count = filtered
+            .iter()
+            .take_while(|session| pinned.contains(&session.id))
+            .count();
+        if let Some(active) = self.active_session.as_deref()
+            && let Some(index) = filtered
+                .iter()
+                .position(|session| session.id == active && session.blank)
+            && index > pinned_count
+        {
+            let session = filtered.remove(index);
+            filtered.insert(pinned_count, session);
+        }
         let filtered_count = filtered.len();
         for session in &filtered {
             self.session_row_focus
@@ -447,12 +483,18 @@ impl DshApp {
                     .or_insert_with(|| cx.focus_handle().tab_stop(true));
             }
         }
-        let mut session_groups = column().w_full().gap(px(match self.workspace_group_by {
+        // 官方：非空白查询用单一扁平结果列表替代任一浏览模式。
+        let grouping = if query.is_empty() {
+            self.workspace_group_by
+        } else {
+            WorkspaceGroupBy::Flat
+        };
+        let mut session_groups = column().w_full().gap(px(match grouping {
             WorkspaceGroupBy::Workspace | WorkspaceGroupBy::WorkspaceTree => 4.,
             WorkspaceGroupBy::Flat => 2.,
         }));
         let mut empty = filtered.is_empty();
-        match self.workspace_group_by {
+        match grouping {
             WorkspaceGroupBy::Flat => {
                 for session in filtered {
                     session_groups = session_groups.child(self.render_session_row(session, w, cx));
@@ -461,12 +503,18 @@ impl DshApp {
             WorkspaceGroupBy::Workspace | WorkspaceGroupBy::WorkspaceTree => {
                 let mut groups: Vec<(String, Vec<SessionSummary>)> = Vec::new();
                 for session in filtered {
+                    // 已移除的 Workspace 分组：Session 归入 Ungrouped。
+                    let group_cwd = if self.hidden_workspaces.contains(&session.cwd) {
+                        String::new()
+                    } else {
+                        session.cwd.clone()
+                    };
                     if let Some((_, sessions)) =
-                        groups.iter_mut().find(|(cwd, _)| cwd == &session.cwd)
+                        groups.iter_mut().find(|(cwd, _)| cwd == &group_cwd)
                     {
                         sessions.push(session);
                     } else {
-                        groups.push((session.cwd.clone(), vec![session]));
+                        groups.push((group_cwd, vec![session]));
                     }
                 }
                 if self.workspace_archived_filter != WorkspaceArchivedFilter::Only {
@@ -1393,52 +1441,58 @@ impl DshApp {
                             );
                         }
                     }));
-                element.child(row().flex_none().gap(px(13.)).child(more).when(
-                    !archived && (pointer_hover || pinned),
-                    |actions| {
-                        actions.child(
-                            div()
-                                .id("session-row-pin")
-                                .group("session-row-pin")
-                                .role(gpui::Role::Button)
-                                .aria_label(if pinned {
-                                    "取消置顶"
-                                } else {
-                                    "置顶会话"
-                                })
-                                .tab_index(0)
-                                .size(px(24.))
-                                .mx(px(-4.))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(4.))
-                                .cursor_pointer()
-                                .text_color(p.label_tertiary)
-                                .hover(|style| style.text_color(p.label_primary))
-                                .child(
-                                    svg()
-                                        .size(px(14.))
-                                        .text_color(p.label_tertiary)
-                                        .group_hover("session-row-pin", |style| {
-                                            style.text_color(p.label_primary)
-                                        })
-                                        .data(if pinned {
-                                            include_bytes!("../../assets/session-pin-fill.svg")
+                // 官方：置顶/取消置顶按钮位于「更多」之前。
+                element.child(
+                    row()
+                        .flex_none()
+                        .gap(px(13.))
+                        .when(!archived && (pointer_hover || pinned), |actions| {
+                            actions.child(
+                                div()
+                                    .id("session-row-pin")
+                                    .group("session-row-pin")
+                                    .role(gpui::Role::Button)
+                                    .aria_label(if pinned {
+                                        "取消置顶"
+                                    } else {
+                                        "置顶会话"
+                                    })
+                                    .tab_index(0)
+                                    .size(px(24.))
+                                    .mx(px(-4.))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(4.))
+                                    .cursor_pointer()
+                                    .text_color(p.label_tertiary)
+                                    .hover(|style| style.text_color(p.label_primary))
+                                    .child(
+                                        svg()
+                                            .size(px(14.))
+                                            .text_color(p.label_tertiary)
+                                            .group_hover("session-row-pin", |style| {
+                                                style.text_color(p.label_primary)
+                                            })
+                                            .data(if pinned {
+                                                include_bytes!("../../assets/session-pin-fill.svg")
+                                                    .as_slice()
+                                            } else {
+                                                include_bytes!(
+                                                    "../../assets/session-pin-outline.svg"
+                                                )
                                                 .as_slice()
-                                        } else {
-                                            include_bytes!("../../assets/session-pin-outline.svg")
-                                                .as_slice()
-                                        }),
-                                )
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.toggle_session_pin(&for_pin, cx);
-                                })),
-                        )
-                    },
-                ))
+                                            }),
+                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.toggle_session_pin(&for_pin, cx);
+                                    })),
+                            )
+                        })
+                        .child(more),
+                )
             })
             .on_click(cx.listener(move |this, event: &gpui::ClickEvent, w, cx| {
                 if event.is_right_click() || mac_control_click(event.modifiers()) {
@@ -2227,6 +2281,9 @@ impl DshApp {
                             .child({
                                 // Official: TextShimmer while the process group is still open.
                                 if live {
+                                    // `LiveShimmer` keeps its sweep phase independent of the
+                                    // text, so the streaming detail can update every frame
+                                    // without restarting the highlight.
                                     self.process_shimmer.update(cx, |shimmer, cx| {
                                         shimmer.set_text(title.clone(), cx);
                                         shimmer.set_active(true, cx);
@@ -2348,6 +2405,14 @@ impl DshApp {
         );
         if !open_process {
             self.process_shimmer
+                .update(cx, |shimmer, cx| shimmer.set_active(false, cx));
+        }
+        // The running-status row only exists while the turn is live, so stop its
+        // sweep as soon as it is gone. Nothing else clears that flag, and an
+        // `active` shimmer keeps requesting animation frames for a label that is
+        // no longer on screen, which spins the WebView's renderer while idle.
+        if !self.conversation.running {
+            self.seeking_shimmer
                 .update(cx, |shimmer, cx| shimmer.set_active(false, cx));
         }
         for panel in &self.conversation.questions {
@@ -2612,10 +2677,9 @@ impl DshApp {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let p = dsh(cx);
+        // 官方：简洁/详细两种模式的已完成轮次页脚都不显示耗时。
         let text = match summary.end {
-            TurnEnd::Completed => {
-                format!("已完成，用时 {}", turn_duration_text(summary.seconds))
-            }
+            TurnEnd::Completed => "已完成".to_owned(),
             other => other.label().to_string(),
         };
         // 官方消耗行：“共消耗 ◇ N ✓ 均衡 (模型)”。模型名来自会话当前配置。
@@ -2628,7 +2692,7 @@ impl DshApp {
         };
         column()
             .w_full()
-            .mt(px(16.))
+            .mt(px(20.))
             .gap(px(6.))
             .when_some(summary.used, |element, used| {
                 element.child(
@@ -2807,9 +2871,29 @@ impl DshApp {
             .and_then(Value::as_str)
             .unwrap_or("工具调用");
         let mut actions = row().w_full().justify_end().gap(px(8.));
-        for (id, name) in &permission.options {
+        // 官方：拒绝 → 允许 → 始终允许；有「始终允许」时只有它是主按钮。
+        let mut options = permission.options.clone();
+        options.sort_by_key(|(id, _)| {
+            let id = id.to_lowercase();
+            if id.contains("reject") || id.contains("deny") || id.contains("cancel") {
+                0
+            } else if id.contains("always") {
+                2
+            } else {
+                1
+            }
+        });
+        let has_always = options
+            .iter()
+            .any(|(id, _)| id.to_lowercase().contains("always"));
+        for (id, name) in &options {
             let option_id = id.clone();
-            let button = if id.contains("allow") {
+            let primary = if has_always {
+                id.to_lowercase().contains("always")
+            } else {
+                id.to_lowercase().contains("allow")
+            };
+            let button = if primary {
                 Button::new(gpui::ElementId::Name(format!("permission-{id}").into())).primary()
             } else {
                 Button::new(gpui::ElementId::Name(format!("permission-{id}").into())).secondary()
@@ -2946,8 +3030,11 @@ impl DshApp {
             px(62.) + toolbar_gap * 2. + permission_width + plan_width + model_width + stop_width
                 > toolbar_width
         });
-        // 官方 hero / conversation 两套 placeholder。
-        let placeholder = if hero {
+        // 官方 hero / conversation 两套 placeholder；plan 模式生效期间，
+        // 会话 composer 改用计划任务提示（hero 自带 surface placeholder）。
+        let placeholder = if !hero && self.conversation.plan_active == Some(true) {
+            "描述你的任务以生成计划"
+        } else if hero {
             "描述你想要构建的内容, / 调用指令, @ 文件或对话"
         } else {
             "发消息或创建任务, / 调用指令, @ 文件或对话"
@@ -2955,6 +3042,9 @@ impl DshApp {
         self.composer.update(cx, |editor, _| {
             editor.set_placeholder(placeholder);
         });
+        // Harness renders a grey ghost hint after an empty claimed command chip.
+        let draft = self.composer.read(cx).value().to_owned();
+        let claim_hint = crate::commands::command_claim_hint(&draft);
         let card_bounds = self.composer_card_bounds.clone();
         let card_open = self
             .composer_menu
@@ -2974,6 +3064,7 @@ impl DshApp {
                     .clone()
                     .or_else(|| self.error.clone()),
                 |element, error| {
+                    let auth_failure = crate::state::is_auth_failure(&error);
                     element.child(
                         row()
                             .w_full()
@@ -2988,6 +3079,28 @@ impl DshApp {
                                     .text_color(p.danger)
                                     .child(error),
                             )
+                            .when(auth_failure, |row| {
+                                row.child(
+                                    div()
+                                        .id("open-api-key-settings")
+                                        .px(px(8.))
+                                        .py(px(3.))
+                                        .rounded(px(6.))
+                                        .border(px(0.5))
+                                        .border_color(p.danger)
+                                        .text_size(px(12.))
+                                        .text_color(p.danger)
+                                        .child("去设置")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.error = None;
+                                            this.conversation.error = None;
+                                            this.show_more_menu = false;
+                                            this.settings_page = SettingsPage::Credentials;
+                                            this.show_settings = true;
+                                            cx.notify();
+                                        })),
+                                )
+                            })
                             .child(icon_btn(
                                 "dismiss-error",
                                 "关闭错误",
@@ -3025,6 +3138,19 @@ impl DshApp {
                             .pr(px(8.))
                             .child(self.composer.clone()),
                     )
+                    .when_some(claim_hint, |element, hint| {
+                        element.child(
+                            div()
+                                .w_full()
+                                .pl(px(14.))
+                                .pr(px(8.))
+                                .pb(px(2.))
+                                .text_size(px(12.))
+                                .line_height(px(18.))
+                                .text_color(p.label_caption)
+                                .child(hint),
+                        )
+                    })
                     .when(!self.conversation.draft_attachments.is_empty(), |element| {
                         element.child(self.render_attachment_rail(cx))
                     })
@@ -3824,7 +3950,7 @@ impl DshApp {
                     .child(self.render_command_picker(menu, cx))
             }
             ComposerMenu::Commands => {
-                let catalog = command_catalog();
+                let catalog = self.command_catalog.catalog();
                 let visible = visible_commands(&catalog, &self.command_filter);
                 let mut list = column()
                     .id("command-list")
@@ -4506,7 +4632,7 @@ impl DshApp {
                 w.request_animation_frame();
             }
         }
-        let label = "显示代码工作视图";
+        let label = "代码工作工具";
         let switch = div()
             .id("developer-tools")
             .role(gpui::Role::Switch)
@@ -4558,7 +4684,7 @@ impl DshApp {
                             .text_size(px(12.))
                             .line_height(px(18.))
                             .text_color(p.label_secondary)
-                            .child("开启后，显示轨迹、本轮代码差异，可选择完整的 Agent 预设切换"),
+                            .child("控制界面展示与 HTML 预览权限，不影响 Host 授权或会话记录"),
                     )
                     .when(self.developer_tools_error, |content| {
                         content.child(
@@ -4583,6 +4709,76 @@ impl DshApp {
                     }
                 }),
             ))
+    }
+
+    /// Restores workspaces hidden from the sidebar. Harness keeps session data
+    /// when a group is removed, so undoing the local `hidden` preference is all
+    /// that is needed — no files or history are touched.
+    fn render_hidden_workspaces(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let p = dsh(cx);
+        let mut hidden: Vec<String> = self.hidden_workspaces.iter().cloned().collect();
+        hidden.sort();
+        let mut body = column().w_full().gap(px(8.)).child(
+            div()
+                .text_size(px(14.))
+                .line_height(px(20.))
+                .text_color(p.label_primary)
+                .child("已移除的工作区"),
+        );
+        if hidden.is_empty() {
+            return body.child(
+                div()
+                    .text_size(px(12.))
+                    .line_height(px(18.))
+                    .text_color(p.label_tertiary)
+                    .child("暂无；从侧栏移除的工作区会出现在这里，可随时恢复，磁盘文件与会话不受影响。"),
+            );
+        }
+        for (index, path) in hidden.iter().enumerate() {
+            let restored = path.clone();
+            body = body.child(
+                row()
+                    .w_full()
+                    .h(px(36.))
+                    .px(px(12.))
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .rounded(px(8.))
+                    .bg(p.bg_module_platform)
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(12.))
+                            .text_color(p.label_secondary)
+                            .child(path.clone()),
+                    )
+                    .child(
+                        div()
+                            .id(gpui::ElementId::Name(
+                                format!("restore-workspace-{index}").into(),
+                            ))
+                            .role(gpui::Role::Button)
+                            .px(px(10.))
+                            .h(px(26.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(4.))
+                            .cursor_pointer()
+                            .bg(p.button_primary_fill)
+                            .text_size(px(12.))
+                            .text_color(p.label_primary_foreground)
+                            .child("恢复")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.hidden_workspaces.remove(&restored);
+                                this.save_workspace_preferences(cx);
+                                this.push_toast("已恢复工作区分组", cx);
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
+        body
     }
 
     fn render_settings(&mut self, w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -4630,6 +4826,7 @@ impl DshApp {
                     .child(self.render_shortcut_setting(cx))
                     .child(self.render_transcript_preferences(w, cx))
                     .child(self.render_developer_tools_setting(w, cx))
+                    .child(self.render_hidden_workspaces(cx))
                     .child(note("当前版本 0.1.0（GPUI 客户端）", cx)),
                 cx,
             ),
@@ -4752,7 +4949,7 @@ impl DshApp {
                     .w_full()
                     .gap(px(12.))
                     .child(wrapped_settings_note(
-                        "当前 ACP 服务没有提供 Agent 预设读取或切换接口。工具执行仍会在会话中逐项请求审批。",
+                        "配套 dsh-acp 的 ACP profile 未挂载 agent-preset-registry，当前无法读取或切换 Agent 预设，也无法按指定预设创建自动化会话。工具执行仍会在会话中逐项请求审批。",
                         cx,
                     )),
                 cx,
@@ -5413,6 +5610,7 @@ fn render_entry(
                 })
         }
         EntryRole::Retry => render_model_retry(entry, expanded, cx),
+        EntryRole::Command => render_command_card(entry, expanded, cx),
         EntryRole::System if entry.title == "turn-end" => row().w_full().justify_start().child(
             div()
                 .px(px(6.))
@@ -5433,6 +5631,118 @@ fn render_entry(
             .child(icon(Glyph::Alert, 16., p.danger))
             .child(div().text_color(p.danger).child(entry.text.clone())),
     }
+}
+
+/// 官方 GenericCommandCard：指令名 + 分隔点 + 折叠摘要，多行正文可展开。
+///
+/// 官方的规则是「正文含换行才可展开」，摘要取结果首行，因此 `/goal` 这类多行
+/// 结果默认只显示一行、点开后看到完整的 `Status/Rounds/Activation` 文本。
+fn render_command_card(entry: &ChatEntry, expanded: bool, cx: &mut Context<DshApp>) -> gpui::Div {
+    let p = dsh(cx);
+    let key = entry.key.clone();
+    let running = entry.status.is_empty();
+    let failed = entry.status == "error";
+    let body = (!entry.text.is_empty()).then(|| entry.text.clone());
+    // 官方：仅当结果含换行时 DisclosureRow 才可展开。
+    let expandable = body.as_deref().is_some_and(|text| text.contains('\n'));
+    let open = expanded && expandable;
+    let summary = match (running, failed) {
+        (true, _) => "正在执行指令".to_string(),
+        (false, true) => "指令执行失败".to_string(),
+        (false, false) => body
+            .as_deref()
+            .map(|text| text.lines().next().unwrap_or_default().trim().to_string())
+            .filter(|line| !line.is_empty())
+            .unwrap_or_else(|| "指令已执行".to_string()),
+    };
+    let title = if entry.title.is_empty() {
+        "指令".to_string()
+    } else {
+        entry.title.clone()
+    };
+    let toggle_key = key.clone();
+    let mut card = column()
+        .w_full()
+        .rounded(px(10.))
+        .border(px(0.5))
+        .border_color(p.line)
+        .child(
+            row()
+                .id(gpui::ElementId::Name(format!("command-{key}").into()))
+                .role(gpui::Role::Button)
+                .aria_label(title.clone())
+                .aria_expanded(open)
+                .tab_index(0)
+                .tab_stop(expandable)
+                .w_full()
+                .px(px(12.))
+                .py(px(8.))
+                .gap(px(8.))
+                .items_center()
+                .when(expandable, |row| {
+                    row.cursor_pointer().hover(|style| style.bg(p.hover))
+                })
+                .child(icon(Glyph::Play, 13., p.faint))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(13.))
+                        .line_height(px(20.))
+                        .text_color(p.secondary)
+                        .child(title),
+                )
+                .child(div().flex_none().size(px(2.)).rounded_full().bg(p.faint))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(13.))
+                        .line_height(px(20.))
+                        .when(failed, |element| element.text_color(p.danger))
+                        .when(!failed, |element| element.text_color(p.faint))
+                        .child(summary),
+                )
+                .children(running.then(|| {
+                    pending_dot(
+                        gpui::ElementId::Name(format!("command-dot-{key}").into()),
+                        div()
+                            .size(px(6.))
+                            .rounded_full()
+                            .bg(p.state_business_primary),
+                    )
+                }))
+                .when(expandable, |row| {
+                    row.child(icon(
+                        if open { Glyph::Up } else { Glyph::Down },
+                        12.,
+                        p.faint,
+                    ))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        toggle_entry(&mut this.conversation.expanded_entries, &toggle_key);
+                        cx.notify();
+                    }))
+                }),
+        );
+    if open && let Some(body) = body {
+        card = card.child(
+            div()
+                .id(gpui::ElementId::Name(format!("command-body-{key}").into()))
+                .w_full()
+                .max_h(px(260.))
+                .overflow_y_scroll()
+                .border_t(px(0.5))
+                .border_color(p.line)
+                .px(px(12.))
+                .py(px(8.))
+                .font_family("Menlo")
+                .text_size(px(12.))
+                .line_height(px(18.))
+                .text_color(p.ink)
+                .child(body),
+        );
+    }
+    card
 }
 
 /// 官方 ModelRetryItem：`已重试模型请求（n/m） · Ns`，可展开看失败原因。
@@ -5898,6 +6208,8 @@ pub(super) fn render_markdown(
                     }),
             ),
             Block::Code { lang, text } => {
+                // 官方：diff / patch 围栏以统一 diff 行代替普通代码内容。
+                let is_diff = matches!(lang.to_lowercase().as_str(), "diff" | "patch");
                 let color_of = |kind: crate::markdown::CodeToken| match kind {
                     crate::markdown::CodeToken::Keyword => p.label_primary_bluish,
                     crate::markdown::CodeToken::Str => p.success,
@@ -6010,8 +6322,8 @@ pub(super) fn render_markdown(
                                         })),
                                 ),
                         )
-                        .child(
-                            div()
+                        .child({
+                            let mut body = div()
                                 .w_full()
                                 .px(px(16.))
                                 .py(px(12.))
@@ -6019,29 +6331,55 @@ pub(super) fn render_markdown(
                                 .text_size(px(12.))
                                 .line_height(px(20.))
                                 .text_color(p.secondary)
-                                .overflow_x_hidden()
-                                .when(wrapped, |element| element.overflow_x_hidden())
-                                .child(super::document_selection::SelectionLayout::text(
-                                    selection,
-                                    source,
-                                    separator,
-                                    |source| {
-                                        gpui::StyledText::new(source).with_highlights(
-                                            code_spans(&text, &highlight_lang).into_iter().map(
-                                                |span| {
-                                                    (
-                                                        span.start..span.end,
-                                                        gpui::HighlightStyle {
-                                                            color: Some(color_of(span.kind)),
-                                                            ..Default::default()
-                                                        },
-                                                    )
-                                                },
-                                            ),
-                                        )
-                                    },
-                                )),
-                        ),
+                                .overflow_x_hidden();
+                            if is_diff {
+                                let mut rows = column().w_full();
+                                for line in text.lines() {
+                                    let (color, fill) =
+                                        if line.starts_with("+++") || line.starts_with('+') {
+                                            (p.success, Some(p.state_success_tertiary))
+                                        } else if line.starts_with("---") || line.starts_with('-') {
+                                            (p.danger, Some(p.hover_danger))
+                                        } else if line.starts_with("@@") {
+                                            (p.state_business_primary, None)
+                                        } else {
+                                            (p.secondary, None)
+                                        };
+                                    let row = div()
+                                        .w_full()
+                                        .px(px(6.))
+                                        .text_color(color)
+                                        .when_some(fill, |row, fill| row.bg(fill))
+                                        .child(line.to_owned());
+                                    rows = rows.child(row);
+                                }
+                                body = body.child(rows);
+                            } else {
+                                body = body
+                                    .when(wrapped, |element| element.overflow_x_hidden())
+                                    .child(super::document_selection::SelectionLayout::text(
+                                        selection,
+                                        source,
+                                        separator,
+                                        |source| {
+                                            gpui::StyledText::new(source).with_highlights(
+                                                code_spans(&text, &highlight_lang).into_iter().map(
+                                                    |span| {
+                                                        (
+                                                            span.start..span.end,
+                                                            gpui::HighlightStyle {
+                                                                color: Some(color_of(span.kind)),
+                                                                ..Default::default()
+                                                            },
+                                                        )
+                                                    },
+                                                ),
+                                            )
+                                        },
+                                    ));
+                            }
+                            body
+                        }),
                 )
             }
         };

@@ -843,6 +843,21 @@ impl DshApp {
                                     .when(enabled, |button| button.cursor_pointer())
                                     .child("恢复默认"),
                                 cx.listener(move |app, _, w, cx| {
+                                    let blocked =
+                                        app.web_search_settings.as_ref().is_none_or(|form| {
+                                            form.busy
+                                                || form
+                                                    .snapshot
+                                                    .as_ref()
+                                                    .is_none_or(|snap| !snap.writable)
+                                        });
+                                    if blocked {
+                                        app.push_toast(
+                                            "当前配置不可写或正在保存，请稍后再试。",
+                                            cx,
+                                        );
+                                        return;
+                                    }
                                     let Some(form) = &mut app.web_search_settings else {
                                         return;
                                     };

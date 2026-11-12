@@ -97,6 +97,8 @@ fn main() {
             acp::set_config_option,
             acp::respond_permission,
             acp::plan_mode,
+            acp::session_commands,
+            acp::execute_session_command,
             acp::permission_mode,
             acp::respond_plan_review,
             acp::question_state,

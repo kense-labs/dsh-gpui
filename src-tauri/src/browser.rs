@@ -587,9 +587,18 @@ fn emit_browser_page<R: Runtime>(
 
 fn browser_history_availability(view: &PlatformWebview) -> (bool, bool) {
     #[cfg(target_os = "macos")]
-    unsafe {
-        let view: &objc2_web_kit::WKWebView = &*view.inner().cast();
-        return (view.canGoBack(), view.canGoForward());
+    {
+        // SAFETY: `PlatformWebview::inner` returns the `WKWebView` that Tauri owns;
+        // `cast` only retypes that pointer and the borrow ends with the temporary,
+        // so no reference outlives the webview.
+        let view: &objc2_web_kit::WKWebView = unsafe { &*view.inner().cast() };
+        // SAFETY: `view` is a live `WKWebView`; each is a read-only Objective-C
+        // accessor taking no arguments and returning a plain boolean, so the
+        // selector and return type match the declared method.
+        let back = unsafe { view.canGoBack() };
+        // SAFETY: as above, for the forward accessor.
+        let forward = unsafe { view.canGoForward() };
+        return (back, forward);
     }
     #[cfg(any(
         target_os = "linux",
@@ -620,12 +629,19 @@ fn browser_history_availability(view: &PlatformWebview) -> (bool, bool) {
 
 fn move_browser_history(view: &PlatformWebview, forward: bool) {
     #[cfg(target_os = "macos")]
-    unsafe {
-        let view: &objc2_web_kit::WKWebView = &*view.inner().cast();
+    {
+        // SAFETY: same retype of the Tauri-owned `WKWebView` as in
+        // `browser_history_availability`; the borrow is confined to this block.
+        let view: &objc2_web_kit::WKWebView = unsafe { &*view.inner().cast() };
+        // SAFETY: `view` is a live `WKWebView`; navigation selectors take no
+        // arguments and only enqueue a load in the webview, whose result is
+        // deliberately discarded.
         if forward {
-            let _ = view.goForward();
+            // SAFETY: as above, for the forward selector.
+            let _ = unsafe { view.goForward() };
         } else {
-            let _ = view.goBack();
+            // SAFETY: as above, for the back selector.
+            let _ = unsafe { view.goBack() };
         }
     }
     #[cfg(any(

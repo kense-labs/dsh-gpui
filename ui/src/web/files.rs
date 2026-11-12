@@ -31,42 +31,6 @@ impl DshApp {
         let _ = w;
     }
 
-    pub(super) fn open_file_picker(&mut self, w: &mut Window, cx: &mut Context<Self>) {
-        let (text, selection) = {
-            let editor = self.composer.read(cx);
-            (editor.value().to_string(), editor.selection())
-        };
-        let token = active_file_token(&text, selection.end).unwrap_or_else(|| {
-            let start = utf16_byte_index(&text, selection.start);
-            let end = utf16_byte_index(&text, selection.end);
-            let before = &text[..start];
-            let after = &text[end..];
-            let separator = before
-                .chars()
-                .next_back()
-                .is_some_and(|character| character.is_alphanumeric() || character == '_');
-            let prefix = if separator { " @" } else { "@" };
-            let token_start = before.len() + usize::from(separator);
-            let next = format!("{before}{prefix}{after}");
-            let token = FileToken {
-                span: token_start..token_start + 1,
-                directory: String::new(),
-                filter: String::new(),
-            };
-            self.replace_composer_without_trigger(&next, w, cx);
-            token
-        });
-        self.file_filter = token.filter.clone();
-        self.file_token = Some(token.clone());
-        self.file_selected = 0;
-        self.file_show_crumbs = false;
-        self.composer_menu = Some(ComposerMenu::Files);
-        self.show_workspace_menu = false;
-        self.load_workspace_files(token.directory, cx);
-        self.focus_composer(w, cx);
-        cx.notify();
-    }
-
     pub(super) fn visible_files(&self) -> Vec<WorkspaceFile> {
         let query = self.file_filter.to_lowercase();
         self.mention_files
@@ -312,6 +276,14 @@ impl DshApp {
             cx.notify();
             return true;
         }
+        // Official `workspace.add` (Mod+O) uses the native directory picker.
+        // It must stay reachable before the ACP service connects, because
+        // choosing a workspace is also how a fresh client reconnects.
+        if command == Command::AddWorkspace {
+            super::document_html::restore_shell_focus();
+            self.request_workspace_picker();
+            return true;
+        }
         if self.connected() {
             match command {
                 Command::NewSession => {
@@ -537,7 +509,7 @@ impl DshApp {
             return true;
         }
         if self.composer_menu == Some(ComposerMenu::Commands) && self.command_from_slash {
-            let catalog = command_catalog();
+            let catalog = self.command_catalog.catalog();
             let visible = visible_commands(&catalog, &self.command_filter);
             match combo {
                 "ArrowDown" if !visible.is_empty() => {
@@ -590,10 +562,14 @@ impl DshApp {
             self.replace_composer_without_trigger("", w, cx);
         }
         match command {
-            "file" => self.open_file_picker(w, cx),
-            "attach" => {
+            // Harness registers "文件" as a native OS file-picker action; the
+            // in-app `@` browser is a separate surface rooted at the workspace
+            // cwd. Using the browser here made the menu list `/` on GUI launches.
+            "file" | "attach" => {
                 self.composer_menu = None;
-                self.pick_attachments(cx);
+                // The official "文件" action opens the native picker for any
+                // file type; an empty accept leaves input.accept unset.
+                self.pick_attachments("", cx);
                 self.focus_composer(w, cx);
             }
             "model" => {
@@ -610,6 +586,24 @@ impl DshApp {
             "permission" => {
                 self.open_command_picker(ComposerMenu::PermissionChoices, from_slash, w, cx);
             }
+            "goal" | "plan" | "compact" => {
+                if !self.command_catalog.supports(command) {
+                    self.conversation.error = Some("当前会话暂不支持该指令。".to_owned());
+                } else if self.command_catalog.has_leading_input(command) {
+                    // Harness claims a host command with `input` as an atomic
+                    // leading chip carrying the *localized* token (`/目标`,
+                    // `/计划`), followed by an editable argument separator.
+                    // Submit still canonicalizes to the registered name.
+                    self.composer_menu = None;
+                    let token = crate::commands::localized_command_token(command);
+                    let line = format!("/{token} ");
+                    self.replace_composer_without_trigger(&line, w, cx);
+                    self.focus_composer(w, cx);
+                } else {
+                    self.composer_menu = None;
+                    self.run_host_command(format!("/{command}"), None, w, cx);
+                }
+            }
             _ => {
                 self.composer_menu = None;
                 self.focus_composer(w, cx);
@@ -619,7 +613,7 @@ impl DshApp {
     }
 
     pub(super) fn activate_first_command(&mut self, w: &mut Window, cx: &mut Context<Self>) {
-        let catalog = command_catalog();
+        let catalog = self.command_catalog.catalog();
         let key = visible_commands(&catalog, &self.command_filter)
             .into_iter()
             .find(|spec| spec.enabled)

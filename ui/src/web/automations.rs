@@ -67,7 +67,8 @@ impl Task {
                 .as_str()
                 .unwrap_or("Cron")
                 .to_owned(),
-            "rrule" => "RRULE".to_owned(),
+            // 官方：界面不向用户提示语法名称。
+            "rrule" => "自定义".to_owned(),
             _ => "单次运行".to_owned(),
         }
     }
@@ -138,6 +139,8 @@ struct History {
     page: Option<HistoryPage>,
     request: Option<Rc<()>>,
     error: Option<String>,
+    /// 官方：长指令可展开/收起，键为投递时间。
+    expanded: std::collections::HashSet<String>,
 }
 
 enum Confirmation {
@@ -158,19 +161,18 @@ enum RuleKind {
     Every,
     Daily,
     Weekly,
-    Cron,
-    RRule,
+    /// 官方：自定义规则只有一个选项、一个输入框，不向用户提示语法名称。
+    Custom,
 }
 
 impl RuleKind {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 6] = [
         Self::After,
         Self::At,
         Self::Every,
         Self::Daily,
         Self::Weekly,
-        Self::Cron,
-        Self::RRule,
+        Self::Custom,
     ];
 
     fn from_task(task: &Task) -> Self {
@@ -179,8 +181,7 @@ impl RuleKind {
             "every" => Self::Every,
             "daily" => Self::Daily,
             "weekly" => Self::Weekly,
-            "cron" => Self::Cron,
-            "rrule" => Self::RRule,
+            "cron" | "rrule" => Self::Custom,
             _ => Self::After,
         }
     }
@@ -192,8 +193,7 @@ impl RuleKind {
             Self::Every => "间隔",
             Self::Daily => "每天",
             Self::Weekly => "每周",
-            Self::Cron => "Cron",
-            Self::RRule => "RRULE",
+            Self::Custom => "自定义",
         }
     }
 
@@ -203,13 +203,12 @@ impl RuleKind {
             Self::At => ("运行时间", "YYYY-MM-DD HH:mm:ss"),
             Self::Every => ("间隔秒数", "例如 3600"),
             Self::Daily | Self::Weekly => ("运行时间", "例如 09:00:00"),
-            Self::Cron => ("Cron 表达式", "例如 0 9 * * 1-5"),
-            Self::RRule => ("重复规则", "DTSTART 和 RRULE 各一行"),
+            Self::Custom => ("运行规则", "请输入重复规则"),
         }
     }
 
     fn needs_zone(self) -> bool {
-        matches!(self, Self::At | Self::Daily | Self::Weekly | Self::Cron)
+        matches!(self, Self::At | Self::Daily | Self::Weekly)
     }
 
     fn original(self, task: &Task) -> String {
@@ -218,8 +217,12 @@ impl RuleKind {
             Self::Every => task.timing["everySeconds"].to_string(),
             Self::At => task.scheduled_at.clone(),
             Self::Daily | Self::Weekly => task.timing["time"].as_str().unwrap_or("").to_owned(),
-            Self::Cron => task.timing["expression"].as_str().unwrap_or("").to_owned(),
-            Self::RRule => task.timing["rrule"].as_str().unwrap_or("").to_owned(),
+            Self::Custom => task.timing["expression"]
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .or_else(|| task.timing["rrule"].as_str())
+                .unwrap_or("")
+                .to_owned(),
         }
     }
 }
@@ -286,10 +289,23 @@ impl Draft {
             RuleKind::Weekly => {
                 json!({"kind":"weekly","weekly":{"time":value,"time_zone":time_zone,"weekdays":self.weekdays}})
             }
-            RuleKind::Cron => {
-                json!({"kind":"cron","cron":{"expression":value,"time_zone":time_zone}})
+            RuleKind::Custom => {
+                // 官方：一个输入框接受五字段 Cron 或 DTSTART+RRULE 两行，
+                // 新改的文本须经校验才能保存，无效时保留草稿。
+                match crate::validation::validate_recurrence(value)? {
+                    crate::validation::Recurrence::Cron => {
+                        let zone = if time_zone.is_empty() {
+                            "UTC"
+                        } else {
+                            time_zone
+                        };
+                        json!({"kind":"cron","cron":{"expression":value,"time_zone":zone}})
+                    }
+                    crate::validation::Recurrence::RRule => {
+                        json!({"kind":"rrule","rrule":value})
+                    }
+                }
             }
-            RuleKind::RRule => json!({"kind":"rrule","rrule":value}),
         })
     }
 
@@ -581,7 +597,7 @@ impl DshApp {
             .child(label(draft.rule.field().0, cx))
             .child(schedule_field(
                 &draft.value,
-                if draft.rule == RuleKind::RRule {
+                if draft.rule == RuleKind::Custom {
                     74.
                 } else {
                     36.
@@ -1111,7 +1127,12 @@ impl DshApp {
                     state.filter.is_none_or(|filter| task.status == filter)
                         && (query.is_empty()
                             || task.title.to_lowercase().contains(&query)
-                            || task.prompt.to_lowercase().contains(&query))
+                            || task.prompt.to_lowercase().contains(&query)
+                            // 官方：筛选也结合关联会话 id。
+                            || task
+                                .target
+                                .session_id()
+                                .is_some_and(|id| id.to_lowercase().contains(&query)))
                 })
                 .peekable();
             if visible.peek().is_none() {
@@ -1562,7 +1583,39 @@ impl DshApp {
                             cx,
                         ))
                         .when_some(delivery.prompt.as_ref(), |row, prompt| {
-                            row.child(note(prompt.clone(), cx))
+                            let key = delivery.delivered_at.clone();
+                            let expanded = history.expanded.contains(&key);
+                            let long = prompt.chars().count() > 120;
+                            let shown = if expanded || !long {
+                                prompt.clone()
+                            } else {
+                                format!("{}…", prompt.chars().take(120).collect::<String>())
+                            };
+                            let toggled = key.clone();
+                            row.child(note(shown, cx)).when(long, |row| {
+                                row.child(
+                                    div()
+                                        .id(gpui::ElementId::Name(
+                                            format!("history-expand-{key}").into(),
+                                        ))
+                                        .role(gpui::Role::Button)
+                                        .tab_index(0)
+                                        .mt(px(2.))
+                                        .text_size(px(12.))
+                                        .text_color(p.link)
+                                        .cursor_pointer()
+                                        .child(if expanded { "收起" } else { "展开" })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if !this.automations.history.expanded.remove(&toggled) {
+                                                this.automations
+                                                    .history
+                                                    .expanded
+                                                    .insert(toggled.clone());
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                            })
                         })
                         .child(self.automation_session_link(&delivery.target_session_id, cx)),
                 );

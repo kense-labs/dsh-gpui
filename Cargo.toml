@@ -7,6 +7,14 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+# `unsafe` is confined to the native host's platform interop (macOS AppKit /
+# WebKit through objc2, plus a few libc calls). It is never needed in the UI
+# crate. Requiring a SAFETY note on every block keeps those calls reviewable:
+# the note must state the actual invariant, not restate the code.
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+
 [profile.dev]
 debug = "limited"
 

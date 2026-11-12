@@ -44,6 +44,7 @@ pub enum Command {
     ForkSession,
     ArchiveSession,
     Settings,
+    AddWorkspace,
     OpenWorkspace,
     ToggleDock,
     Files,
@@ -143,6 +144,14 @@ pub const COMMANDS: &[Definition] = &[
         "打开设置",
         "settings preferences",
         "Comma",
+        0
+    ),
+    command!(
+        AddWorkspace,
+        "workspace.add",
+        "添加工作区",
+        "add workspace open folder",
+        "KeyO",
         0
     ),
     command!(
@@ -716,5 +725,47 @@ pub fn modifier_key(code: &str) -> u8 {
         "ShiftLeft" | "ShiftRight" => SHIFT,
         "MetaLeft" | "MetaRight" => META,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_add_keeps_the_official_mod_o_default() {
+        let add = COMMANDS
+            .iter()
+            .find(|definition| definition.id == "workspace.add")
+            .expect("the official workspace.add command must be registered");
+        assert_eq!(add.command, Command::AddWorkspace);
+        assert_eq!(add.code, "KeyO");
+        assert_eq!(add.modifiers, 0);
+        assert!(add.primary);
+
+        // Harness binds "在应用中打开工作区" to Mod+Alt+O. Adding Mod+O must
+        // not displace it or produce a conflict in the default keymap.
+        let keymap = Keymap::new(&Document::default(), Platform::Mac);
+        let row = |command| {
+            keymap
+                .rows
+                .iter()
+                .find(|row| row.definition.command == command)
+                .unwrap()
+        };
+        let add_row = row(Command::AddWorkspace);
+        let open_row = row(Command::OpenWorkspace);
+        assert_eq!(add_row.issue, None);
+        assert!(add_row.conflicts.is_empty());
+        assert_eq!(open_row.issue, None);
+        assert_ne!(add_row.binding, open_row.binding);
+        assert_eq!(
+            add_row.binding.as_ref().map(|binding| binding.modifiers),
+            Some(META)
+        );
+        assert_eq!(
+            open_row.binding.as_ref().map(|binding| binding.modifiers),
+            Some(META | ALT)
+        );
     }
 }

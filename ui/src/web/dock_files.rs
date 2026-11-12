@@ -22,6 +22,8 @@ const FILE_OTHER_FOLD: &[u8] = include_bytes!("../../assets/files-other-fold.svg
 pub(super) struct DockFileTree {
     levels: HashMap<String, FileLevel>,
     expanded: HashSet<String>,
+    /// 官方：点号开头的条目默认隐藏，可由「显示隐藏项」切换。
+    show_hidden: bool,
     scroll: ScrollHandle,
     shown: bool,
     navigator_open: bool,
@@ -371,7 +373,42 @@ impl DshApp {
                     .child("这个会话没有工作区目录。"),
             );
         }
+        let show_hidden = self
+            .sidebar
+            .file_trees
+            .get(&pane)
+            .is_some_and(|tree| tree.show_hidden);
         let header = files_header(workspace, cx)
+            .child(
+                div()
+                    .id("files-show-hidden")
+                    .role(gpui::Role::Button)
+                    .aria_label("显示隐藏项")
+                    .tab_index(0)
+                    .px(px(6.))
+                    .h(px(24.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .text_size(px(11.))
+                    .text_color(if show_hidden {
+                        p.label_primary
+                    } else {
+                        p.label_tertiary
+                    })
+                    .hover(|style| style.bg(p.hover))
+                    .child(if show_hidden {
+                        "隐藏项：显示"
+                    } else {
+                        "显示隐藏项"
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let tree = this.sidebar.file_trees.entry(pane).or_default();
+                        tree.show_hidden = !tree.show_hidden;
+                        cx.notify();
+                    })),
+            )
             .child(
                 self.dock_button(DockControl::FilesRefresh(pane), "重新读取", false, cx)
                     .group("files-refresh")
@@ -438,11 +475,24 @@ impl DshApp {
             return rows.child(file_note("正在读取…", cx));
         }
         if let Some(error) = &listing.error {
-            rows = rows.child(file_note(error.clone(), cx));
+            rows = rows.child(file_note(file_error_note(error), cx));
         } else if listing.entries.is_empty() {
             rows = rows.child(file_note("空目录", cx));
+        } else if !tree.show_hidden
+            && listing
+                .entries
+                .iter()
+                .all(|entry| entry.name.starts_with('.'))
+        {
+            rows = rows.child(file_note(
+                "该目录只有隐藏项，可点击「显示隐藏项」查看。",
+                cx,
+            ));
         }
         for entry in &listing.entries {
+            if !tree.show_hidden && entry.name.starts_with('.') {
+                continue;
+            }
             let expanded = entry.is_directory && tree.expanded.contains(&entry.path);
             let current_row = current == Some(entry.path.as_str());
             let mut row = self.render_file_entry(pane, entry, expanded, current_row, size, cx);
@@ -655,6 +705,20 @@ fn files_path_label(workspace: &str, cx: &App) -> gpui::Stateful<gpui::Div> {
             .absolute()
             .inset_0(),
         )
+}
+
+/// 官方：失败层按 not-found / outside-workspace / not-directory 分类文案。
+fn file_error_note(error: &str) -> String {
+    let lower = error.to_lowercase();
+    if lower.contains("not found") || lower.contains("enoent") {
+        "目录不存在".to_owned()
+    } else if lower.contains("outside") {
+        "路径不在当前工作区内".to_owned()
+    } else if lower.contains("not a directory") || lower.contains("enotdir") {
+        "目标不是目录".to_owned()
+    } else {
+        error.to_owned()
+    }
 }
 
 fn file_note(label: impl Into<gpui::SharedString>, cx: &App) -> gpui::Div {

@@ -158,14 +158,19 @@ pub(crate) fn install_guest_input(app: AppHandle) {
         }
         if let Some(webview) = app.get_webview("main") {
             let _ = webview.with_webview(|platform| {
-                // The platform handle is the main WKWebView, an NSView subclass.
+                // SAFETY: `with_webview` runs on the main thread while the webview is
+                // alive, and Wry's `inner()` returns the address of that webview's
+                // backing `WKWebView`, an `NSView` subclass — so the cast is to the
+                // correct type and the referent outlives this borrow.
                 let view = unsafe { &*platform.inner().cast::<NSView>() };
                 MAIN_VIEW.with_borrow_mut(|main| *main = Some(Weak::new(view)));
             });
         }
         let keyboard = RefCell::new(Keyboard::default());
         let block = RcBlock::new(move |event: NonNull<NSEvent>| {
-            // AppKit retains the event for the duration of this synchronous local callback.
+            // SAFETY: this is a local event monitor, so AppKit calls the handler
+            // synchronously with the event it is currently dispatching and keeps that
+            // event alive for the whole call; the reference never escapes the closure.
             let event_ref = unsafe { event.as_ref() };
             let Some(mtm) = MainThreadMarker::new() else {
                 return event.as_ptr();
@@ -212,6 +217,10 @@ pub(crate) fn install_guest_input(app: AppHandle) {
             }
         });
         // Returning the live event preserves native handling. Null consumes a routed shortcut.
+        // SAFETY: `addLocalMonitorForEventsMatchingMask` is a main-thread-only API and
+        // this function already returned unless a `MainThreadMarker` was available. The
+        // mask and handler are plain values, and AppKit returns either a monitor token
+        // to remove later or null, both of which are valid for `Option<Retained<_>>`.
         *slot = unsafe {
             NSEvent::addLocalMonitorForEventsMatchingMask_handler(
                 NSEventMask::LeftMouseDown | NSEventMask::RightMouseDown | NSEventMask::OtherMouseDown
@@ -225,7 +234,9 @@ pub(crate) fn install_guest_input(app: AppHandle) {
 pub(crate) fn uninstall_guest_input() {
     MONITOR.with_borrow_mut(|slot| {
         if let Some(monitor) = slot.take() {
-            // The token was returned by addLocalMonitor and is removed once on app exit.
+            // SAFETY: `monitor` is the token this module stored from
+            // `addLocalMonitorForEventsMatchingMask`; `slot.take()` guarantees the
+            // matching removal happens at most once, which is what AppKit requires.
             unsafe { NSEvent::removeMonitor(&monitor) };
         }
     });
@@ -299,6 +310,9 @@ fn monitor_event(
         return false;
     };
     if responder.respondsToSelector(sel!(hasMarkedText))
+        // SAFETY: the guard proved `responder` implements `hasMarkedText`, and the
+        // selector takes no arguments and returns a plain `BOOL`, so the call and its
+        // return type match the declared method.
         && unsafe { msg_send![&responder, hasMarkedText] }
     {
         keyboard.held.clear();
@@ -362,7 +376,9 @@ fn is_main_webview_responder(mut view: Retained<NSView>) -> bool {
         if ptr::eq(&*view, &*main) {
             return true;
         }
-        // AppKit retains the view hierarchy throughout the local event callback.
+        // SAFETY: local event monitors run inside AppKit's dispatch, which keeps the
+        // whole view hierarchy alive, so each `superview` receiver is valid; the
+        // returned parent is unretained and is only walked while that holds.
         let Some(parent) = (unsafe { view.superview() }) else {
             return false;
         };
@@ -374,6 +390,9 @@ fn pointer_host(window: &NSWindow, event: &NSEvent) -> Option<Retained<BrowserHo
     let content = window.contentView()?;
     let point = event.locationInWindow();
     // hitTest expects superview coordinates. The NSWindow retains this view hierarchy.
+    // SAFETY: `superview` is called on the window's own content view, whose parent is
+    // kept alive by the window for the duration of this event dispatch; the returned
+    // parent is used only within this expression.
     let point = unsafe { content.superview() }
         .map_or(point, |parent| parent.convertPoint_fromView(point, None));
     browser_host(content.hitTest(point)?)
@@ -386,7 +405,9 @@ fn browser_host(mut view: Retained<NSView>) -> Option<Retained<BrowserHost>> {
     loop {
         view = match view.downcast::<BrowserHost>() {
             Ok(host) => return Some(host),
-            // The event's window retains these views throughout AppKit dispatch.
+            // SAFETY: the caller obtained `view` from an event AppKit is dispatching,
+            // so the window retains this view hierarchy; the walk stops at the first
+            // `BrowserHost` or the root, and each parent stays valid while it runs.
             Err(view) => unsafe { view.superview() }?,
         };
     }

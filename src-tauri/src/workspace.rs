@@ -71,6 +71,9 @@ mod directory_picker {
                     let _ = send.send(Err(PICKER_ERROR.to_owned()));
                     return;
                 };
+                // SAFETY: this closure runs on the main thread while the window is
+                // alive; `ns_window` returns that window's `NSWindow` pointer, so the
+                // cast is to the correct type and `as_ref` rejects a null handle.
                 let native = window
                     .ns_window()
                     .ok()

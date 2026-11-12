@@ -12,6 +12,7 @@ pub mod history;
 #[cfg(any(target_family = "wasm", test))]
 mod markdown;
 pub mod process;
+mod provider_marks;
 mod questions;
 #[cfg(any(target_family = "wasm", test))]
 mod right_dock;
@@ -27,6 +28,7 @@ mod terminal_keys;
 #[cfg(any(target_family = "wasm", test))]
 pub mod tokens;
 mod tool_calls;
+pub mod validation;
 
 #[cfg(target_family = "wasm")]
 mod brand;

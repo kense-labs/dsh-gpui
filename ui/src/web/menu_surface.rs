@@ -54,10 +54,18 @@ pub(super) fn menu_elevation(tokens: Tokens) -> Vec<BoxShadow> {
     for shadow in &mut shadows {
         // CSS box-shadow's blur radius is twice the Gaussian standard deviation.
         shadow.blur_radius *= 0.5;
+        // Harness's `--dsw-elevation-prominent` is two almost invisible glows
+        // (alpha .04/.05) plus a 0.5px hairline stroke. GPUI renders the
+        // exterior-only variant far more densely than CSS, so the raw alpha
+        // reads as a heavy dark halo around the menu. Compensate here while
+        // keeping the official geometry and stroke.
+        shadow.color.a *= 0.4;
     }
     gpui_wgpu::clip_backdrop_shadows(&mut shadows);
     // CSS paints the first listed shadow on top.
     shadows.reverse();
-    shadows.push(gpui_wgpu::backdrop_stroke(px(0.5), tokens.menu_stroke));
+    let mut stroke = gpui_wgpu::backdrop_stroke(px(0.5), tokens.menu_stroke);
+    stroke.color.a *= 0.5;
+    shadows.push(stroke);
     shadows
 }

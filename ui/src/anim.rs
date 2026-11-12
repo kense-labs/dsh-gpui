@@ -100,6 +100,136 @@ pub fn fish_swim_phase(t: f32) -> (f32, f32, f32) {
     (r2 * (1. - k3), x2 * (1. - k3), y2 * (1. - k3))
 }
 
+/// Official TextShimmer sweep phase for a label that has been active for
+/// `age` seconds. Mirrors the official 1.5s cycle: hold at the left, sweep
+/// linearly, then pause parked at the left.
+///
+/// This lives here rather than beside its renderer because the live process
+/// title needs it on both the host and wasm targets, and it is pure arithmetic
+/// worth testing directly.
+pub const SHIMMER_HOLD_SECONDS: f32 = 0.12;
+/// Idle pause after each sweep, as a fraction of the sweep duration.
+pub const SHIMMER_PAUSE_RATIO: f32 = 0.32;
+
+pub fn shimmer_sweep(age: f32, duration: f32) -> f32 {
+    let duration = duration.max(0.1);
+    let time = age - SHIMMER_HOLD_SECONDS;
+    if time <= 0. {
+        return 0.;
+    }
+    let local = time % (duration * (1. + SHIMMER_PAUSE_RATIO));
+    if local < duration {
+        local / duration
+    } else {
+        0.
+    }
+}
+
+/// Whether a live activity label should keep requesting animation frames.
+///
+/// Every condition matters for power: an `active` label that is off-screen, in a
+/// hidden window, or under reduced-motion must not ask for frames. Dropping the
+/// viewport check is enough to pin the WebView's renderer at full CPU while the
+/// transcript sits idle, because the entity keeps animating a highlight nobody
+/// can see.
+pub fn shimmer_should_animate(
+    active: bool,
+    window_visible: bool,
+    in_view: bool,
+    reduced_motion: bool,
+) -> bool {
+    active && window_visible && in_view && !reduced_motion
+}
+
+/// Source falloff stops for the moving highlight, in units of the band.
+/// Mirrors the official `linear-gradient(105deg, transparent 0%, black 40% 60%,
+/// transparent 100%)`.
+pub fn shimmer_falloff(offset: f32) -> f32 {
+    const STOPS: [(f32, f32); 7] = [
+        (-1., 0.),
+        (-0.5, 0.5),
+        (-0.2, 0.9),
+        (0., 1.),
+        (0.2, 0.9),
+        (0.5, 0.5),
+        (1., 0.),
+    ];
+    if offset <= STOPS[0].0 || offset >= STOPS[6].0 {
+        return 0.;
+    }
+    for pair in STOPS.windows(2) {
+        let (start, start_value) = pair[0];
+        let (end, end_value) = pair[1];
+        if offset >= start && offset <= end {
+            let span = (end - start).max(0.0001);
+            return start_value + (end_value - start_value) * (offset - start) / span;
+        }
+    }
+    0.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SHIMMER_PAUSE_RATIO, shimmer_falloff, shimmer_should_animate, shimmer_sweep};
+
+    #[test]
+    fn a_label_animates_only_while_it_is_visible_and_active() {
+        assert!(shimmer_should_animate(true, true, true, false));
+        // Settled: nothing to draw.
+        assert!(!shimmer_should_animate(false, true, true, false));
+        // Scrolled out of the viewport.
+        assert!(!shimmer_should_animate(true, true, false, false));
+        // Host window hidden.
+        assert!(!shimmer_should_animate(true, false, true, false));
+        // Reduced motion is honoured.
+        assert!(!shimmer_should_animate(true, true, true, true));
+    }
+
+    #[test]
+    fn sweep_holds_then_moves_then_pauses() {
+        // Holds at the left for the first 0.12s.
+        assert_eq!(shimmer_sweep(0., 1.5), 0.);
+        assert_eq!(shimmer_sweep(0.12, 1.5), 0.);
+        // Linear sweep across the duration.
+        assert!((shimmer_sweep(0.12 + 0.75, 1.5) - 0.5).abs() < 0.0001);
+        // Then parked at the left during the pause, and repeating.
+        let cycle = 1.5 * (1. + SHIMMER_PAUSE_RATIO);
+        assert_eq!(shimmer_sweep(0.12 + 1.5 + 0.1, 1.5), 0.);
+        assert!((shimmer_sweep(0.12 + cycle + 0.75, 1.5) - 0.5).abs() < 0.0001);
+    }
+
+    #[test]
+    fn sweep_advances_through_one_pass_then_resets_for_the_pause() {
+        // Strictly inside the sweep the highlight only moves forward. The loop
+        // stops just short of `hold + duration`, where the value returns to 0 to
+        // begin the pause.
+        let mut previous = -1.;
+        for step in 0..30 {
+            let age = 0.12 + 1.5 * (step as f32 / 30.);
+            let t = shimmer_sweep(age, 1.5);
+            assert!(t >= previous, "sweep went backwards at age {age}");
+            previous = t;
+        }
+        assert!(previous > 0.9, "sweep should nearly finish its pass");
+        // Past the sweep it parks back at the left for the pause, then the next
+        // cycle sweeps again. One cycle is `duration * (1 + pause ratio)` after
+        // the initial hold.
+        assert_eq!(shimmer_sweep(0.12 + 1.6, 1.5), 0.);
+        assert!((shimmer_sweep(0.12 + 1.5 * 1.32 + 0.75, 1.5) - 0.5).abs() < 0.0001);
+    }
+
+    #[test]
+    fn falloff_peaks_at_the_centre_and_vanishes_at_the_edges() {
+        assert_eq!(shimmer_falloff(0.), 1.);
+        assert_eq!(shimmer_falloff(0.2), 0.9);
+        assert_eq!(shimmer_falloff(-0.5), 0.5);
+        assert_eq!(shimmer_falloff(1.), 0.);
+        assert_eq!(shimmer_falloff(-1.), 0.);
+        // Symmetric around the centre.
+        assert!((shimmer_falloff(0.35) - shimmer_falloff(-0.35)).abs() < 0.0001);
+    }
+}
+
 /// The shared StateDot ring. Sidebar instances start at document time zero.
 #[cfg(target_family = "wasm")]
 pub(crate) fn state_spinner(edge: f32, started: f64, ink: gpui::Hsla) -> impl IntoElement {

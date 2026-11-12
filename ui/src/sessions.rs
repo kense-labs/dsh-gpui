@@ -15,7 +15,9 @@ impl SessionSummary {
         self.title.as_deref().unwrap_or(if self.blank {
             "新会话"
         } else {
-            "未命名会话"
+            // 官方：无保存标题的历史会话显示「未命名 / Untitled」，
+            // 不使用目录名兜底，也不追加「会话」二字。
+            "未命名"
         })
     }
 }
@@ -256,7 +258,7 @@ mod tests {
         assert_eq!(known[0], session("active", None, true));
         assert_eq!(known[0].title(), "新会话");
         assert_eq!(known[1].title(), "真实标题");
-        assert_eq!(known[2].title(), "未命名会话");
+        assert_eq!(known[2].title(), "未命名");
     }
 
     #[test]

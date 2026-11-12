@@ -69,6 +69,15 @@ export function dshListenDockCancel(callback) {
     window.addEventListener('blur', callback);
 }
 
+// JavaScript-only helpers (terminal emulation, document rendering) report
+// failures through this event so the GPUI layer can surface a toast instead of
+// leaving them in the browser console only.
+export function dshListenRuntimeError(callback) {
+    window.addEventListener('kwork-runtime-error', event => {
+        callback(String(event.detail ?? '操作失败'));
+    });
+}
+
 export function dshReadSidebar(session) {
     try { return localStorage.getItem(`dsh.gpui.sidebar-right.v1.${session}`) ?? ''; }
     catch { return ''; }
@@ -402,6 +411,9 @@ extern "C" {
 
     #[wasm_bindgen(js_name = dshListenDockCancel)]
     pub(crate) fn listen_dock_cancel(callback: &js_sys::Function);
+
+    #[wasm_bindgen(js_name = dshListenRuntimeError)]
+    pub(crate) fn listen_runtime_error(callback: &js_sys::Function);
 
     #[wasm_bindgen(js_name = dshNow)]
     fn now_js() -> f64;

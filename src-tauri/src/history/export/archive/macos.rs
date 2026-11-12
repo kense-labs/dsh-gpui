@@ -26,7 +26,9 @@ pub(super) async fn choose_destination(
                 return;
             };
             let native = window.ns_window().ok().and_then(|window| {
-                // Tauri owns the native window for the duration of this sheet.
+                // SAFETY: this closure runs on the main thread while Tauri owns the
+                // window; `ns_window` returns that window's `NSWindow` pointer, so the
+                // cast is to the correct type and `as_ref` rejects a null handle.
                 unsafe { window.cast::<NSWindow>().as_ref() }
             });
             let Some(native) = native else {

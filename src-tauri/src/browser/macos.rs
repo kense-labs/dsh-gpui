@@ -34,6 +34,10 @@ fn subtract_path() -> Option<Subtract> {
     static FUNCTION: OnceLock<Option<Subtract>> = OnceLock::new();
     *FUNCTION.get_or_init(|| {
         // Resolve the macOS 13 API at runtime so earlier macOS can still load the app.
+        // SAFETY: `RTLD_DEFAULT` is a valid pseudo-handle that searches the global
+        // symbol scope, and the name is a `'static`, NUL-terminated C string literal,
+        // which is the one precondition `dlsym` places on it. A missing symbol is a
+        // normal answer reported as null and handled by the check just below.
         let symbol = unsafe {
             libc::dlsym(
                 libc::RTLD_DEFAULT,
@@ -42,6 +46,10 @@ fn subtract_path() -> Option<Subtract> {
         };
         (!symbol.is_null()).then(|| {
             // CoreGraphics exports this function with the signature in CGPath.h.
+            // SAFETY: the non-null `symbol` resolves the `CGPathCreateCopyBySubtractingPath`
+            // symbol, whose declaration is `CGPathRef (CGPathRef, CGPathRef, bool)`.
+            // `Subtract` has that exact ABI, so calls through this pointer use the
+            // real function's signature and calling convention.
             unsafe { std::mem::transmute::<*mut libc::c_void, Subtract>(symbol) }
         })
     })
@@ -74,11 +82,27 @@ pub(super) fn add_child<R: Runtime>(
                 }
                 let mtm = MainThreadMarker::new().ok_or("浏览器配置必须在主线程创建")?;
                 // WebKit configurations and data stores are confined to the AppKit thread.
+                // SAFETY: `WKWebViewConfiguration` is `MainThreadOnly`, and `mtm` is a
+                // `MainThreadMarker`, which can only be obtained on the AppKit main
+                // thread — the thread this closure is running on. `new` is in the `new`
+                // method family, so the returned object is +1 and owned by `Retained`.
                 let configuration = unsafe { WKWebViewConfiguration::new(mtm) };
                 STORES.with_borrow_mut(|stores| {
+                    // SAFETY: `WKWebsiteDataStore` is `MainThreadOnly` and `mtm`, still
+                    // live here, proves this is the AppKit thread. The class method
+                    // returns a fresh store whose +1 reference the `Retained` inside the
+                    // map takes ownership of, and `entry(..).or_insert_with` keeps it
+                    // alive for as long as the store is reachable from this thread.
                     let store = stores.entry(storage).or_insert_with(|| unsafe {
                         WKWebsiteDataStore::nonPersistentDataStore(mtm)
                     });
+                    // SAFETY: `configuration` is a live configuration that `Retained`
+                    // keeps alive and that has not been handed to a web view yet, and
+                    // `store` is a live data store owned by the thread-local map for the
+                    // rest of the AppKit thread's lifetime. The `websiteDataStore`
+                    // property is `strong`, so WebKit retains the store, and writing it
+                    // here precedes `with_webview_configuration` consuming the
+                    // configuration, which is the only ordering WebKit permits.
                     unsafe { configuration.setWebsiteDataStore(store) };
                 });
                 window
@@ -108,6 +132,11 @@ impl Visibility {
             Self::Full => true,
             Self::Partial(path) => {
                 // A null transform tests the same local path used by the layer mask.
+                // SAFETY: `path` is a `CFRetained<CGPath>` held by this variant, so the
+                // path outlives the call; `contains_point` only reads it. The transform
+                // argument is null, which the binding documents as the valid "no
+                // transform" form, so the point is tested in the path's own coordinate
+                // space — the same space the caller converted `point` into.
                 unsafe { CGPath::contains_point(Some(path), ptr::null(), point, false) }
             }
             Self::Covered => false,
@@ -139,12 +168,23 @@ define_class!(
 impl BrowserHost {
     fn clipped_hit(&self, point: NSPoint) -> Option<Retained<NSView>> {
         // AppKit calls hitTest on the main thread while traversing a live parent.
+        // SAFETY: `superview` is declared `unsafe_unretained`, so it does not return a
+        // +1 reference; the `Retained` wrapper this binding returns assumes the parent
+        // outlives the borrow. AppKit guarantees that while a view is attached its
+        // superview stays alive, and `self` is a view AppKit is currently traversing
+        // for this hit test, so the parent is live for the duration of this call.
         let parent = unsafe { self.superview() }?;
         let local = self.convertPoint_fromView(point, Some(&parent));
         if !self.ivars().visibility.borrow().contains(local) {
             return None;
         }
         // An empty or hidden child must not leave the host blocking the canvas.
+        // SAFETY: the receiver is `super(self)`, i.e. the live `NSView` base of this
+        // very object, and `hitTest:` is a message `NSView` itself implements, so the
+        // selector resolves on that receiver. It is not in a recognized method family,
+        // so `msg_send!` treats the returned view as autoreleased and retains it via
+        // `Retained::retain_autoreleased`, which is what keeps the result alive after
+        // AppKit's autorelease pool drains. `point` is a plain `NSPoint` value.
         let hit: Option<Retained<NSView>> = unsafe { msg_send![super(self), hitTest: point] };
         hit.filter(|view| !ptr::eq::<NSView>(&**view, self.as_super()))
     }
@@ -163,6 +203,12 @@ impl BrowserHost {
             observer: RefCell::default(),
         });
         // Initialize an ordinary NSView with the old child's frame and z order.
+        // SAFETY: `alloc` is the uninitialized instance returned by `Self::alloc(mtm)`,
+        // so it is a valid, owned receiver of this exact class and the `initWithFrame:`
+        // message is the designated initializer the class declares. `frame` is a plain
+        // `NSRect` value, and as a method in the `init` family the call consumes `alloc`
+        // and hands back a +1 initialized instance that `Retained` owns, so the object
+        // is initialized exactly once.
         let host: Retained<Self> = unsafe { msg_send![super(alloc), initWithFrame: frame] };
         host.setWantsLayer(true);
         host.setAutoresizingMask(if parent.isFlipped() {
@@ -182,6 +228,11 @@ impl BrowserHost {
 
     fn place(&self, child: &NSView, layout: &BrowserLayout, subtract: Subtract) {
         // The host is attached to the live content view by present().
+        // SAFETY: `superview` is `unsafe_unretained`, so the returned `Retained` relies
+        // on the parent outliving the borrow rather than on a +1 return. `present()`
+        // only calls `place` on a host it has already added to a live parent view, and
+        // detaching the host takes it out of that hierarchy, so the parent is alive
+        // here. The borrow is confined to this function and reads only geometry.
         let Some(parent) = (unsafe { self.superview() }) else {
             return;
         };
@@ -217,6 +268,11 @@ impl BrowserHost {
             (Visibility::Full, layer) => {
                 if let Some(layer) = layer {
                     // This host owns the mask and it was never added as a sublayer.
+                    // SAFETY: `setMask:` is `unsafe` because CALayer requires the new
+                    // mask to have a nil superlayer; passing `None` installs the null
+                    // mask, which carries no such precondition. `layer` is the host's
+                    // own live backing layer, returned by `self.layer()`, and clearing
+                    // its mask only drops the mask this host had installed.
                     unsafe { layer.setMask(None) };
                 }
                 true
@@ -229,6 +285,12 @@ impl BrowserHost {
                 }
                 mask.setPath(Some(path));
                 // The shape layer is used exclusively as this host's mask.
+                // SAFETY: `layer` is this host's own live backing layer, and `mask` is
+                // the `CAShapeLayer` owned by the host's ivars, which is never added to
+                // any layer hierarchy — so its superlayer is nil, the precondition
+                // `setMask:` requires of a new mask. `mask` outlives `layer`, because
+                // the ivar is kept alive by the host that owns the layer, and `path`
+                // was written to the mask just above so its shape is current.
                 unsafe { layer.setMask(Some(mask)) };
                 true
             }
@@ -261,7 +323,19 @@ pub(super) fn present<R: Runtime>(
                 return;
             };
             // Tauri supplies a live WKWebView on the AppKit thread for this callback.
+            // SAFETY: `platform.inner()` is the `WKWebView *` Tauri hands to
+            // `with_webview` for this live webview, and the callback runs on the main
+            // thread, where WebKit requires that object to be touched. The raw pointer
+            // is non-null and points at an object Tauri keeps alive for the duration of
+            // the callback, so reborrowing it as `&WKWebView` for that same duration
+            // cannot dangle; the reference is never used to mutate through a shared
+            // alias.
             let child: &WKWebView = unsafe { &*platform.inner().cast() };
+            // SAFETY: `child` is the live web view reborrowed just above, and
+            // `superview` is `unsafe_unretained`, so the returned `Retained` assumes
+            // the parent outlives the borrow. Tauri has already added the web view to
+            // its window's view hierarchy by the time it invokes this callback, so the
+            // parent exists and stays alive while the callback runs.
             let Some(parent) = (unsafe { child.superview() }) else {
                 return;
             };
@@ -304,7 +378,18 @@ pub(super) fn present<R: Runtime>(
 pub(super) fn detach<R: Runtime>(webview: &Webview<R>) {
     let _ = webview.with_webview(|platform| {
         // This callback runs before Wry closes and releases its child view.
+        // SAFETY: as in `present`, `platform.inner()` is the live `WKWebView *` Tauri
+        // passes to `with_webview`, and this callback runs on the main thread before
+        // Wry tears the view down, so the object is still alive and may be reborrowed
+        // as `&WKWebView` for the duration of the callback.
         let child: &WKWebView = unsafe { &*platform.inner().cast() };
+        // SAFETY: `child` is the same live web view reborrowed above. `superview` is
+        // `unsafe_unretained`, so the `Retained` wrapper assumes the parent outlives the
+        // borrow; Tauri runs this callback while the web view is still installed in its
+        // window, and this callback only removes the host that Tauri attached, so the
+        // parent is live for the borrow. The borrow does not outlive the closure, and
+        // `downcast` re-checks the concrete class before the parent is treated as a
+        // `BrowserHost`.
         if let Some(parent) = unsafe { child.superview() }
             && let Ok(host) = parent.downcast::<BrowserHost>()
         {
@@ -331,12 +416,20 @@ fn clip_path(clip: BrowserClip, viewport: BrowserBounds) -> CFRetained<CGPath> {
         .min(rect.size.width / 2.)
         .min(rect.size.height / 2.);
     // CoreGraphics takes a null transform for points in the supplied coordinate space.
-    unsafe {
-        if radius > 0. {
-            CGPath::with_rounded_rect(rect, radius, radius, ptr::null())
-        } else {
-            CGPath::with_rect(rect, ptr::null())
-        }
+    if radius > 0. {
+        // SAFETY: the transform argument is null, which the binding documents as the
+        // valid "no transform" form, so no `CGAffineTransform` is read through it.
+        // `rect` is a plain value argument and `radius` was clamped above to at most
+        // half the rect's width and height, so the two corner axes stay within the
+        // rounded rect CoreGraphics constructs for that rect. The function follows the
+        // Create rule, so the returned `CFRetained` takes ownership of its +1 reference.
+        unsafe { CGPath::with_rounded_rect(rect, radius, radius, ptr::null()) }
+    } else {
+        // SAFETY: here too the transform argument is the valid null form, so no
+        // `CGAffineTransform` is read through it. `rect` is a plain value argument, and
+        // the result follows the Create rule, so the returned `CFRetained` takes
+        // ownership of its +1 reference.
+        unsafe { CGPath::with_rect(rect, ptr::null()) }
     }
 }
 
@@ -375,10 +468,21 @@ fn visible_path(layout: &BrowserLayout, subtract: Subtract, include_visual: bool
         let cut = clip_path(cover, viewport);
         // The Create Rule transfers one reference to the result. Repeated
         // subtraction handles overlapping covers without exposing their overlap.
+        // SAFETY: `subtract` resolved to `CGPathCreateCopyBySubtractingPath` and this
+        // call only happens on macOS versions where that symbol exists, since
+        // `subtract_path` is the sole source of the pointer. Both `path` and `cut` are
+        // live `CFRetained<CGPath>` values that outlive the call, matching the
+        // function's `CGPathRef` parameters, and the false flag selects the documented
+        // non-even-odd fill rule. The function only reads its arguments.
         let result = unsafe { subtract(&*path, &*cut, false) };
         let Some(result) = NonNull::new(result) else {
             return Visibility::Covered;
         };
+        // SAFETY: the non-null `result` came from `CGPathCreateCopyBySubtractingPath`,
+        // which follows the Create rule, so it already carries the +1 reference that
+        // `CFRetained::from_raw` takes ownership of. It was not retained or released
+        // in between, and the old `path` is dropped by this assignment while its own
+        // reference is still accounted for, so neither path is double-freed.
         path = unsafe { CFRetained::from_raw(result) };
         if CGPath::is_empty(Some(&path)) {
             return Visibility::Covered;

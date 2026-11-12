@@ -4,10 +4,9 @@ use crate::{
     anim,
     anim::{FISH_SWIM, menu_in, modal_in, pending_dot},
     bridge,
-    commands::{CommandSpec, command_catalog, visible_commands},
+    commands::{CommandCatalog, CommandSpec, canonical_host_command, visible_commands},
     files::{
         FileListing, FileToken, WorkspaceFile, active_file_token, file_mention, replace_token,
-        utf16_byte_index,
     },
     markdown::{Block, InlinePart, code_spans, inline_parts, parse_markdown},
     right_dock::{
@@ -17,7 +16,7 @@ use crate::{
         PendingInteraction, SessionActivity, SessionIndicator, SessionSummary, merge_session_page,
         short_session_title,
     },
-    state::{ChatEntry, EntryRole, apply_update},
+    state::{ChatEntry, EntryRole, apply_update, prompt_failure_message},
     tokens::{dsh, elevation_prominent, elevation_soft},
     welcome::{Welcome, WelcomeEvent},
 };
@@ -50,6 +49,7 @@ struct Host {
     _html_focus_listener: Closure<dyn FnMut(String, u32)>,
     _transparency_listener: Closure<dyn FnMut()>,
     _motion_listener: Closure<dyn FnMut(bool)>,
+    _runtime_error_listener: Closure<dyn FnMut(String)>,
 }
 
 thread_local! {
@@ -169,6 +169,15 @@ pub fn start() {
         let motion_listener = Closure::<dyn FnMut(bool)>::new(|reduce| {
             with_host(|host| host.app.update(|cx| cx.set_reduce_motion(reduce)));
         });
+        let runtime_error_listener = Closure::<dyn FnMut(String)>::new(|message: String| {
+            with_host(|host| {
+                host.app.update(|cx| {
+                    let _ = host.window.update(cx, |app, _, cx| {
+                        app.push_toast(message.clone(), cx);
+                    });
+                });
+            });
+        });
         HOST.set(Some(Host {
             app: cx.to_async(),
             window,
@@ -180,6 +189,7 @@ pub fn start() {
             _html_focus_listener: html_focus_listener,
             _transparency_listener: transparency_listener,
             _motion_listener: motion_listener,
+            _runtime_error_listener: runtime_error_listener,
         }));
         with_host(|host| {
             bridge::listen_keys(host._key_listener.as_ref().unchecked_ref());
@@ -189,6 +199,7 @@ pub fn start() {
                 host._browser_selection_listener.as_ref().unchecked_ref(),
             );
             document_html::listen_focus(host._html_focus_listener.as_ref().unchecked_ref());
+            bridge::listen_runtime_error(host._runtime_error_listener.as_ref().unchecked_ref());
             bridge::watch_reduced_motion(host._motion_listener.as_ref().unchecked_ref());
             if bridge::has_mac_window_material() {
                 bridge::watch_transparency(host._transparency_listener.as_ref().unchecked_ref());
@@ -487,6 +498,12 @@ pub(crate) struct QueuedPrompt {
     pub(crate) prompt: Vec<Value>,
 }
 
+/// 一次会话指令提交：成功后才清理对应草稿与附件。
+pub(super) struct CommandSubmission {
+    draft: String,
+    attachment_ids: Vec<String>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AttachmentKind {
     Image,
@@ -522,21 +539,11 @@ impl TurnEnd {
 #[derive(Clone, Copy)]
 pub(crate) struct TurnSummary {
     pub(crate) end: TurnEnd,
+    /// 官方页脚不显示耗时；保留读数供统计与无障碍描述使用。
+    #[allow(dead_code)]
     pub(crate) seconds: f32,
     /// 本轮新增的上下文消耗（token 数；usage 无数据时为 None）。
     pub(crate) used: Option<u64>,
-}
-
-/// 把轮次时长格式化为官方风格的短文本。
-pub(crate) fn turn_duration_text(seconds: f32) -> String {
-    let total = seconds.round().max(0.) as u32;
-    if total < 60 {
-        format!("{total} 秒")
-    } else if total < 3600 {
-        format!("{} 分 {} 秒", total / 60, total % 60)
-    } else {
-        format!("{} 小时 {} 分", total / 3600, total % 3600 / 60)
-    }
 }
 
 #[derive(Clone)]
@@ -627,6 +634,8 @@ pub(crate) struct DshApp {
     session_row_more_focus: HashMap<String, gpui::FocusHandle>,
     session_title_focus: gpui::FocusHandle,
     pub(crate) collapsed_workspaces: std::collections::HashSet<String>,
+    /// 官方水位线：每个 Workspace 当前显示的 Session 行数（初始 5，不持久化）。
+    pub(crate) workspace_watermarks: HashMap<String, usize>,
     pub(crate) hidden_workspaces: std::collections::HashSet<String>,
     added_workspaces: Vec<String>,
     workspace_picker_pending: bool,
@@ -680,13 +689,24 @@ pub(crate) struct DshApp {
     pub(crate) command_filter: String,
     pub(crate) command_from_slash: bool,
     pub(crate) command_selected: usize,
+    pub(crate) command_catalog: CommandCatalog,
     pub(crate) model_filter_editor: gpui::Entity<Editor>,
     model_menu: model_menu::ModelMenu,
     permission_menu: permission_picker::PermissionMenu,
     command_picker: command_picker::CommandPicker,
-    pub(crate) seeking_shimmer: gpui::Entity<kui::components::text_shimmer::TextShimmer>,
+    /// Official RunningStatus activity label ("深度求索中，用时 Xs···").
+    ///
+    /// Uses the local `LiveShimmer` for the same reason as `process_shimmer`:
+    /// the elapsed-seconds clock rewrites this text once per second, and KUI's
+    /// component would replay a fade-in each time.
+    pub(crate) seeking_shimmer: gpui::Entity<live_shimmer::LiveShimmer>,
     /// Official ChatGroupSeat live process title shimmer (`TextShimmer active={!closed}`).
-    pub(crate) process_shimmer: gpui::Entity<kui::components::text_shimmer::TextShimmer>,
+    ///
+    /// This is the local `LiveShimmer` rather than KUI's `TextShimmer`: the live
+    /// title embeds streaming reasoning text that changes almost every frame,
+    /// and KUI's component replays a fade-in per text change, which never
+    /// completes and leaves the row flickering.
+    pub(crate) process_shimmer: gpui::Entity<live_shimmer::LiveShimmer>,
     pub(crate) last_escape: Option<f64>,
     suppress_file_trigger: bool,
     sessions_loading: bool,
@@ -871,15 +891,18 @@ impl DshApp {
                 }
             },
         );
-        // 官方“深度求索中”标签：kui TextShimmer 1.5s 移动高光。
+        // 官方“深度求索中”标签：与官方 TextShimmer 同参数的移动高光，
+        // 但用本地组件，使每秒跳动的用时不会重启动画。
         let seeking_shimmer = cx.new(|cx| {
-            kui::components::text_shimmer::TextShimmer::new("深度求索中···", cx)
+            live_shimmer::LiveShimmer::new("深度求索中···", cx)
                 .with_duration(std::time::Duration::from_millis(1500))
                 .with_font_size(12.)
         });
         // Official process header title: same shimmer while the group is live.
+        // Uses the local component so a continuously growing title keeps one
+        // uninterrupted sweep instead of restarting a fade on every change.
         let process_shimmer = cx.new(|cx| {
-            kui::components::text_shimmer::TextShimmer::new("正在分析请求", cx)
+            live_shimmer::LiveShimmer::new("正在分析请求", cx)
                 .with_duration(std::time::Duration::from_millis(1500))
                 .with_font_size(13.)
         });
@@ -980,6 +1003,7 @@ impl DshApp {
             session_row_more_focus: HashMap::new(),
             session_title_focus: cx.focus_handle(),
             collapsed_workspaces: std::collections::HashSet::new(),
+            workspace_watermarks: HashMap::new(),
             hidden_workspaces: std::collections::HashSet::new(),
             added_workspaces: Vec::new(),
             workspace_picker_pending: false,
@@ -1032,6 +1056,7 @@ impl DshApp {
             command_filter: String::new(),
             command_from_slash: false,
             command_selected: 0,
+            command_catalog: CommandCatalog::default(),
             model_filter_editor,
             model_menu: model_menu::ModelMenu::new(w, cx),
             permission_menu: permission_picker::PermissionMenu::new(cx),
@@ -1113,6 +1138,7 @@ impl DshApp {
         cx: &mut Context<Self>,
     ) {
         if self.active_session.as_deref() != Some(session.id.as_str()) {
+            self.command_catalog.clear();
             let next = self
                 .parked_conversations
                 .remove(&session.id)
@@ -1588,8 +1614,17 @@ impl DshApp {
             return;
         }
         if self.archived_sessions.contains(&session.id) {
+            // 官方：已归档结果不清空查询、不导航。
             self.push_toast("已归档对话暂时无法查看，请取消归档后查看", cx);
             return;
+        }
+        // 官方：选择未归档搜索结果会清空并收起搜索、打开会话，
+        // 分组浏览还按需展开其所属 Workspace。
+        if self.search_expanded {
+            self.close_workspace_search(w, cx);
+        }
+        if self.workspace_group_by != WorkspaceGroupBy::Flat {
+            self.collapsed_workspaces.remove(&session.cwd);
         }
         if self.sidebar_drawer && self.narrow_sidebar_expanded {
             self.set_left_sidebar_collapsed(true, w, cx);
@@ -1722,6 +1757,7 @@ impl DshApp {
             self.request_permission_mode();
             invoke("plan_mode", json!({"sessionId": id}));
             invoke("question_state", json!({"sessionId": id}));
+            invoke("session_commands", json!({"sessionId": id}));
         }
         self.conversation.resumed_session = resumed;
         self.conversation.config_options = reply
@@ -2057,7 +2093,10 @@ impl DshApp {
 
     /// Enter 提交入口：空闲即发送；生成中按官方行为排队。
     fn submit_prompt(&mut self, w: &mut Window, cx: &mut Context<Self>) {
-        if self.conversation.permission_mode.changing() || self.confirm_permission.is_some() {
+        if self.conversation.permission_mode.changing()
+            || self.confirm_permission.is_some()
+            || self.conversation.command_busy
+        {
             return;
         }
         let command = match self.composer.read(cx).value() {
@@ -2070,7 +2109,10 @@ impl DshApp {
             cx.notify();
             return;
         }
-        if self.submit_feedback_command(w, cx) || self.submit_plan_command(w, cx) {
+        if self.submit_feedback_command(w, cx)
+            || self.submit_plan_command(w, cx)
+            || self.submit_host_command(w, cx)
+        {
             return;
         }
         if self.conversation.running {
@@ -2078,6 +2120,138 @@ impl DshApp {
         } else {
             self.send_prompt(w, cx);
         }
+    }
+
+    /// 把 `/goal`、`/compact` 及中文别名交给会话的 ACP 命令目录执行。
+    /// `/plan` 由 `submit_plan_command` 处理，因为它还要提交可选的后续消息。
+    fn submit_host_command(&mut self, w: &mut Window, cx: &mut Context<Self>) -> bool {
+        let draft = self.composer.read(cx).value().to_owned();
+        let Some((name, line)) = canonical_host_command(&draft) else {
+            return false;
+        };
+        if name == "plan" {
+            return false;
+        }
+        if !self.command_catalog.supports(&name) {
+            self.conversation.error = Some("当前会话暂不支持该指令。".to_owned());
+            cx.notify();
+            return true;
+        }
+        let attachment_ids = self
+            .conversation
+            .draft_attachments
+            .iter()
+            .map(|item| item.id.clone())
+            .collect();
+        self.run_host_command(
+            line,
+            Some(CommandSubmission {
+                draft,
+                attachment_ids,
+            }),
+            w,
+            cx,
+        );
+        true
+    }
+
+    /// 执行无输入命令（菜单里的 `/compact`）或已经带齐参数的命令。
+    /// 命令未成功前保留草稿和附件，与 Harness 的 admission 行为一致。
+    pub(super) fn run_host_command(
+        &mut self,
+        line: String,
+        submission: Option<CommandSubmission>,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.active_session.clone() else {
+            self.error = Some("请先打开会话再执行指令。".to_owned());
+            cx.notify();
+            return;
+        };
+        if !self.connected() || !self.conversation.acp_open {
+            self.conversation.error = Some("会话尚未连接，指令未执行。".to_owned());
+            cx.notify();
+            return;
+        }
+        if self.conversation.command_busy {
+            return;
+        }
+        let name = line
+            .trim_start_matches('/')
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        let accepts_attachments = self.command_catalog.accepts_attachments(&name);
+        let attachments = if submission.is_some() {
+            match command_attachment_payload(
+                &self.conversation.draft_attachments,
+                accepts_attachments,
+            ) {
+                Ok(attachments) => attachments,
+                Err(error) => {
+                    self.conversation.error = Some(error);
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        self.conversation.command_busy = true;
+        self.conversation.error = None;
+        self.composer_menu = None;
+        cx.notify();
+        let args = json!({
+            "sessionId": session,
+            "line": line,
+            "attachments": attachments,
+        });
+        cx.spawn_in(w, async move |this, cx| {
+            let result = bridge::invoke("execute_session_command", args).await;
+            let _ = this.update_in(cx, |this, w, cx| {
+                let selected = this.active_session.as_deref() == Some(session.as_str());
+                let Some(conversation) = this.conversation_mut(&session) else {
+                    return;
+                };
+                conversation.command_busy = false;
+                match result {
+                    // The command card comes from the session event stream, so the
+                    // RPC reply only has to settle the pending state.
+                    Ok(_reply) => {
+                        conversation.error = None;
+                        if let Some(CommandSubmission {
+                            ref draft,
+                            ref attachment_ids,
+                        }) = submission
+                        {
+                            conversation
+                                .draft_attachments
+                                .retain(|item| !attachment_ids.contains(&item.id));
+                            if !selected && conversation.draft == *draft {
+                                conversation.draft.clear();
+                            }
+                        }
+                        if selected
+                            && submission
+                                .as_ref()
+                                .is_some_and(|item| this.composer.read(cx).value() == item.draft)
+                        {
+                            this.replace_composer_without_trigger("", w, cx);
+                        }
+                        // The result is not toasted: the bridge forwards the
+                        // session's `command/run` + `command/done` events, and the
+                        // transcript renders them as a command card (official
+                        // GenericCommandCard). A toast would float the same text
+                        // over the composer and vanish after 4s.
+                    }
+                    Err(error) => conversation.error = Some(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn queue_prompt(&mut self, w: &mut Window, cx: &mut Context<Self>) {
@@ -2246,7 +2420,7 @@ impl DshApp {
                     }
                 }
                 if let Some(conversation) = self.conversation_mut(session) {
-                    conversation.error = Some(format!("发送失败：{error}。草稿已保留，请重试。"));
+                    conversation.error = Some(prompt_failure_message(&error));
                 }
                 TurnEnd::Failed
             }
@@ -2254,14 +2428,10 @@ impl DshApp {
         self.finish_session_turn(session, end, cx);
     }
 
-    pub(crate) fn pick_attachments(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn pick_attachments(&mut self, accept: &'static str, cx: &mut Context<Self>) {
         let owner = self.active_session.clone();
-        cx.spawn(async move |this, cx| {
-            match bridge::pick_files(
-                "image/*,.pdf,.txt,.md,.json,.csv,.zip,.png,.jpg,.jpeg,.gif,.webp",
-            )
-            .await
-            {
+        cx.spawn(
+            async move |this, cx| match bridge::pick_files(accept).await {
                 Ok(raw) => {
                     let Ok(items) = serde_json::from_str::<Vec<Value>>(&raw) else {
                         return;
@@ -2285,8 +2455,8 @@ impl DshApp {
                         cx.notify();
                     });
                 }
-            }
-        })
+            },
+        )
         .detach();
     }
 
@@ -2468,7 +2638,7 @@ impl DshApp {
             },
             "peek_session_titles" => match result {
                 Ok(reply) => self.apply_session_titles(&reply),
-                Err(_) => {}
+                Err(error) => self.error = Some(format!("会话标题加载失败：{error}")),
             },
             "load_workspace_preferences" => match result {
                 Ok(reply) => self.apply_workspace_preferences(reply, cx),
@@ -2540,7 +2710,32 @@ impl DshApp {
                         result.ok().and_then(|value| value["active"].as_bool());
                 }
             }
+            "session_commands" => {
+                if owner == self.active_session.as_deref() {
+                    match result {
+                        Ok(reply) => self.command_catalog.replace(&reply),
+                        Err(_) => self.command_catalog.clear(),
+                    }
+                }
+            }
             "permission_mode" => self.finish_permission_mode(owner, result, w, cx),
+            // A cold resume has no projection stream yet: the bridge returns the
+            // same `rows` shape as its `continued` event, so rebuild the pending
+            // question panels from the reply instead of dropping it.
+            "question_state" => match result {
+                Ok(reply) => {
+                    if let (Some(session), Some(rows)) = (owner, reply.as_array()) {
+                        self.apply_question_state(session, rows, w, cx);
+                    }
+                }
+                Err(error) => {
+                    if let Some(conversation) =
+                        owner.and_then(|session| self.conversation_mut(session))
+                    {
+                        conversation.error = Some(format!("待回答问题恢复失败：{error}"));
+                    }
+                }
+            },
             "cancel_session" | "respond_permission" => {
                 if let Err(error) = result
                     && let Some(conversation) =
@@ -2561,7 +2756,26 @@ impl DshApp {
                     self.error = Some(error);
                 }
             }
-            _ => {}
+            // Fire-and-forget commands still owe the user an error when the host
+            // fails. Previously these fell through to `_ => {}` and silently
+            // discarded both success and failure, leaving the UI out of sync
+            // (notably `close_session`, which removes its row optimistically).
+            "close_session"
+            | "configure_shell_window"
+            | "focus_browser_shell"
+            | "show_document_copy_menu"
+            | "close_shortcut_window"
+            | "start_window_dragging" => {
+                if let Err(error) = result {
+                    self.push_toast(error, cx);
+                }
+            }
+            // Keep future commands honest: never swallow an error silently.
+            _ => {
+                if let Err(error) = result {
+                    self.push_toast(error, cx);
+                }
+            }
         }
         cx.notify();
     }
@@ -3235,6 +3449,7 @@ mod floating_panes;
 mod flow_motion;
 mod flow_scroll;
 mod header_chrome;
+mod live_shimmer;
 mod menu_groups;
 mod menu_surface;
 mod message_feedback;
@@ -3449,6 +3664,40 @@ fn build_prompt_payload(text: &str, attachments: &[DraftAttachment]) -> (String,
         blocks.push(json!({"type": "text", "text": ""}));
     }
     (display_lines.join("\n"), blocks)
+}
+
+/// 把草稿图片转换成 `commands.execute` 的 `CommandSubmitAttachment`。
+/// KWork 的通用文件附件仍是草稿轨里的本地提示，未上传成 receipt，不能伪造。
+fn command_attachment_payload(
+    items: &[DraftAttachment],
+    accepts_attachments: bool,
+) -> Result<Vec<Value>, String> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !accepts_attachments {
+        return Err("该指令不支持附件；草稿已保留。".to_owned());
+    }
+    let mut attachments = Vec::with_capacity(items.len());
+    for item in items {
+        match item.kind {
+            AttachmentKind::File => {
+                return Err("文件附件暂不支持该指令；草稿已保留。".to_owned());
+            }
+            AttachmentKind::Image => {
+                let Some((mime, data)) = image_block_from_attachment(item) else {
+                    return Err("图片尚未就绪；草稿已保留。".to_owned());
+                };
+                attachments.push(json!({
+                    "type": "image",
+                    "mediaType": mime,
+                    "data": data,
+                    "name": item.name,
+                }));
+            }
+        }
+    }
+    Ok(attachments)
 }
 
 fn image_block_from_attachment(item: &DraftAttachment) -> Option<(String, String)> {

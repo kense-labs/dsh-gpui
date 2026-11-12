@@ -42,6 +42,8 @@ pub(super) struct PendingQuestions {
     stage: Stage,
     clock: Option<Clock>,
     busy: Option<Decision>,
+    /// 官方：超时放行 agent 后卡片仍可回答，不用 busy 锁住控件。
+    timed_out: bool,
     error: Option<String>,
 }
 
@@ -120,6 +122,7 @@ impl PendingQuestions {
                     deadline: bridge::monotonic_ms() + remaining.max(0.),
                 }),
             busy: None,
+            timed_out: false,
             error: None,
         })
     }
@@ -273,6 +276,44 @@ impl DshApp {
         cx.notify();
     }
 
+    /// Rehydrate the pending questions after a cold resume.
+    ///
+    /// `question_state` returns the bridge's `rows` projection directly, without
+    /// the `settled` / `queued` snapshots carried by the `continued` event. Keep
+    /// those snapshots intact and only reconcile the live panels here.
+    pub(super) fn apply_question_state(
+        &mut self,
+        session: &str,
+        rows: &[Value],
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ids: HashSet<&str> = rows
+            .iter()
+            .filter_map(|row| row["callId"].as_str())
+            .collect();
+        if let Some(conversation) = self.conversation_mut(session) {
+            conversation
+                .questions
+                .retain(|panel| panel.stage != Stage::Continued || ids.contains(panel.id.as_str()));
+        }
+        for row in rows {
+            let Some(id) = row["callId"].as_str() else {
+                continue;
+            };
+            if self.question_mut(session, id).is_some() {
+                continue;
+            }
+            let Some(panel) = PendingQuestions::new(session, id, row, Stage::Continued, w, cx)
+            else {
+                continue;
+            };
+            if let Some(conversation) = self.conversation_mut(session) {
+                conversation.questions.push(panel);
+            }
+        }
+    }
+
     fn tick_question(
         &mut self,
         session: String,
@@ -350,7 +391,13 @@ impl DshApp {
                 .map(|(draft, question)| draft.payload(question))
                 .collect::<Vec<_>>()
         });
-        panel.busy = Some(decision);
+        // 官方：到期放行 agent，但卡片保持可用，用户仍可提交答案。
+        if decision == Decision::Timeout {
+            panel.timed_out = true;
+            panel.clock = None;
+        } else {
+            panel.busy = Some(decision);
+        }
         panel.error = None;
         let (session, id) = (session.to_owned(), id.to_owned());
         let args = json!({
@@ -374,7 +421,9 @@ impl DshApp {
                 else {
                     return;
                 };
-                if panel.stage != stage || panel.busy != Some(decision) {
+                if panel.stage != stage
+                    || (decision != Decision::Timeout && panel.busy != Some(decision))
+                {
                     return;
                 }
                 match result {
@@ -824,6 +873,9 @@ impl DshApp {
         let compact = f32::from(w.viewport_size().width) <= 720.;
         let last = index + 1 == panel.questions.len();
         let (status, take_time) = match (panel.stage, panel.clock) {
+            (_, _) if panel.timed_out && panel.stage != Stage::Review => {
+                ("已超时，工作继续，你仍可回答".to_owned(), false)
+            }
             (Stage::Review, _) => ("已回答".to_owned(), false),
             (Stage::Continued | Stage::Continuing, _) => ("已继续工作，仍可回答".to_owned(), false),
             (_, Some(Clock::Held)) => ("会一直等你回答".to_owned(), false),

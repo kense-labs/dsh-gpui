@@ -1,8 +1,10 @@
 //! OpenAI-compatible provider configuration over the official Host adapter.
 
 use super::{permission_dialog::dialog_action, *};
-use gpui::{Entity, Focusable, Subscription};
+use gpui::{AnyElement, Entity, Focusable, Subscription};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize)]
 enum Protocol {
@@ -61,6 +63,56 @@ const PRESETS: &[Preset] = &[
         protocol: Protocol::Chat,
     },
 ];
+
+/// One provider's mark: local brand artwork, or a glyph when the brand is unknown.
+#[derive(Clone, Copy)]
+enum ProviderMark {
+    Logo(&'static [u8]),
+    Glyph(Glyph),
+}
+
+/// Resolve the mark for a configured provider (see `crate::provider_marks`).
+fn provider_mark(name: &str, base_url: &str) -> ProviderMark {
+    crate::provider_marks::provider_logo(name, base_url)
+        .map(ProviderMark::Logo)
+        .unwrap_or(ProviderMark::Glyph(Glyph::Globe))
+}
+
+/// Decoded provider marks, keyed by the static asset address.
+///
+/// `Image::from_bytes` decodes the PNG, so every frame would pay for it. The
+/// address of the `include_bytes!` slice is stable, which makes it a sound cache
+/// key without threading an index through the mapping.
+fn provider_image(data: &'static [u8]) -> Arc<gpui::Image> {
+    static CACHE: OnceLock<Mutex<HashMap<usize, Arc<gpui::Image>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = data.as_ptr() as usize;
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache
+        .entry(key)
+        .or_insert_with(|| {
+            Arc::new(gpui::Image::from_bytes(
+                gpui::ImageFormat::Png,
+                data.to_vec(),
+            ))
+        })
+        .clone()
+}
+
+fn provider_mark_element(mark: ProviderMark, cx: &mut Context<DshApp>) -> AnyElement {
+    match mark {
+        // `img()` keeps the artwork's own colors; `svg()` would rasterize it to
+        // an alpha mask and paint the whole mark in one tint.
+        ProviderMark::Logo(data) => gpui::img(provider_image(data))
+            .size(px(16.))
+            .flex_none()
+            .object_fit(gpui::ObjectFit::Contain)
+            .into_any_element(),
+        ProviderMark::Glyph(glyph) => icon(glyph, 15., dsh(cx).label_secondary).into_any_element(),
+    }
+}
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -477,7 +529,7 @@ impl DshApp {
             service_list = service_list.child(provider_row(
                 format!("model-provider-{id}"),
                 &provider.name,
-                Some(Glyph::Globe),
+                Some(provider_mark(&provider.name, &provider.base_url)),
                 selected,
                 busy,
                 cx,
@@ -500,7 +552,7 @@ impl DshApp {
             service_list = service_list.child(provider_row(
                 format!("provider-preset-{index}"),
                 preset.name,
-                Some(Glyph::Globe),
+                Some(provider_mark(preset.name, preset.url)),
                 state.preset == Some(index),
                 busy,
                 cx,
@@ -531,7 +583,7 @@ impl DshApp {
             .child(provider_row(
                 "add-model-provider".into(),
                 "添加服务商",
-                Some(Glyph::Plus),
+                Some(ProviderMark::Glyph(Glyph::Plus)),
                 state.selected.is_none() && state.preset.is_none(),
                 busy,
                 cx,
@@ -541,7 +593,7 @@ impl DshApp {
                 sidebar.child(provider_row(
                     "reload-model-providers".into(),
                     "重新加载",
-                    Some(Glyph::Redo),
+                    Some(ProviderMark::Glyph(Glyph::Redo)),
                     false,
                     busy,
                     cx,
@@ -554,7 +606,8 @@ impl DshApp {
         let p = dsh(cx);
         let state = &self.model_providers;
         let busy = state.busy.is_some();
-        let can_sync = !state.url.read(cx).value().trim().is_empty() && !busy;
+        let can_sync =
+            crate::validation::valid_provider_url(state.url.read(cx).value().trim()) && !busy;
         let model_query = state.model_search.read(cx).value().trim().to_lowercase();
         let model_matches = |model: &ProviderModel| {
             matches_query(
@@ -764,9 +817,36 @@ impl DshApp {
         } else {
             "API Key"
         };
-        let can_sync = !state.url.read(cx).value().trim().is_empty() && !busy;
+        let provider_name = state.name.read(cx).value().to_owned();
+        let provider_url = state.url.read(cx).value().to_owned();
+        // 官方：端点必须是可解析的 HTTP/HTTPS URL，语法错误阻止创建。
+        let url_valid = crate::validation::valid_provider_url(&provider_url);
+        let can_sync = url_valid && !busy;
         let can_save =
             can_sync && !state.models.is_empty() && !state.name.read(cx).value().trim().is_empty();
+        let heading = row().gap(px(8.)).items_center().flex_none();
+        let heading = if let Some(logo) =
+            crate::provider_marks::provider_logo(&provider_name, &provider_url)
+        {
+            heading.child(
+                gpui::img(provider_image(logo))
+                    .size(px(20.))
+                    .flex_none()
+                    .object_fit(gpui::ObjectFit::Contain),
+            )
+        } else {
+            heading
+        }
+        .child(
+            div()
+                .text_size(px(16.))
+                .font_weight(FontWeight::MEDIUM)
+                .child(if state.selected.is_some() || state.preset.is_some() {
+                    provider_name
+                } else {
+                    "添加 OpenAI 兼容服务商".to_owned()
+                }),
+        );
         let details = column()
             .id("provider-details")
             .w_full()
@@ -777,18 +857,20 @@ impl DshApp {
             .overflow_y_scroll()
             .pr(px(4.))
             .gap(px(14.))
-            .child(
-                div()
-                    .text_size(px(16.))
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(if state.selected.is_some() || state.preset.is_some() {
-                        state.name.read(cx).value().to_owned()
-                    } else {
-                        "添加 OpenAI 兼容服务商".to_owned()
-                    }),
-            )
+            .child(heading)
             .child(provider_field("服务商名称", input(&state.name, cx), cx))
             .child(provider_field("API 地址", input(&state.url, cx), cx))
+            .when(!url_valid && !provider_url.trim().is_empty(), |details| {
+                details.child(
+                    div()
+                        .id("provider-url-error")
+                        .role(gpui::Role::Alert)
+                        .text_size(px(12.))
+                        .line_height(px(18.))
+                        .text_color(p.danger)
+                        .child("请输入以 http:// 或 https:// 开头的有效地址"),
+                )
+            })
             .child(provider_field(
                 "接口协议",
                 row()
@@ -966,7 +1048,7 @@ fn matches_query(query: &str, values: &[&str]) -> bool {
 fn provider_row(
     id: String,
     label: &str,
-    glyph: Option<Glyph>,
+    mark: Option<ProviderMark>,
     selected: bool,
     disabled: bool,
     cx: &mut Context<DshApp>,
@@ -988,7 +1070,7 @@ fn provider_row(
         .tab_index(0)
         .tab_stop(!disabled)
         .when(selected, |button| button.bg(p.hover))
-        .children(glyph.map(|glyph| icon(glyph, 15., p.label_secondary)))
+        .children(mark.map(|mark| provider_mark_element(mark, cx)))
         .child(
             div()
                 .min_w_0()

@@ -698,6 +698,54 @@ pub(crate) async fn plan_mode(
 }
 
 #[tauri::command]
+pub(crate) async fn session_commands(
+    webview: tauri::Webview,
+    session_id: String,
+    service: State<'_, AcpService>,
+) -> Result<Value, String> {
+    if webview.label() != "main" || session_id.is_empty() {
+        return Err("command/unavailable".into());
+    }
+    let connection = connection(&service).await?;
+    if !connection.session_bridge {
+        return Err("当前服务不支持读取会话指令目录。".into());
+    }
+    connection
+        .request(
+            "_dsh/gpui/session/commands",
+            json!({"sessionId": session_id}),
+        )
+        .await
+}
+
+#[tauri::command]
+pub(crate) async fn execute_session_command(
+    webview: tauri::Webview,
+    session_id: String,
+    line: String,
+    attachments: Option<Value>,
+    service: State<'_, AcpService>,
+) -> Result<Value, String> {
+    if webview.label() != "main" || session_id.is_empty() {
+        return Err("command/unavailable".into());
+    }
+    let connection = connection(&service).await?;
+    if !connection.session_bridge {
+        return Err("当前服务不支持执行会话指令。".into());
+    }
+    connection
+        .request(
+            "_dsh/gpui/session/command-execute",
+            json!({
+                "sessionId": session_id,
+                "line": line,
+                "attachments": attachments.unwrap_or_else(|| json!([])),
+            }),
+        )
+        .await
+}
+
+#[tauri::command]
 pub(crate) async fn permission_mode(
     webview: tauri::Webview,
     session_id: String,
@@ -1181,7 +1229,7 @@ async fn connection(service: &AcpService) -> Result<Arc<AcpConnection>, String> 
 fn resolve_workspace(value: Option<&str>) -> Result<PathBuf, String> {
     let path = match value.map(str::trim).filter(|value| !value.is_empty()) {
         Some(value) => absolute_path(Path::new(value))?,
-        None => std::env::current_dir().map_err(|error| error.to_string())?,
+        None => default_workspace()?,
     };
     let canonical = path
         .canonicalize()
@@ -1190,6 +1238,45 @@ fn resolve_workspace(value: Option<&str>) -> Result<PathBuf, String> {
         return Err(format!("工作区不是目录：{}", canonical.display()));
     }
     Ok(canonical)
+}
+
+/// Harness starts a session from the workspace cwd, never from the process cwd.
+/// A GUI launch on macOS inherits `/` as the working directory, which used to
+/// make the `@` file browser list the entire filesystem root. Resolve a real
+/// workspace instead: an explicit override, the enclosing KWork checkout of
+/// this dev build, or the user's Documents/home directory.
+fn default_workspace() -> Result<PathBuf, String> {
+    let mut candidates = Vec::new();
+    if let Some(value) = std::env::var_os("KWORK_WORKSPACE") {
+        candidates.push(PathBuf::from(value));
+    }
+    if let Some(exe) = std::env::current_exe().ok() {
+        let mut dir = exe.parent().map(Path::to_path_buf);
+        for _ in 0..10 {
+            let Some(current) = dir else { break };
+            if current.join("Cargo.toml").is_file() && current.join("ui").is_dir() {
+                candidates.push(current.clone());
+                break;
+            }
+            dir = current.parent().map(Path::to_path_buf);
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        candidates.push(home.join("Documents"));
+        candidates.push(home);
+    }
+    if let Ok(cwd) = std::env::current_dir()
+        && cwd != Path::new("/")
+    {
+        candidates.push(cwd);
+    }
+    for candidate in candidates {
+        if candidate.is_absolute() && candidate.is_dir() {
+            return Ok(candidate);
+        }
+    }
+    Err("无法确定工作区目录，请在设置中指定工作区".to_owned())
 }
 
 /// Resolve a Node.js binary for spawning dsh-acp and the credential helper.

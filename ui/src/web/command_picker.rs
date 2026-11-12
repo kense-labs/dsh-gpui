@@ -184,8 +184,7 @@ impl DshApp {
                 }
             }
             Err(error) if picker_open => self.command_picker.model_error = Some(error),
-            Err(error) if selected => self.push_toast(error, cx),
-            Err(_) => {}
+            Err(error) => self.push_toast(error, cx),
         }
     }
 

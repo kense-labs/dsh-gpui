@@ -1124,6 +1124,7 @@ impl DshApp {
                     .bg(p.state_warn_tertiary)
                     .child(icon(Glyph::Alert, 14., p.state_warn_primary))
                     .child(note("请确认插件来源可信。插件在本机以你的权限运行，来源不明的插件可能读取或修改你的数据。", cx)))
+                .child(note("官方按需插件提供显式更新；其他插件通过卸载后重新安装升级。", cx))
                 .child(dialog_action("install-plugin-run",
                     if install.phase == Phase::Checking { "正在检查…" } else { "安装" },
                     true, !can_run, 0., cx, |app,w,cx| app.begin_plugin_install(false,w,cx)).w_full())

@@ -301,6 +301,14 @@ impl DshApp {
                 }
                 self.push_toast(error, cx);
             }
+            // A failed load leaves the official defaults in place; say so
+            // instead of presenting them as a successfully restored profile.
+            Err(error) => {
+                if let Some(draft) = self.shortcuts.draft.as_mut() {
+                    draft.error = Some(error.clone());
+                }
+                self.push_toast(format!("快捷键加载失败：{error}"), cx);
+            }
             _ => {}
         }
     }

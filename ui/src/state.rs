@@ -22,6 +22,29 @@ pub fn validate_api_key(value: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// ACP wraps every agent failure as JSON-RPC `-32603 Internal error`, so the
+/// client has to recover credential failures from the detail text. Without
+/// this, a user-fixable expired key is reported as an internal crash and the
+/// UI tells the user to retry something that can never succeed.
+pub fn is_auth_failure(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("authenticationfails")
+        || lower.contains("authentication fails")
+        || lower.contains("invalid api key")
+        || (lower.contains("api key") && lower.contains("invalid"))
+        || lower.contains("unauthorized")
+}
+
+/// Build the message shown when a prompt fails. The draft is always restored
+/// by the caller, so both variants can safely mention it.
+pub fn prompt_failure_message(error: &str) -> String {
+    if is_auth_failure(error) {
+        "API Key 已失效或未配置，请在「更多 → 设置 → API Key」更新密钥。草稿已保留。".to_owned()
+    } else {
+        format!("发送失败：{error}。草稿已保留，请重试。")
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EntryRole {
     User,
@@ -32,6 +55,8 @@ pub enum EntryRole {
     Plan,
     /// 官方 ModelRetryItem：模型请求重试行。
     Retry,
+    /// 官方 GenericCommandCard：斜杠指令的结果行（`command/run` + `command/done`）。
+    Command,
     System,
     Error,
 }
@@ -317,6 +342,62 @@ pub fn apply_update(entries: &mut Vec<ChatEntry>, update: &Value) -> UpdateEffec
                 });
             }
         }
+        // Host/ACP 扩展：斜杠指令结果行（官方 GenericCommandCard）。
+        // `command/run` 建立行，`command/done` 回填结果；用 commandId 配对。
+        Some("gpui_command_run" | "gpui_command_done") => {
+            let run = update["sessionUpdate"] == "gpui_command_run";
+            let id = string_field(update, "commandId");
+            if id.is_empty() {
+                return effect;
+            }
+            let name = string_field(update, "name");
+            let at_ms = update.get("time").and_then(Value::as_f64);
+            if let Some(entry) = entries.iter_mut().find(|entry| {
+                entry.role == EntryRole::Command
+                    && entry.external_id.as_deref() == Some(id.as_str())
+            }) {
+                if run {
+                    if !name.is_empty() {
+                        entry.title = name;
+                    }
+                    if let Some(args) = update.get("args").and_then(Value::as_str) {
+                        entry.input = args.to_owned();
+                    }
+                } else {
+                    // done：kind 决定成功/失败，text 是展开后的正文。
+                    entry.status = string_field(update, "kind");
+                    if let Some(text) = update.get("text").and_then(Value::as_str) {
+                        entry.text = text.to_owned();
+                    }
+                }
+                entry.at_ms = entry.at_ms.or(at_ms);
+            } else if run || !name.is_empty() {
+                // 历史窗口可能只有 done；官方同样按 done 建行。
+                entries.push(ChatEntry {
+                    key: format!("command-{id}"),
+                    external_id: Some(id),
+                    role: EntryRole::Command,
+                    title: name,
+                    text: update
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned(),
+                    input: update
+                        .get("args")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned(),
+                    status: if run {
+                        String::new()
+                    } else {
+                        string_field(update, "kind")
+                    },
+                    tool: None,
+                    at_ms,
+                });
+            }
+        }
         Some("config_option_update") => {
             effect.config_options = update
                 .get("configOptions")
@@ -421,6 +502,7 @@ fn role_name(role: EntryRole) -> &'static str {
         EntryRole::QuestionReply => "question-reply",
         EntryRole::Plan => "plan",
         EntryRole::Retry => "retry",
+        EntryRole::Command => "command",
         EntryRole::System => "system",
         EntryRole::Error => "error",
     }
@@ -428,8 +510,37 @@ fn role_name(role: EntryRole) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{EntryRole, apply_update, validate_api_key};
+    use super::{
+        EntryRole, apply_update, is_auth_failure, prompt_failure_message, validate_api_key,
+    };
     use serde_json::json;
+
+    #[test]
+    fn auth_failures_get_an_actionable_message_instead_of_a_retry_hint() {
+        let sample = "ACP -32603: Internal error; turn failed: AuthenticationFails. Your api key: sk-****3E7l is invalid (request_id: b1806464-4a3b-4e51-9691-1ac)";
+        assert!(is_auth_failure(sample));
+        let message = prompt_failure_message(sample);
+        assert!(message.contains("API Key"));
+        assert!(message.contains("设置"));
+        assert!(
+            !message.contains("请重试"),
+            "auth failure must not suggest a plain retry"
+        );
+        assert!(
+            !message.contains("Internal error"),
+            "raw internal error text must be hidden"
+        );
+    }
+
+    #[test]
+    fn ordinary_failures_keep_the_original_detail_and_retry_hint() {
+        let sample = "ACP -32000: connection reset";
+        assert!(!is_auth_failure(sample));
+        assert_eq!(
+            prompt_failure_message(sample),
+            "发送失败：ACP -32000: connection reset。草稿已保留，请重试。"
+        );
+    }
 
     #[test]
     fn api_key_validation_accepts_keys_and_rejects_assignments_and_quotes() {
@@ -460,6 +571,53 @@ mod tests {
         assert_eq!(entries[0].title, "goal");
         assert_eq!(entries[0].text, "Fix the bug");
         assert_eq!(entries[0].role, EntryRole::User);
+    }
+
+    #[test]
+    fn a_live_goal_round_becomes_a_trigger_card_with_its_objective() {
+        // The `user/message` a goal round writes, with `content` flattened by the
+        // bridge exactly as `contentBlocks` does. Reproduced from a real session
+        // so a live round renders the same card history replay produces.
+        let mut entries = Vec::new();
+        let effect = apply_update(
+            &mut entries,
+            &json!({
+                "sessionUpdate": "turn_trigger",
+                "messageId": "goal-message-1",
+                "sourceKind": "goal",
+                "content": "<goal_round>\nObjective: \"帮我算出圆周率第100位\"\n\
+                            Round: 1/256\n\nContinue working toward the objective in this same \
+                            session.</goal_round>",
+                "time": 1794454152069f64
+            }),
+        );
+        assert!(effect.turn_triggered, "a live goal round must start a turn");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "goal");
+        // The card shows the objective, not the whole `<goal_round>` envelope.
+        assert_eq!(entries[0].text, "帮我算出圆周率第100位");
+        assert_eq!(entries[0].at_ms, Some(1794454152069.0));
+    }
+
+    #[test]
+    fn a_goal_completion_notice_is_not_swallowed_as_internal_context() {
+        // `tool-goal` reports completion through a `notice` message. It is not one
+        // of the internally filtered kinds, so it reaches the transcript.
+        let mut entries = Vec::new();
+        let effect = apply_update(
+            &mut entries,
+            &json!({
+                "sessionUpdate": "turn_trigger",
+                "messageId": "goal-notice-1",
+                "sourceKind": "tool-goal",
+                "form": "notice",
+                "content": "complete: 帮我算出圆周率第100位"
+            }),
+        );
+        assert!(effect.turn_triggered);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "trigger:tool-goal");
+        assert_eq!(entries[0].text, "complete: 帮我算出圆周率第100位");
     }
 
     #[test]
@@ -592,5 +750,81 @@ mod tests {
         assert_eq!(entries[0].title, "2/5");
         assert_eq!(entries[0].status, "active");
         assert_eq!(entries[0].input, "3");
+    }
+
+    #[test]
+    fn command_events_pair_by_command_id_and_carry_the_full_result() {
+        let mut entries = Vec::new();
+        apply_update(
+            &mut entries,
+            &json!({
+                "sessionUpdate": "gpui_command_run",
+                "commandId": "c1",
+                "name": "goal",
+                "args": "帮我算出圆周率第100位"
+            }),
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].role, EntryRole::Command);
+        assert_eq!(entries[0].title, "goal");
+        assert_eq!(entries[0].input, "帮我算出圆周率第100位");
+        // `run` 未结算：摘要按「正在执行指令」渲染。
+        assert!(entries[0].status.is_empty());
+
+        let result = "Goal created\nStatus: active\nObjective: 帮我算出圆周率第100位\n\
+                      Rounds: 0/256\nActivation: armed\n\n\
+                      Commands: /goal edit <objective>, /goal pause, /goal clear";
+        apply_update(
+            &mut entries,
+            &json!({
+                "sessionUpdate": "gpui_command_done",
+                "commandId": "c1",
+                "name": "goal",
+                "kind": "success",
+                "text": result
+            }),
+        );
+        // 同一个 commandId 回填原行，不新增行。
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, "success");
+        assert_eq!(entries[0].text, result);
+        assert_eq!(entries[0].title, "goal");
+
+        // 官方：多行结果才可展开；摘要取首行。
+        assert!(entries[0].text.contains('\n'));
+        assert_eq!(entries[0].text.lines().next(), Some("Goal created"));
+
+        // 失败结果同样按 commandId 落回同一行。
+        apply_update(
+            &mut entries,
+            &json!({
+                "sessionUpdate": "gpui_command_done",
+                "commandId": "c1",
+                "kind": "error",
+                "text": "The goal command is not valid for the current state."
+            }),
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, "error");
+    }
+
+    #[test]
+    fn a_done_without_its_run_still_builds_a_row() {
+        // 历史窗口截断时可能只翻到 done；官方 fallbackState 同样建行。
+        let mut entries = Vec::new();
+        apply_update(
+            &mut entries,
+            &json!({
+                "sessionUpdate": "gpui_command_done",
+                "commandId": "c9",
+                "name": "compact",
+                "kind": "success",
+                "text": "Compacted."
+            }),
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].role, EntryRole::Command);
+        assert_eq!(entries[0].title, "compact");
+        assert_eq!(entries[0].status, "success");
     }
 }

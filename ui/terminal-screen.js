@@ -20,7 +20,12 @@ function queue(screen, command, args) {
   // Resize, terminal replies, and keystrokes must reach the same PTY in order.
   screen.commands = screen.commands.then(() => {
     if (screen.id === id) return window.__TAURI__.core.invoke(command, { terminalId: id, ...args });
-  }).catch(error => console.error('Terminal command failed', error));
+  }).catch(error => {
+    console.error('Terminal command failed', error);
+    // Surface PTY failures in the GPUI toast layer, not just the console.
+    const detail = `终端命令执行失败：${error instanceof Error ? error.message : String(error)}`;
+    window.dispatchEvent(new CustomEvent('kwork-runtime-error', { detail }));
+  });
 }
 
 export function createTerminal() {

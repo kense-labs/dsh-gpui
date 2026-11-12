@@ -48,3 +48,6 @@ webkit2gtk = "2.0.2"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+
+[lints]
+workspace = true

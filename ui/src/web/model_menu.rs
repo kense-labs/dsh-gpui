@@ -320,7 +320,7 @@ impl DshApp {
                 }
                 self.push_toast(format!("模型操作失败：{error}"), cx);
             }
-            Err(_) => {}
+            Err(error) => self.push_toast(format!("模型操作失败：{error}"), cx),
         }
     }
 

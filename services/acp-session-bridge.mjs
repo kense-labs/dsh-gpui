@@ -43,6 +43,8 @@ const renameMethod = '_dsh/gpui/session/rename';
 const planModeMethod = '_dsh/gpui/session/plan-mode';
 const planReviewMethod = '_dsh/gpui/session/plan-review';
 const permissionModeMethod = '_dsh/gpui/session/permission-mode';
+const sessionCommandsMethod = '_dsh/gpui/session/commands';
+const executeSessionCommandMethod = '_dsh/gpui/session/command-execute';
 const runtimeSettingsMethod = '_dsh/gpui/runtime-settings';
 const webSettingsMethod = '_dsh/gpui/web-settings';
 const pluginCenterMethod = '_dsh/gpui/plugin-center';
@@ -65,7 +67,8 @@ const messageMethods = new Map([
 ]);
 const extensionMethods = [
   recordMethod, flushMethod, forkMethod, renameMethod, planModeMethod, planReviewMethod,
-  permissionModeMethod, runtimeSettingsMethod, webSettingsMethod, pluginCenterMethod, pluginInstallMethod,
+  permissionModeMethod, sessionCommandsMethod, executeSessionCommandMethod,
+  runtimeSettingsMethod, webSettingsMethod, pluginCenterMethod, pluginInstallMethod,
   questionStateMethod, questionDecisionMethod, scheduleMethod, openHostSessionMethod, sessionArchiveMethod,
   ...modelProviderMethods, ...messageMethods.keys(),
 ];
@@ -105,7 +108,13 @@ async function startSchedule(ctx) {
     ctx.provide('sessionController', {
       async create({ sessionId, cwd, agentPreset }) {
         if (agentPreset !== undefined) {
-          throw new SessionOperationError('schedule/preset', '当前 ACP 配置无法按预设创建会话。');
+          // The companion dsh-acp ACP profile does not mount the
+          // agent-preset-registry service and acpSessionHost.create ignores a
+          // third argument. Report that precisely instead of implying a
+          // client-side limitation; silently dropping the preset would create
+          // the task with the wrong agent configuration.
+          throw new SessionOperationError('schedule/preset',
+            '配套 dsh-acp 未在 ACP profile 中启用 Agent 预设服务，无法按指定预设创建会话。');
         }
         const { session } = await sessions.create(sessionId, cwd ?? process.env.KWORK_WORKSPACE ?? process.cwd());
         process.stdout.write(JSON.stringify({
@@ -1027,6 +1036,15 @@ function notify(sessionId, update) {
   }) + '\n');
 }
 
+/** Flatten a message's content blocks to the plain text a trigger card shows. */
+function contentBlocks(content) {
+  if (!Array.isArray(content)) return '';
+  return content
+    .map(block => (block?.type === 'text' ? block.text : ''))
+    .filter(text => typeof text === 'string' && text.length > 0)
+    .join('\n');
+}
+
 const providerSettings = 'llm-pi-ai';
 const managedProvider = /^kwork-[a-f0-9-]{36}$/;
 const managedCredential = /^KWORK_[A-F0-9]{32}_API_KEY$/;
@@ -1480,6 +1498,43 @@ function planMode(ctx, { sessionId, active }) {
   return { active: state.pending ?? state.active };
 }
 
+function sessionCommands(ctx, { sessionId }) {
+  const agent = ctx.get('agents')?.get(sessionId);
+  const commands = ctx.get('commands');
+  if (!agent || !commands) return [];
+  // The session-scoped catalog is the same source Harness uses for its "/" menu.
+  return commands.list(agent).map(({ name, description, input }) => ({
+    name,
+    description,
+    ...input?.hint === undefined ? {} : { inputHint: input.hint },
+    ...input?.attachments === true ? { attachments: true } : {},
+  }));
+}
+
+async function executeSessionCommand(ctx, { sessionId, line, attachments }) {
+  if (typeof line !== 'string' || !line.trimStart().startsWith('/')) {
+    throw new SessionOperationError('command/invalid', '无效的斜杠指令。');
+  }
+  const agent = ctx.get('agents')?.get(sessionId);
+  const commands = ctx.get('commands');
+  if (!agent || !commands) {
+    throw new SessionOperationError('command/unavailable', '当前会话不支持该指令。');
+  }
+  const submitted = Array.isArray(attachments) ? attachments : [];
+  const execution = await commands.execute(agent, line, submitted, new AbortController().signal);
+  if (!execution) {
+    throw new SessionOperationError('command/unknown', `未知指令：${line.trim().split(/\s+/)[0]}`);
+  }
+  if (execution.result.kind === 'error') {
+    throw new SessionOperationError('command/rejected', execution.result.text || '指令执行失败。');
+  }
+  return {
+    kind: 'success',
+    text: execution.result.text ?? '',
+    commandId: execution.commandId,
+  };
+}
+
 async function permissionMode(ctx, { sessionId, preset, acknowledged }) {
   const agent = ctx.get('agents').get(sessionId);
   const permissions = ctx.get('permissionPresets');
@@ -1568,10 +1623,43 @@ function observeSessionUpdates(ctx) {
       if (source === 'user') {
         notify(session.id, { sessionUpdate: 'gpui_session_activity', time: event.time });
       }
+      // A non-human message is rendered as a trigger card (official
+      // TurnTriggerNodeView), which needs the text and source kind. Forwarding
+      // only the tail left a live goal round with no card at all: it appeared
+      // afterwards, from history replay, but never while it was running.
+      const human = source === 'user' || source === 'user-question-reply';
+      const internal = source === 'runtime-context' || source === 'skill-catalog'
+        || source === 'compact-checkpoint';
+      if (!human && !internal) {
+        notify(session.id, {
+          sessionUpdate: 'turn_trigger',
+          messageId: data.id,
+          sourceKind: source,
+          form: data.source?.form,
+          content: contentBlocks(data.content),
+          time: event.time,
+        });
+      }
       if (['user', 'goal', 'schedule', 'webhook', 'github', 'agent', 'agent-message'].includes(source) ||
           (source === 'user-question-reply' && data.source.outcome === 'answered')) {
         notify(session.id, { sessionUpdate: 'gpui_turn_tail', type, seq: event.seq });
       }
+      return;
+    }
+    // Command results are log-only session events (`command/run` then
+    // `command/done`). The official client turns them into a command row in the
+    // transcript, so they must reach the UI instead of being dropped here.
+    if (type === 'command/run' || type === 'command/done') {
+      notify(session.id, {
+        sessionUpdate: type === 'command/run' ? 'gpui_command_run' : 'gpui_command_done',
+        seq: event.seq,
+        time: event.time,
+        commandId: data.commandId,
+        name: data.name,
+        args: data.args,
+        kind: data.kind,
+        text: data.text,
+      });
       return;
     }
     const relevant = ['session/title', 'turn/start', 'step/start', 'turn/end', 'llm/retry', 'tool/call'].includes(type)
@@ -1665,6 +1753,10 @@ async function extension({ id, method, params }) {
       response = { result: planMode(ctx, params) };
     } else if (method === permissionModeMethod) {
       response = { result: await permissionMode(ctx, params) };
+    } else if (method === sessionCommandsMethod) {
+      response = { result: sessionCommands(ctx, params) };
+    } else if (method === executeSessionCommandMethod) {
+      response = { result: await executeSessionCommand(ctx, params) };
     } else if (method === questionDecisionMethod) {
       response = { result: respondQuestion(ctx, params) };
     } else if (method === forkMethod || method === renameMethod) {

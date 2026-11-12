@@ -20,7 +20,9 @@ define_class!(
             pasteboard.clearContents();
             pasteboard.setString_forType(
                 &NSString::from_str(self.ivars()),
-                // AppKit provides a static pasteboard type for a plain string.
+                // SAFETY: `NSPasteboardTypeString` is an AppKit static whose address
+                // is valid for the process lifetime, which is what the accessor's
+                // contract requires; the reference is used only for this call.
                 unsafe { NSPasteboardTypeString },
             );
         }
@@ -33,18 +35,28 @@ pub(super) fn show(webview: tauri::Webview, text: String, x: f64, y: f64) -> Res
             let Some(mtm) = MainThreadMarker::new() else {
                 return;
             };
-            // The macOS webview's native handle is a WKWebView, an NSView subclass.
+            // SAFETY: `with_webview` runs on the main thread while the webview is
+            // alive, and Wry's `inner()` hands back the address of that webview's
+            // backing `WKWebView`, which is an `NSView` subclass — so the cast is
+            // to the correct type. `as_ref` rejects a null handle.
             let Some(view) = (unsafe { webview.inner().cast::<NSView>().as_ref() }) else {
                 return;
             };
             let target = CopyTarget::alloc(mtm).set_ivars(text);
-            // NSObject initializes the target after the Rust ivars have been set.
+            // SAFETY: `alloc` returned an uninitialized `CopyTarget`, and `init` is
+            // `NSObject`'s initializer, which returns the same instance now fully
+            // initialized; the ivars were set above, before any other use.
             let target: Retained<CopyTarget> = unsafe { msg_send![super(target), init] };
             let item = NSMenuItem::new(mtm);
             item.setTitle(&NSString::from_str("复制"));
-            // The target stays retained until the synchronous menu tracking ends.
+            // SAFETY: `target` is a live initialised object and `item` retains it for
+            // as long as the menu tracks; `sel!(copySelection:)` names the method
+            // declared on `CopyTarget` above, so the action's signature matches.
             unsafe {
                 item.setTarget(Some(&target));
+            }
+            // SAFETY: as above — the selector is the one `CopyTarget` implements.
+            unsafe {
                 item.setAction(Some(sel!(copySelection:)));
             }
             item.setEnabled(true);
