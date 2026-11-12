@@ -12,6 +12,7 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, oneshot};
 
 use crate::acp::resolve_service_path;
+use crate::embedded_script::write_module;
 
 /// Owns the credential helper independently of the ACP conversation process.
 #[derive(Default)]
@@ -25,6 +26,8 @@ struct AuthConnection {
     child: Mutex<Child>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
     stopping: AtomicBool,
+    // Kept alive for as long as the child may still be reading the module.
+    _credential_script: tempfile::NamedTempFile,
 }
 
 impl AuthConnection {
@@ -32,11 +35,15 @@ impl AuthConnection {
         let dsh_home = resolve_dsh_home()?;
         std::fs::create_dir_all(&dsh_home)
             .map_err(|error| format!("无法创建 Harness 主目录：{error}"))?;
+        let script = write_module(
+            "credential-service",
+            include_str!("../../services/credential-service.mjs").as_bytes(),
+        )?;
         let node = crate::acp::resolve_node();
+        // As in acp.rs, the script path takes argv[1], so the service path and
+        // DSH home remain at process.argv.slice(2). No `--eval` payload needed.
         let mut child = Command::new(node)
-            .args(["--input-type=module", "--eval"])
-            .arg(include_str!("../../services/credential-service.mjs"))
-            .args(["--", "dsh-gpui-credentials"])
+            .arg(script.path())
             .arg(&service_path)
             .arg(&dsh_home)
             .env("DSH_HOME", &dsh_home)
@@ -56,6 +63,7 @@ impl AuthConnection {
             child: Mutex::new(child),
             pending: Mutex::new(HashMap::new()),
             stopping: AtomicBool::new(false),
+            _credential_script: script,
         });
         tokio::spawn(read_stdout(connection.clone(), stdout, app));
         tokio::spawn(read_stderr(stderr));

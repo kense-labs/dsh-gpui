@@ -14,21 +14,23 @@ KWork is a desktop client for DeepSeek Harness ACP. Its Rust interface uses KUI 
 
 ## Quick start
 
-Install Node.js 24.9 or later, pnpm 12.6.0, Rust stable with `rustup`, and the Tauri prerequisites for your platform. On macOS, install the Xcode Command Line Tools and `just`.
+Install [Bun](https://bun.sh), Rust stable with `rustup`, and the Tauri prerequisites for your platform. On macOS, also install the Xcode Command Line Tools and `just`.
 
-Clone KWork and its companion [dsh-acp](https://github.com/kense-labs/dsh-acp) service into the same parent directory.
+**KWork has no Node.js build or runtime dependency of its own.** The frontend build scripts (`scripts/*.mjs`), the dependency install and the Tauri CLI all run on Bun. Node.js 24.9+ / pnpm 12.6.0 are needed only for the separate [dsh-acp](https://github.com/kense-labs/dsh-acp) checkout, which KWork launches as an external stdio process together with a small credential helper; `DSH_NODE` points at that executable. Those two child processes are the only place Node appears.
+
+Clone KWork and its companion dsh-acp service into the same parent directory.
 
 ```sh
 git clone https://github.com/kense-labs/kwork.git
 git clone https://github.com/kense-labs/dsh-acp.git
 cd dsh-acp
-pnpm install
-pnpm run build
+pnpm install          # dsh-acp only
+pnpm run build        # dsh-acp only
 cd ../kwork
-npm ci
+bun install --no-save # reads the tracked package-lock.json; keeps it the single lockfile
 ```
 
-On macOS, run `just dev` to build and launch `.tools/dev-app/KWork.app`. On other platforms, use `npm run dev` to start the Tauri development client.
+On macOS, run `just dev` to build and launch `.tools/dev-app/KWork.app`. On other platforms, use `bun run dev` to start the Tauri development client. `KWORK_BUN` can point at a Bun executable that is not on `PATH`.
 
 You can add a DeepSeek API key on first launch or select **Set up later** (`稍后配置`) to enter the workspace. To manage the key later, open **More → Settings → API Key** from the sidebar. KWork also accepts the `DEEPSEEK_API_KEY` environment variable and uses the `deepseek-official` route for that key.
 
@@ -43,7 +45,7 @@ The Tauri host writes keys through the local Harness credential service. The fro
 | Variable | Purpose |
 | --- | --- |
 | `DSH_ACP_PATH` | Path to the `dsh-acp` checkout. The default lookup includes `../dsh-acp`. |
-| `DSH_NODE` | Path to the Node.js executable used by the host. |
+| `DSH_NODE` | Path to the Node.js executable used for the external dsh-acp / credential helper processes. Not used by the Bun build chain. |
 | `DSH_HOME` | Harness data directory. Defaults to `~/.dsh`. |
 
 The workspace directory must exist on the machine running KWork. ACP uses its canonical absolute path. Resuming a session reattaches to the Harness agent. KWork loads persisted history separately from the ACP update stream.
@@ -51,13 +53,13 @@ The workspace directory must exist on the machine running KWork. ACP uses its ca
 ## Build and verify
 
 ```sh
-npm run ui:build
+bun run ui:build
 cargo fmt --all --check
 cargo test --workspace
-node --test scripts/*.test.mjs
+bun test scripts/*.test.mjs
 ```
 
-`npm run build` builds the release host executable. To package a macOS application, build the frontend first and run `npm exec -- tauri build --bundles app`. The frontend build installs the `wasm-bindgen-cli` version pinned in `Cargo.lock` and a platform-matched `wasm-opt` under `.tools/`, without adding them to `package.json`.
+`bun run build` builds the release host executable. To package a macOS application, build the frontend first and run `bun x tauri build --bundles app`. The frontend build installs the `wasm-bindgen-cli` version pinned in `Cargo.lock` and a platform-matched `wasm-opt` under `.tools/`, without adding them to `package.json`.
 
 | Path | Contents |
 | --- | --- |
@@ -65,6 +67,10 @@ node --test scripts/*.test.mjs
 | `src-tauri/` | Native shell, IPC, ACP process management, and application icons |
 | `services/` | Credential and ACP bridges, plus bundled Harness services |
 | `scripts/` | Build tools and JavaScript tests |
+
+### Embedded Node modules
+
+`services/acp-session-bridge.mjs` and `services/credential-service.mjs` are compiled into the host binary with `include_str!`. They are **not** shipped as loose files and are no longer passed through `node --eval` (~90 KB of command line, close to the macOS `ARG_MAX` budget). `src-tauri/src/embedded_script.rs` materialises each as a private `.mjs` temp file before spawn, so stack traces point at a real path and the file is deleted when the connection is dropped. The 574 KB scheduler bundle (`services/vendor/dsh-schedule/index.mjs`) is instead content-addressed by SHA-256 in the per-user temp directory: it is written once and reused by every ACP connection and every app launch. Both scripts still read their arguments from `process.argv.slice(2)`; the script path simply replaces the former `[eval]` label at `argv[1]`.
 
 ## Build speed and bundle size
 
@@ -78,37 +84,37 @@ just host-blaze                            # build the native host only
 just dev-blaze                             # build and launch the macOS dev app
 ```
 
-`scripts/blaze-build.mjs` probes compatibility once per (blaze version, `Cargo.lock`, platform) and caches the answer in `.tools/blaze-compat.json`. A failed probe falls back to `cargo build -p dsh-gpui` permanently, so the default `just dev` never gets slower or breaks. Re-probe after an upstream fix with `KWORK_BLAZE=force node scripts/blaze-build.mjs`; `KWORK_BLAZE=off` forces cargo. blaze v2 writes outside the checkout by default and needs `KWORK_BLAZE_ARGS='--target-dir target'`; set `BLAZE_SANDBOX=off` in containers where the sandbox is unavailable.
+`scripts/blaze-build.mjs` probes compatibility once per (blaze version, `Cargo.lock`, platform) and caches the answer in `.tools/blaze-compat.json`. A failed probe falls back to `cargo build -p dsh-gpui` permanently, so the default `just dev` never gets slower or breaks. Re-probe after an upstream fix with `KWORK_BLAZE=force bun scripts/blaze-build.mjs`; `KWORK_BLAZE=off` forces cargo. blaze v2 writes outside the checkout by default and needs `KWORK_BLAZE_ARGS='--target-dir target'`; set `BLAZE_SANDBOX=off` in containers where the sandbox is unavailable.
 
 **Measured on macOS arm64 (2026-11-11)**: stable `0.20261027.0` cannot compile the `objc2-exception-helper` build script while loading the workspace; canary `0.20261105.4` fails on proc-macro expansion in `icu_collections` / `icu_provider` / `cargo_metadata`. Do not use `blaze enable`, which changes the user-level `~/.cargo/config.toml`: KWork builds with stable 1.99.1 while blaze uses its own nightly-2026-10-27, so in wrapper mode the daemon links zero programs and incremental builds are slower than plain cargo. `cargo check` and CI remain the final word.
 
 ### Fast development loop (cargo, measured)
 
-blaze cannot build this workspace, so the speedups that actually landed come from avoiding work cargo does not need to redo. Neither one changes the default path: `just dev` and `npm run build` keep the same size-optimized frontend.
+blaze cannot build this workspace, so the speedups that actually landed come from avoiding work cargo does not need to redo. Neither one changes the default path: `just dev` and `bun run build` keep the same size-optimized frontend.
 
-**Skip unchanged frontend builds.** `npm run ui:build` fingerprints every input of `ui/dist` (`ui/**` except `dist/`, `shared/**`, `vendor/**`, manifests, lockfiles and the build script itself) into `.tools/ui-build-stamp.json`. A cheap `stat` pass over ~220 files runs first; the content hash is only computed when an mtime or size changed. An unchanged tree exits in **0.5–0.7s** instead of 2.5–3.1s, so a native-Rust-only edit in `just dev` rebuilds only the host (~1.7s). `KWORK_UI_BUILD=always` forces a rebuild.
+**Skip unchanged frontend builds.** `bun run ui:build` fingerprints every input of `ui/dist` (`ui/**` except `dist/`, `shared/**`, `vendor/**`, manifests, lockfiles and the build script itself) into `.tools/ui-build-stamp.json`. A cheap `stat` pass over ~220 files runs first; the content hash is only computed when an mtime or size changed. An unchanged tree exits in **0.5–0.7s** instead of 2.5–3.1s, so a native-Rust-only edit in `just dev` rebuilds only the host (~1.7s). `KWORK_UI_BUILD=always` forces a rebuild.
 
 **Iterate on the WASM frontend without LTO.** `release-wasm` uses `lto = true`, so a one-line frontend Rust edit pays for a ~20s whole-program link. `KWORK_UI_FAST=1` switches to the separate `[profile.dev-wasm]` (`opt-level = "z"`, `lto = false`, `codegen-units = 16`, `debug = 0`) and skips `wasm-opt`:
 
 ```sh
 just ui-fast        # fast frontend only
 just dev-fast       # build + launch the macOS dev app with it
-npm run ui:build    # restore the size-optimized frontend before packaging
+bun run ui:build    # restore the size-optimized frontend before packaging
 ```
 
 | macOS arm64, 2026-11-11 | default | `KWORK_UI_FAST=1` |
 | --- | ---: | ---: |
-| `npm run ui:build`, one frontend Rust line changed | 28.6s (20.7s LTO link) | 11.1s (3.0s cargo) |
+| `bun run ui:build`, one frontend Rust line changed | 28.6s (20.7s LTO link) | 11.1s (3.0s cargo) |
 | warmed, no source change | 2.5–3.1s | 0.5–0.7s (fingerprint skip) |
 | `ui/dist/pkg/dsh_gpui_ui_bg.wasm` | 13,413,708 B | 33,798,006 B |
 
-If the edit changes the wasm bytes, the default path additionally pays ~11s of `wasm-opt -Oz`; the fast path never runs it. The fast wasm is unoptimized and ~2.5x larger — local iteration only. `npm run build` runs the default `ui:build` first, so packaging always restores the optimized artifact, and switching profiles invalidates the fingerprint automatically.
+If the edit changes the wasm bytes, the default path additionally pays ~11s of `wasm-opt -Oz`; the fast path never runs it. The fast wasm is unoptimized and ~2.5x larger — local iteration only. `bun run build` runs the default `ui:build` first, so packaging always restores the optimized artifact, and switching profiles invalidates the fingerprint automatically.
 
 **Evaluated, not adopted**: rust-lld as a faster linker (`-C linker-features=+lld` is unstable on stable 1.99.1; LLD 23.1.1 cannot parse this macOS SDK's TAPI `.tbd` files), a `debug = 0` native dev profile (alternating incremental runs: 2.58s vs 3.45s, no consistent win), and mold (no macOS support). `sccache` is not wired in either: cargo's incremental cache already covers the dev loop, and sccache mainly pays off for CI / clean rebuilds; it can be added later with `RUSTC_WRAPPER`.
 
 ### Bundle size
 
-The WebAssembly frontend is KWork's largest artifact. `npm run ui:build` applies three steps:
+The WebAssembly frontend is KWork's largest artifact. `bun run ui:build` applies three steps:
 
 1. `[profile.release-wasm]` in `Cargo.toml` (inherits release, `opt-level = "z"`, `lto = true`, `panic = "abort"`, `strip = false`). `strip = false` keeps the `target_features` custom section; without it wasm-bindgen cannot detect the bulk-memory / reference-types features rustc enabled.
 2. `wasm-opt -Oz` on the wasm-bindgen output — the replacement recommended by wasm-bindgen's own `strip = true` warning — with a content-addressed cache in `.tools/wasm-opt-cache/`.

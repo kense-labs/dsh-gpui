@@ -14,21 +14,23 @@ KWork 是基于 DeepSeek Harness ACP 的桌面客户端。Rust 界面使用 KUI 
 
 ## 快速开始
 
-安装 Node.js 24.9 或更高版本、pnpm 12.6.0、通过 `rustup` 安装的 Rust stable，以及当前平台的 Tauri 构建依赖。macOS 还需安装 Xcode Command Line Tools 和 `just`。
+安装 [Bun](https://bun.sh)、通过 `rustup` 安装的 Rust stable，以及当前平台的 Tauri 构建依赖。macOS 还需安装 Xcode Command Line Tools 和 `just`。
 
-将 KWork 和配套的 [dsh-acp](https://github.com/kense-labs/dsh-acp) 服务克隆到同一个父目录下。
+**KWork 自身不依赖 Node.js，无论构建期还是运行期。** 前端构建脚本（`scripts/*.mjs`）、依赖安装和 Tauri CLI 全部走 Bun。Node.js 24.9+ / pnpm 12.6.0 只用于独立的 [dsh-acp](https://github.com/kense-labs/dsh-acp) 检出：KWork 把它和一个小型凭据服务当作外部 stdio 子进程启动，`DSH_NODE` 指向的正是这个可执行文件。整个项目里只有这两个子进程需要 Node。
+
+将 KWork 和配套的 dsh-acp 服务克隆到同一个父目录下。
 
 ```sh
 git clone https://github.com/kense-labs/kwork.git
 git clone https://github.com/kense-labs/dsh-acp.git
 cd dsh-acp
-pnpm install
-pnpm run build
+pnpm install          # 仅 dsh-acp 需要
+pnpm run build        # 仅 dsh-acp 需要
 cd ../kwork
-npm ci
+bun install --no-save # 读取已入库的 package-lock.json，避免生成第二份 lockfile
 ```
 
-macOS 上运行 `just dev`，构建并启动 `.tools/dev-app/KWork.app`。其他平台使用 `npm run dev` 启动 Tauri 开发客户端。
+macOS 上运行 `just dev`，构建并启动 `.tools/dev-app/KWork.app`。其他平台使用 `bun run dev` 启动 Tauri 开发客户端。若 Bun 不在 `PATH` 中，可用 `KWORK_BUN` 指定可执行文件。
 
 首次启动可以添加 DeepSeek API Key，也可以选择「稍后配置」进入工作区。之后从侧栏打开「更多 → 设置 → API Key」管理密钥。KWork 也支持 `DEEPSEEK_API_KEY` 环境变量，并为该密钥使用 `deepseek-official` 路由。
 
@@ -43,7 +45,7 @@ Tauri 主进程通过 Harness 本机凭据服务写入密钥，前端读取凭�
 | 环境变量 | 用途 |
 | --- | --- |
 | `DSH_ACP_PATH` | `dsh-acp` 检出的路径，默认查找路径包含 `../dsh-acp`。 |
-| `DSH_NODE` | 主进程使用的 Node.js 可执行文件路径。 |
+| `DSH_NODE` | 用于启动外部 dsh-acp / 凭据服务子进程的 Node.js 可执行文件路径，与 Bun 构建链无关。 |
 | `DSH_HOME` | Harness 数据目录，默认 `~/.dsh`。 |
 
 工作区目录必须在运行 KWork 的机器上存在。ACP 使用该目录规范化后的绝对路径。恢复会话时，KWork 会重新连接对应的 Harness Agent，并独立于 ACP 更新流读取已保存的历史。
@@ -51,13 +53,13 @@ Tauri 主进程通过 Harness 本机凭据服务写入密钥，前端读取凭�
 ## 构建与检查
 
 ```sh
-npm run ui:build
+bun run ui:build
 cargo fmt --all --check
 cargo test --workspace
-node --test scripts/*.test.mjs
+bun test scripts/*.test.mjs
 ```
 
-`npm run build` 构建发布版主程序。打包 macOS 应用时，先构建前端，再运行 `npm exec -- tauri build --bundles app`。前端构建会把 `Cargo.lock` 锁定版本的 `wasm-bindgen-cli` 和按平台匹配的 `wasm-opt` 安装到 `.tools/`，不写入 `package.json`。
+`bun run build` 构建发布版主程序。打包 macOS 应用时，先构建前端，再运行 `bun x tauri build --bundles app`。前端构建会把 `Cargo.lock` 锁定版本的 `wasm-bindgen-cli` 和按平台匹配的 `wasm-opt` 安装到 `.tools/`，不写入 `package.json`。
 
 | 路径 | 内容 |
 | --- | --- |
@@ -65,6 +67,10 @@ node --test scripts/*.test.mjs
 | `src-tauri/` | 原生窗口、IPC、ACP 进程管理和应用图标 |
 | `services/` | 凭据桥、ACP 桥和内置 Harness 服务 |
 | `scripts/` | 构建工具和 JavaScript 测试 |
+
+### 内嵌的 Node 模块
+
+`services/acp-session-bridge.mjs` 与 `services/credential-service.mjs` 通过 `include_str!` 编进主进程二进制，并不作为散落文件分发，也不再通过 `node --eval` 注入（约 90 KB 命令行参数，叠加环境变量后已接近 macOS 的 `ARG_MAX` 上限）。`src-tauri/src/embedded_script.rs` 会在启动子进程前把它们写成私有的 `.mjs` 临时文件：堆栈信息指向真实路径，连接释放时文件随之删除。574 KB 的调度运行时（`services/vendor/dsh-schedule/index.mjs`）则按内容 SHA-256 寻址缓存在用户临时目录，只写一次，供所有 ACP 连接和每次启动复用。两个脚本仍从 `process.argv.slice(2)` 读取参数，只是原本占着 `argv[1]` 的 `[eval]` 标签换成了脚本路径。
 
 ## 构建提速与产物体积
 
@@ -78,37 +84,37 @@ just host-blaze                            # 只构建原生 Host
 just dev-blaze                             # 构建并启动 macOS 开发应用
 ```
 
-`scripts/blaze-build.mjs` 会按「blaze 版本 + `Cargo.lock` + 平台」做一次兼容性探测，结果记在 `.tools/blaze-compat.json`：探测失败就永久回退 `cargo build -p dsh-gpui`，所以 `just dev` 默认路径不会变慢也不会失败。上游修复后可用 `KWORK_BLAZE=force node scripts/blaze-build.mjs` 重新探测；`KWORK_BLAZE=off` 强制只用 cargo。blaze v2 默认把产物写到 checkout 之外，需要 `KWORK_BLAZE_ARGS='--target-dir target'`；容器/CI 里若沙箱不可用可设 `BLAZE_SANDBOX=off`。
+`scripts/blaze-build.mjs` 会按「blaze 版本 + `Cargo.lock` + 平台」做一次兼容性探测，结果记在 `.tools/blaze-compat.json`：探测失败就永久回退 `cargo build -p dsh-gpui`，所以 `just dev` 默认路径不会变慢也不会失败。上游修复后可用 `KWORK_BLAZE=force bun scripts/blaze-build.mjs` 重新探测；`KWORK_BLAZE=off` 强制只用 cargo。blaze v2 默认把产物写到 checkout 之外，需要 `KWORK_BLAZE_ARGS='--target-dir target'`；容器/CI 里若沙箱不可用可设 `BLAZE_SANDBOX=off`。
 
 **当前实测结论（2026-11-11，macOS arm64）**：stable `0.20261027.0` 在加载工作区时无法编译 `objc2-exception-helper` 的 build script（writable static `MIN` 无 rustc 符号）；canary `0.20261105.4` 在 `icu_collections` / `icu_provider` / `cargo_metadata` 等 crate 的 proc macro 展开上失败（退出码 101）。`blaze enable` 全局接管 cargo 的做法也不要用：它改 `~/.cargo/config.toml`，会影响同机其它项目，而且 KWork 用 stable 1.99.1、blaze 用自己的 nightly-2026-10-27，wrapper 模式下 daemon 实际链接 0 个程序，增量构建反而比纯 cargo 慢。按官方建议，`cargo check` 与 CI 始终是最终裁决。
 
 ### 快速开发循环（基于 cargo，实测）
 
-blaze 构建不了本工作区，所以真正落地的提速来自「不让 cargo 重复做不必要的工作」。两者都不会改变默认流程：`just dev` 与 `npm run build` 仍使用同一份体积优化后的前端。
+blaze 构建不了本工作区，所以真正落地的提速来自「不让 cargo 重复做不必要的工作」。两者都不会改变默认流程：`just dev` 与 `bun run build` 仍使用同一份体积优化后的前端。
 
-**跳过未变更的前端构建。** `npm run ui:build` 把 `ui/dist` 的所有输入（`ui/**`（排除 `dist/`）、`shared/**`、`vendor/**`、各 manifest 与 lockfile、构建脚本自身）记入 `.tools/ui-build-stamp.json`：先用 `stat` 对约 220 个文件做 mtime + size 快检，只有发生变化时才计算内容哈希。输入未变时 **0.5–0.7s** 直接退出（原来 warm 构建 2.5–3.1s），因此只改原生 Rust 时 `just dev` 只需重建 Host（约 1.7s）。`KWORK_UI_BUILD=always` 可强制重建。
+**跳过未变更的前端构建。** `bun run ui:build` 把 `ui/dist` 的所有输入（`ui/**`（排除 `dist/`）、`shared/**`、`vendor/**`、各 manifest 与 lockfile、构建脚本自身）记入 `.tools/ui-build-stamp.json`：先用 `stat` 对约 220 个文件做 mtime + size 快检，只有发生变化时才计算内容哈希。输入未变时 **0.5–0.7s** 直接退出（原来 warm 构建 2.5–3.1s），因此只改原生 Rust 时 `just dev` 只需重建 Host（约 1.7s）。`KWORK_UI_BUILD=always` 可强制重建。
 
 **迭代 WASM 前端时去掉 LTO。** `release-wasm` 开了 `lto = true`，改一行前端 Rust 就要付约 20s 的全程序重链。`KWORK_UI_FAST=1` 切到独立的 `[profile.dev-wasm]`（`opt-level = "z"`、`lto = false`、`codegen-units = 16`、`debug = 0`），并跳过 `wasm-opt`：
 
 ```sh
 just ui-fast        # 只构建快速前端
 just dev-fast       # 构建并启动使用它的 macOS 开发应用
-npm run ui:build    # 打包前恢复体积优化产物
+bun run ui:build    # 打包前恢复体积优化产物
 ```
 
 | 2026-11-11，macOS arm64 | 默认 | `KWORK_UI_FAST=1` |
 | --- | ---: | ---: |
-| `npm run ui:build`，前端 Rust 改一行 | 28.6s（LTO 重链 20.7s） | 11.1s（cargo 3.0s） |
+| `bun run ui:build`，前端 Rust 改一行 | 28.6s（LTO 重链 20.7s） | 11.1s（cargo 3.0s） |
 | warm、源码无改动 | 2.5–3.1s | 0.5–0.7s（指纹跳过） |
 | `ui/dist/pkg/dsh_gpui_ui_bg.wasm` | 13,413,708 B | 33,798,006 B |
 
-若改动真的改变了 wasm 字节，默认路径还要再付约 11s 的 `wasm-opt -Oz`，快速路径则不执行这一步。快速产物未优化、体积约 2.5 倍，仅供本地迭代；`npm run build` 会先跑默认 `ui:build`，打包时自动恢复优化产物，切换 profile 也会让指纹自动失效。
+若改动真的改变了 wasm 字节，默认路径还要再付约 11s 的 `wasm-opt -Oz`，快速路径则不执行这一步。快速产物未优化、体积约 2.5 倍，仅供本地迭代；`bun run build` 会先跑默认 `ui:build`，打包时自动恢复优化产物，切换 profile 也会让指纹自动失效。
 
 **评估过但未采用**：用 rust-lld 替换 ld64（stable 1.99.1 上 `-C linker-features=+lld` 仍是 unstable；LLD 23.1.1 无法解析本机 macOS SDK 的 TAPI `.tbd`）、原生 Host 的 `debug = 0` dev profile（交替增量实测 2.58s vs 3.45s，无稳定收益）、mold（不支持 macOS）。`sccache` 也未接入：cargo 自身的增量缓存已覆盖开发循环，sccache 主要对 CI / clean 重建有价值，后续可通过 `RUSTC_WRAPPER` 再加。
 
 ### 产物体积
 
-WASM 前端是 KWork 最大的产物。体积优化分成三段，全部由 `npm run ui:build` 完成：
+WASM 前端是 KWork 最大的产物。体积优化分成三段，全部由 `bun run ui:build` 完成：
 
 1. `Cargo.toml` 的 `[profile.release-wasm]`（继承 release，独立设置 `opt-level = "z"`、`lto = true`、`panic = "abort"`、`strip = false`）；`strip = false` 保留 `target_features` 自定义段，否则 wasm-bindgen 无法识别 rustc 启用的 bulk-memory / reference-types 等特性。
 2. `wasm-bindgen` 输出到临时目录后，用 `wasm-opt -Oz` 处理（这是官方在 `strip = true` 警告里推荐的替代方案），结果按内容哈希缓存在 `.tools/wasm-opt-cache/`。

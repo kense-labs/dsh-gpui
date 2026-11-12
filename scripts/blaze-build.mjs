@@ -64,7 +64,7 @@ if (existsSync(statePath)) {
 }
 if (mode !== 'force' && cached?.key === key && cached.status === 'failed') {
   console.error(`blaze 与当前 KWork 不兼容（探测于 ${cached.at}，退出码 ${cached.code}）；使用 cargo。`);
-  console.error(`上游修复后可执行 KWORK_BLAZE=force node scripts/blaze-build.mjs 重新探测。`);
+  console.error(`上游修复后可执行 KWORK_BLAZE=force bun scripts/blaze-build.mjs 重新探测。`);
   cargoBuild();
 }
 

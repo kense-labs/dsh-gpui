@@ -5,12 +5,18 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 export PATH="$(dirname "$(rustup which rustc)"):$PATH"
 
-npm run ui:build
+BUN="${KWORK_BUN:-bun}"
+if ! command -v "$BUN" >/dev/null 2>&1; then
+    echo "找不到 Bun：请安装 Bun，或用 KWORK_BUN 指定可执行文件。KWork 构建链不再依赖 Node/npm。" >&2
+    exit 1
+fi
+
+"$BUN" scripts/build-ui.mjs
 # blaze is an opt-in accelerator for the native Host only (never for the WASM
 # frontend or release builds). The wrapper probes compatibility once and falls
 # back to cargo for good when blaze cannot build this workspace yet.
 if [[ "${KWORK_USE_BLAZE:-0}" == "1" ]]; then
-    node scripts/blaze-build.mjs
+    "$BUN" scripts/blaze-build.mjs
 else
     cargo build -p dsh-gpui
 fi

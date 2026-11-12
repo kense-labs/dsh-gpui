@@ -1,4 +1,4 @@
-// Run against the packaged adapter after npm run ui:build.
+// Run against the packaged adapter after bun run ui:build.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { SerializeAddon } from '../ui/dist/xterm-addon-serialize.mjs';
