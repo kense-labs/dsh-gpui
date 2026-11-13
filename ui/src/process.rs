@@ -17,6 +17,8 @@ pub enum ProcessKind {
     Plan,
     Questions,
     Tools,
+    /// 官方 `message.stepProcess.done.context`：本轮注入过上下文。
+    Context,
 }
 
 impl ProcessKind {
@@ -36,6 +38,7 @@ impl ProcessKind {
             Self::Plan => "更新了计划",
             Self::Questions => "向用户提出了问题",
             Self::Tools => "已调用工具",
+            Self::Context => "已注入上下文",
         }
     }
 
@@ -57,6 +60,7 @@ impl ProcessKind {
             Self::Plan => "准备更新计划",
             Self::Questions => "准备提问",
             Self::Tools => "准备调用工具",
+            Self::Context => "准备调用工具",
         }
     }
 
@@ -76,6 +80,7 @@ impl ProcessKind {
             Self::Plan => "正在更新计划",
             Self::Questions => "等待你的操作",
             Self::Tools => "正在调用工具",
+            Self::Context => "正在注入上下文",
         }
     }
 }
@@ -356,6 +361,59 @@ pub fn ranked_kinds(tool_names: impl IntoIterator<Item = impl AsRef<str>>) -> Ve
     ranked.into_iter().map(|(kind, _, _)| kind).collect()
 }
 
+/// Official `formatRunDuration`: whole hours/minutes when reached, seconds
+/// always, joined without separators (e.g. `1分5秒`, `2小时1分5秒`).
+pub fn format_run_duration(total_seconds: u64) -> String {
+    let hours = total_seconds / 3600;
+    let minutes = total_seconds / 60 % 60;
+    let seconds = total_seconds % 60;
+    let mut out = String::new();
+    if hours > 0 {
+        out.push_str(&format!("{hours}小时"));
+    }
+    if total_seconds >= 60 {
+        out.push_str(&format!("{minutes}分"));
+    }
+    out.push_str(&format!("{seconds}秒"));
+    out
+}
+
+/// One process evidence item, in transcript order.
+#[derive(Clone, Copy)]
+pub enum ProcessEvidence<'a> {
+    Tool(&'a str),
+    Context,
+}
+
+/// Rank process kinds the way the official summary counts do: frequency first,
+/// then first occurrence; context injections count as the `context` kind.
+pub fn ranked_evidence<'a>(
+    items: impl IntoIterator<Item = ProcessEvidence<'a>>,
+) -> Vec<ProcessKind> {
+    use std::collections::HashMap;
+    let mut counts: HashMap<ProcessKind, usize> = HashMap::new();
+    let mut order: Vec<ProcessKind> = Vec::new();
+    for item in items {
+        let kind = match item {
+            ProcessEvidence::Tool(name) => activity(name),
+            ProcessEvidence::Context => ProcessKind::Context,
+        };
+        if let Some(count) = counts.get_mut(&kind) {
+            *count += 1;
+        } else {
+            counts.insert(kind, 1);
+            order.push(kind);
+        }
+    }
+    let mut ranked: Vec<(ProcessKind, usize, usize)> = order
+        .into_iter()
+        .enumerate()
+        .map(|(index, kind)| (kind, counts.get(&kind).copied().unwrap_or(0), index))
+        .collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
+    ranked.into_iter().map(|(kind, _, _)| kind).collect()
+}
+
 /// Official `formatCacheHitPercent`: cache-read share of billed prompt tokens.
 /// Never rounds a partial hit up to 100.
 pub fn format_cache_hit_percent(cache_read: u64, prompt_tokens: u64) -> Option<String> {
@@ -589,6 +647,29 @@ mod tests {
                 ProcessKind::Search
             ]),
             "执行了命令，已调用工具，已访问网页等"
+        );
+    }
+
+    #[test]
+    fn run_duration_uses_the_official_chinese_units() {
+        assert_eq!(format_run_duration(0), "0秒");
+        assert_eq!(format_run_duration(5), "5秒");
+        assert_eq!(format_run_duration(65), "1分5秒");
+        assert_eq!(format_run_duration(3665), "1小时1分5秒");
+    }
+
+    #[test]
+    fn context_injections_join_the_process_summary() {
+        let ranked = ranked_evidence([
+            ProcessEvidence::Tool("read"),
+            ProcessEvidence::Context,
+            ProcessEvidence::Tool("bash"),
+        ]);
+        assert_eq!(ranked[0], ProcessKind::Read);
+        assert!(ranked.contains(&ProcessKind::Context));
+        assert_eq!(
+            process_title(&ranked_evidence([ProcessEvidence::Context])),
+            "已注入上下文"
         );
     }
 

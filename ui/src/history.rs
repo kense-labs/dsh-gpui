@@ -57,6 +57,60 @@ fn user_visible_source(kind: &str) -> Option<&'static str> {
     }
 }
 
+/// Every durable session event type this UI version already consumes.
+///
+/// Anything else is a surface this build does not know: the official client
+/// shows it as a JSON block (message.unknownSurface) instead of dropping it.
+fn known_event_type(kind: &str) -> bool {
+    matches!(
+        kind,
+        "session"
+            | "user/message"
+            | "assistant/message"
+            | "assistant/attempt"
+            | "system/message"
+            | "tool/call"
+            | "tool/result"
+            | "tool/ptc-dispatch"
+            | "tool/ptc-dispatch-start"
+            | "turn/start"
+            | "turn/end"
+            | "step/start"
+            | "step/end"
+            | "llm/retry"
+            | "llm/retry-started"
+            | "session/title"
+            | "session/title-llm-request"
+            | "session/end-seed"
+            | "agent/inbox/spliced"
+            | "request/header"
+            | "request/context"
+            | "job/registered"
+            | "job/settled"
+            | "command/run"
+            | "command/done"
+            | "developer/message"
+            | "compaction/start"
+            | "compaction/summary"
+            | "compaction/prune"
+            | "compaction/end"
+            | "deliverables/presented"
+            | "workspace/changes"
+            | "model/selection"
+            | "goal/change"
+            | "subagent/catalog"
+            | "subagent/descriptor"
+            | "todo/write"
+            | "web/deepseek-search-llm-request"
+            | "sandbox/mode"
+            | "approval/policy"
+            | "permission/preset"
+            | "approval/asked"
+            | "approval/decided"
+            | "team/mode"
+    )
+}
+
 fn content_texts(blocks: &[Value]) -> String {
     blocks
         .iter()
@@ -132,6 +186,9 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
     let mut mutation_calls: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut pending_changed_files: Vec<String> = Vec::new();
+    // User rows attach a following session-reference's labels to themselves
+    // (official ReferenceLabelProjector keys by the preceding message seq).
+    let mut last_user_input: Option<(u64, usize)> = None;
     // Compaction summaries arrive just before the checkpoint message that
     // replaces the shadowed history; keep them keyed so the marker can cite the
     // official counts without rendering an extra row.
@@ -186,6 +243,11 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                     }
                 }
             }
+            continue;
+        }
+        if !known_event_type(kind) {
+            out.entries
+                .push(crate::state::unknown_surface_entry(kind, &data, at_ms));
             continue;
         }
         if matches!(kind, "tool/ptc-dispatch" | "tool/ptc-dispatch-start") {
@@ -320,6 +382,19 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                                 catalog
                             }
                         };
+                        let reference_labels: Vec<String> = if source == "session-reference" {
+                            data.pointer("/source/references")
+                                .and_then(Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|reference| {
+                                    reference.get("label").and_then(Value::as_str)
+                                })
+                                .map(str::to_owned)
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
                         if !body.trim().is_empty() {
                             let payload = data.to_string();
                             out.entries.push(ChatEntry {
@@ -341,6 +416,16 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                                 tool: None,
                                 at_ms,
                             });
+                        }
+                        // The reference labels belong to the message one seq
+                        // earlier, exactly like the official projector.
+                        if !reference_labels.is_empty()
+                            && let Some(seq) = event.get("seq").and_then(Value::as_u64)
+                            && let Some((input_seq, index)) = last_user_input
+                            && input_seq.saturating_add(1) == seq
+                            && let Some(entry) = out.entries.get_mut(index)
+                        {
+                            crate::state::attach_user_references(entry, &reference_labels);
                         }
                         continue;
                     }
@@ -392,6 +477,23 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                         .collect();
                     content_texts(&text_blocks)
                 };
+                // Official UserContent keeps every block that is not text, image
+                // or file as an 附加内容块 JSON box inside the bubble.
+                let extra_blocks: Vec<Value> = data
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|block| {
+                        let kind = block.get("type").and_then(Value::as_str);
+                        let known_text = kind == Some("text")
+                            && block.get("text").and_then(Value::as_str).is_some();
+                        let known_media = matches!(kind, Some("image" | "file"))
+                            && block.get("attachment").is_some();
+                        !known_text && !known_media
+                    })
+                    .cloned()
+                    .collect();
                 if text.trim().is_empty() && images.is_empty() {
                     continue;
                 }
@@ -433,21 +535,25 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                         .unwrap_or_default(),
                     _ => "",
                 };
+                let input = if images.is_empty() && extra_blocks.is_empty() {
+                    String::new()
+                } else {
+                    crate::state::user_entry_input(&images, &extra_blocks, &[])
+                };
                 out.entries.push(ChatEntry {
                     key,
                     external_id: id,
                     role: EntryRole::User,
                     title,
                     text,
-                    input: if images.is_empty() {
-                        String::new()
-                    } else {
-                        crate::state::user_images_json(&images)
-                    },
+                    input,
                     status: detail.to_owned(),
                     tool: None,
                     at_ms,
                 });
+                if let Some(seq) = event.get("seq").and_then(Value::as_u64) {
+                    last_user_input = Some((seq, out.entries.len() - 1));
+                }
             }
             "system/message" => {
                 // Official SystemPromptRow: the complete model-visible prompt as
@@ -541,8 +647,16 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                     .unwrap_or_default();
                 let mut thought = String::new();
                 let mut answer = String::new();
+                let mut unknown_blocks = Vec::new();
                 for block in &blocks {
-                    match block.get("type").and_then(Value::as_str) {
+                    let block_kind = block.get("type").and_then(Value::as_str);
+                    if !matches!(
+                        block_kind,
+                        Some("reasoning" | "text" | "tool-call" | "image" | "file" | "audio")
+                    ) {
+                        unknown_blocks.push(block.clone());
+                    }
+                    match block_kind {
                         Some("reasoning") => {
                             if let Some(text) = block.get("text").and_then(Value::as_str) {
                                 if !text.is_empty() {
@@ -599,6 +713,10 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                         tool: None,
                         at_ms,
                     });
+                }
+                for block in &unknown_blocks {
+                    out.entries
+                        .push(crate::state::unknown_block_entry(block, at_ms));
                 }
             }
             "tool/call" => {
@@ -1571,6 +1689,102 @@ mod tests {
         ];
         let projected = project_session_events(&events);
         assert_eq!(projected.session_title, Some((2, "会话进度确认".into())));
+    }
+
+    #[test]
+    fn unknown_blocks_and_surfaces_render_json_fallbacks() {
+        let events = vec![
+            // A surface this build does not know: keep it visible as a JSON block.
+            json!({"type": "future/surface", "seq": 1, "data": {"payload": 7}}),
+            json!({"type": "turn/start", "seq": 2, "data": {"turn": 1}}),
+            json!({
+                "type": "assistant/message", "seq": 3, "surfaceOp": "append", "time": 4,
+                "data": {"turn": 1, "step": 1, "message": {"id": "a1", "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "回答"},
+                        {"type": "asset", "assetId": "asset-9"},
+                    ]}},
+            }),
+            json!({"type": "turn/end", "seq": 4, "data": {"turn": 1, "reason": {"kind": "completed"}}}),
+        ];
+        let projected = project_session_events(&events);
+        let surface = projected
+            .entries
+            .iter()
+            .find(|entry| entry.role == EntryRole::UnknownSurface)
+            .expect("unknown surface row");
+        assert_eq!(surface.title, "future/surface");
+        assert!(surface.input.contains("payload"));
+        let block = projected
+            .entries
+            .iter()
+            .find(|entry| entry.role == EntryRole::UnknownBlock)
+            .expect("unknown content block");
+        assert!(block.input.contains("assetId"));
+        // The known text still renders as the assistant answer.
+        assert!(
+            projected
+                .entries
+                .iter()
+                .any(|entry| entry.role == EntryRole::Assistant && entry.text == "回答")
+        );
+        // Known infrastructure events never become fallback rows.
+        let known = vec![
+            json!({"type": "sandbox/mode", "seq": 5, "data": {"mode": "workspace-write"}}),
+            json!({"type": "approval/policy", "seq": 6, "data": {}}),
+            json!({"type": "permission/preset", "seq": 7, "data": {}}),
+        ];
+        let projected = project_session_events(&known);
+        assert!(projected.entries.is_empty());
+    }
+
+    #[test]
+    fn a_user_message_keeps_extra_blocks_and_the_following_session_reference() {
+        let events = vec![
+            json!({
+                "type": "user/message", "seq": 10, "surfaceOp": "append", "time": 1,
+                "data": {
+                    "id": "u1",
+                    "source": {"kind": "user"},
+                    "content": [
+                        {"type": "text", "text": "看看这个"},
+                        {"type": "asset", "assetId": "asset-1", "kind": "spreadsheet"},
+                    ],
+                }
+            }),
+            // The recall context one seq later carries the labels of that message.
+            json!({
+                "type": "user/message", "seq": 11, "surfaceOp": "append", "time": 2,
+                "data": {
+                    "id": "ref-1",
+                    "source": {"kind": "session-reference", "form": "recall", "references": [
+                        {"label": "修复登录问题", "retainedMessages": 3, "omittedMessages": 1, "truncated": false},
+                    ]},
+                    "content": [{"type": "text", "text": "recalled material"}],
+                }
+            }),
+        ];
+        let projected = project_session_events(&events);
+        let user = projected
+            .entries
+            .iter()
+            .find(|entry| entry.external_id.as_deref() == Some("u1"))
+            .expect("user row");
+        assert_eq!(crate::state::user_extra_blocks(user).len(), 1);
+        assert_eq!(
+            crate::state::user_references(user),
+            vec!["修复登录问题".to_owned()]
+        );
+        // The recall context still renders as its own 跨会话召回 row.
+        let context = projected
+            .entries
+            .iter()
+            .find(|entry| entry.external_id.as_deref() == Some("ref-1"))
+            .expect("recall context row");
+        assert_eq!(context.role, EntryRole::Context);
+        let header = crate::state::context_header(&context.input);
+        assert_eq!(header.title, "跨会话召回");
+        assert_eq!(header.label, "修复登录问题");
     }
 
     #[test]

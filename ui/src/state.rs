@@ -76,6 +76,10 @@ pub enum EntryRole {
     /// 官方 ChangedFiles：本轮编辑过的文件卡片（改动的 +/- 统计来自 Host，
     /// ACP 不提供，因此这里只列文件并可在侧边栏打开）。
     ChangedFiles,
+    /// 官方 `message.unknownBlock`：助手消息里未知的内容块，按 JSON 块展示。
+    UnknownBlock,
+    /// 官方 `message.unknownSurface`：本版本不认识的会话事件类型。
+    UnknownSurface,
 }
 
 /// One message, thought, tool invocation, or local status row.
@@ -1207,6 +1211,8 @@ fn role_name(role: EntryRole) -> &'static str {
         EntryRole::Compaction => "compaction",
         EntryRole::Deliverable => "deliverable",
         EntryRole::ChangedFiles => "changed-files",
+        EntryRole::UnknownBlock => "unknown-block",
+        EntryRole::UnknownSurface => "unknown-surface",
     }
 }
 
@@ -1582,6 +1588,74 @@ pub fn user_images_json(images: &[UserImage]) -> String {
     serde_json::json!({ "images": value }).to_string()
 }
 
+/// One extra (non-text, non-media) content block on a user message.
+pub fn user_extra_blocks(entry: &ChatEntry) -> Vec<Value> {
+    user_input_value(entry)
+        .and_then(|value| value.get("extra").and_then(Value::as_array).cloned())
+        .unwrap_or_default()
+}
+
+/// Session-reference labels cited by this user message (official
+/// `referenceSummary` under the bubble).
+pub fn user_references(entry: &ChatEntry) -> Vec<String> {
+    user_input_value(entry)
+        .and_then(|value| value.get("references").and_then(Value::as_array).cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|label| label.as_str().map(str::to_owned))
+        .collect()
+}
+
+fn user_input_value(entry: &ChatEntry) -> Option<Value> {
+    if entry.role != EntryRole::User {
+        return None;
+    }
+    serde_json::from_str::<Value>(&entry.input).ok()
+}
+
+/// Serialize one user row's `input` payload from its parts.
+pub fn user_entry_input(images: &[UserImage], extra: &[Value], references: &[String]) -> String {
+    let image_value: Value = serde_json::from_str(&user_images_json(images)).unwrap_or(Value::Null);
+    serde_json::json!({
+        "images": image_value.get("images").cloned().unwrap_or(Value::Array(Vec::new())),
+        "extra": extra,
+        "references": references,
+    })
+    .to_string()
+}
+
+/// Attach session-reference labels to a user row already on screen.
+pub fn attach_user_references(entry: &mut ChatEntry, labels: &[String]) {
+    if entry.role != EntryRole::User || labels.is_empty() {
+        return;
+    }
+    let mut value: Value = serde_json::from_str(&entry.input)
+        .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
+    if !value.is_object() {
+        value = Value::Object(serde_json::Map::new());
+    }
+    let references = value
+        .as_object_mut()
+        .map(|object| {
+            object
+                .entry("references")
+                .or_insert_with(|| Value::Array(Vec::new()))
+        })
+        .and_then(Value::as_array_mut);
+    let Some(references) = references else {
+        return;
+    };
+    for label in labels {
+        if !references
+            .iter()
+            .any(|seen| seen.as_str() == Some(label.as_str()))
+        {
+            references.push(Value::from(label.clone()));
+        }
+    }
+    entry.input = value.to_string();
+}
+
 /// Patch a loaded data URL into every user row that references the attachment.
 pub fn set_user_image_data(entries: &mut [ChatEntry], attachment_id: &str, data_url: &str) {
     for entry in entries
@@ -1682,6 +1756,40 @@ pub fn changed_files(entry: &ChatEntry) -> Vec<String> {
         .flatten()
         .filter_map(|file| file.get("path").and_then(Value::as_str).map(str::to_owned))
         .collect()
+}
+
+/// One unknown content block from a message (official `message.unknownBlock`).
+pub fn unknown_block_entry(block: &Value, at_ms: Option<f64>) -> ChatEntry {
+    ChatEntry {
+        key: format!(
+            "unknown-block-{}",
+            block.get("type").and_then(Value::as_str).unwrap_or("")
+        ),
+        external_id: None,
+        role: EntryRole::UnknownBlock,
+        title: "未知内容块".to_owned(),
+        text: String::new(),
+        input: serde_json::to_string_pretty(block).unwrap_or_else(|_| block.to_string()),
+        status: String::new(),
+        tool: None,
+        at_ms,
+    }
+}
+
+/// One session event type this UI version does not know (official
+/// `message.unknownSurface`): label carries the type, input the payload.
+pub fn unknown_surface_entry(kind: &str, data: &Value, at_ms: Option<f64>) -> ChatEntry {
+    ChatEntry {
+        key: format!("unknown-surface-{kind}"),
+        external_id: None,
+        role: EntryRole::UnknownSurface,
+        title: kind.to_owned(),
+        text: String::new(),
+        input: serde_json::to_string_pretty(data).unwrap_or_else(|_| data.to_string()),
+        status: String::new(),
+        tool: None,
+        at_ms,
+    }
 }
 
 /// Localized title of one turn-trigger row (official `turnTriggerDetails`).
@@ -1787,10 +1895,10 @@ pub fn adopt_logged_user_message(
 mod tests {
     use super::{
         ChatEntry, ContextBodyView, ContextRole, EntryRole, adopt_logged_user_message,
-        apply_update, context_body_view, context_entries_text, context_header,
-        context_source_label, is_auth_failure, job_detail_text, job_status_label,
+        apply_update, attach_user_references, context_body_view, context_entries_text,
+        context_header, context_source_label, is_auth_failure, job_detail_text, job_status_label,
         prompt_failure_message, trigger_title, turn_failure, turn_failure_entry, turn_usage_map,
-        validate_api_key,
+        user_entry_input, user_extra_blocks, user_references, validate_api_key,
     };
     use serde_json::json;
 
@@ -2299,6 +2407,28 @@ mod tests {
             Some(1.0)
         ));
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn user_rows_keep_extra_blocks_and_reference_labels() {
+        let extra = vec![serde_json::json!({"type": "asset", "assetId": "a-1"})];
+        let input = user_entry_input(&[], &extra, &[]);
+        let mut entry = ChatEntry::local(EntryRole::User, "u1", "hello");
+        entry.input = input;
+        assert_eq!(user_extra_blocks(&entry), extra);
+        assert!(user_references(&entry).is_empty());
+        attach_user_references(&mut entry, &["修复登录".to_owned(), "会话 A".to_owned()]);
+        attach_user_references(&mut entry, &["修复登录".to_owned()]);
+        assert_eq!(
+            user_references(&entry),
+            vec!["修复登录".to_owned(), "会话 A".to_owned()]
+        );
+        // Extra blocks survive the label patch.
+        assert_eq!(user_extra_blocks(&entry), extra);
+        // An empty input is not a user payload.
+        let plain = ChatEntry::local(EntryRole::User, "u2", "plain");
+        assert!(user_extra_blocks(&plain).is_empty());
+        assert!(user_references(&plain).is_empty());
     }
 
     #[test]

@@ -2282,12 +2282,28 @@ impl DshApp {
                 }
                 let mut seen = std::collections::HashSet::new();
                 tools.retain(|tool| tool.external_id.as_deref().is_none_or(|id| seen.insert(id)));
-                let ranked = crate::process::ranked_kinds(
-                    tools
-                        .iter()
-                        .filter(|tool| tool.tool.is_some())
-                        .map(|tool| tool.tool_name()),
-                );
+                // Official summary counts: tool activities in transcript order,
+                // with context injections contributing the `context` kind.
+                let mut evidence: Vec<crate::process::ProcessEvidence<'_>> = Vec::new();
+                let mut tool_cursor = 0usize;
+                for member in process {
+                    match member.role {
+                        EntryRole::Tool => {
+                            if let Some(tool) = tools.get(tool_cursor)
+                                && tool.tool.is_some()
+                            {
+                                evidence
+                                    .push(crate::process::ProcessEvidence::Tool(tool.tool_name()));
+                            }
+                            tool_cursor += 1;
+                        }
+                        EntryRole::Context => {
+                            evidence.push(crate::process::ProcessEvidence::Context);
+                        }
+                        _ => {}
+                    }
+                }
+                let ranked = crate::process::ranked_evidence(evidence);
                 let live = turn_live && index == entries.len();
                 open_process |= live;
                 let active = running_tool.filter(|_| live);
@@ -2605,7 +2621,10 @@ impl DshApp {
                     }),
             };
             let label = if elapsed >= 1. {
-                format!("{live_label}，用时 {}s···", elapsed.floor() as u32)
+                format!(
+                    "{live_label}，用时 {} ···",
+                    crate::process::format_run_duration(elapsed.floor() as u64)
+                )
             } else {
                 format!("{live_label}···")
             };
@@ -6118,7 +6137,15 @@ fn render_entry(
                             })
                             .when(!entry.text.trim().is_empty(), |bubble| {
                                 bubble.child(entry.text.clone())
-                            }),
+                            })
+                            .children(
+                                crate::state::user_extra_blocks(entry)
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(index, block)| {
+                                        render_extra_content_block(block, index, cx)
+                                    }),
+                            ),
                     )
                     .child(
                         row()
@@ -6168,7 +6195,10 @@ fn render_entry(
                                         this.push_toast("已复制", cx);
                                     })),
                             ),
-                    ),
+                    )
+                    .when_some(render_user_references(entry, cx), |column, references| {
+                        column.child(references)
+                    }),
             )
         }
         EntryRole::Assistant => div().w_full().child(render_markdown(
@@ -6367,6 +6397,16 @@ fn render_entry(
         EntryRole::Compaction => render_compaction(entry, expanded, cx),
         EntryRole::Deliverable => render_deliverables(entry, expanded, workspace, cx),
         EntryRole::ChangedFiles => render_changed_files(entry, expanded, workspace, cx),
+        EntryRole::UnknownBlock => {
+            div()
+                .w_full()
+                .child(render_unknown_json("未知内容块", entry, cx))
+        }
+        EntryRole::UnknownSurface => div().w_full().child(render_unknown_json(
+            &format!("未知 surface 事件：{}", entry.title),
+            entry,
+            cx,
+        )),
         EntryRole::SystemPrompt => render_system_prompt(entry, expanded, cx),
         EntryRole::Job => render_job_row(entry, expanded, cx),
         EntryRole::System if entry.title == "turn-end" => row().w_full().justify_start().child(
@@ -6776,6 +6816,64 @@ fn deliverable_action(
         .on_click(cx.listener(move |this, _, w, cx| action(this, w, cx)))
 }
 
+/// Official `JsonBlock`: one labeled JSON payload (unknown blocks and events).
+fn render_unknown_json(
+    label: &str,
+    entry: &ChatEntry,
+    cx: &mut Context<DshApp>,
+) -> gpui::AnyElement {
+    let p = dsh(cx);
+    let total = entry.input.chars().count();
+    const LIMIT: usize = 2000;
+    let truncated = total > LIMIT;
+    let body: String = if truncated {
+        entry.input.chars().take(LIMIT).collect()
+    } else {
+        entry.input.clone()
+    };
+    column()
+        .id(gpui::ElementId::Name(
+            format!("json-block-{}", entry.key).into(),
+        ))
+        .w_full()
+        .gap(px(6.))
+        .rounded(px(10.))
+        .border(px(0.5))
+        .border_color(p.border_l1)
+        .bg(p.stage)
+        .px(px(10.))
+        .py(px(8.))
+        .child(
+            div()
+                .text_size(px(12.))
+                .line_height(px(18.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(p.secondary)
+                .child(label.to_owned()),
+        )
+        .child(
+            div()
+                .w_full()
+                .max_h(px(220.))
+                .overflow_hidden()
+                .font_family("monospace")
+                .text_size(px(11.))
+                .line_height(px(16.))
+                .text_color(p.faint)
+                .child(body),
+        )
+        .when(truncated, |blocked| {
+            blocked.child(
+                div()
+                    .text_size(px(11.))
+                    .line_height(px(16.))
+                    .text_color(p.faint)
+                    .child(format!("… 已截断，共 {total} 字符")),
+            )
+        })
+        .into_any_element()
+}
+
 /// Official ChangedFiles card: the files this turn edited.
 ///
 /// The Host serves `+N/-M` counts through a route ACP does not expose, so the
@@ -7130,6 +7228,78 @@ fn render_deliverable_card(
 /// User-message pictures (official UserContent): a row of rounded thumbnails
 /// that open the full-screen viewer. Attachment objects are read lazily, so a
 /// thumbnail falls back to 加载图片… until its data URL arrives.
+/// Official 附加内容块: one unknown user content block as a labeled JSON box.
+fn render_extra_content_block(
+    block: &Value,
+    index: usize,
+    cx: &mut Context<DshApp>,
+) -> gpui::AnyElement {
+    let p = dsh(cx);
+    let payload = serde_json::to_string_pretty(block).unwrap_or_else(|_| block.to_string());
+    let total = payload.chars().count();
+    const LIMIT: usize = 1200;
+    let truncated = total > LIMIT;
+    let body: String = if truncated {
+        payload.chars().take(LIMIT).collect()
+    } else {
+        payload
+    };
+    column()
+        .id(gpui::ElementId::Name(format!("user-extra-{index}").into()))
+        .w_full()
+        .gap(px(4.))
+        .px(px(8.))
+        .py(px(6.))
+        .rounded(px(8.))
+        .bg(p.selector)
+        .child(
+            div()
+                .text_size(px(11.))
+                .line_height(px(16.))
+                .text_color(p.faint)
+                .child("附加内容块"),
+        )
+        .child(
+            div()
+                .w_full()
+                .max_h(px(160.))
+                .overflow_hidden()
+                .font_family("monospace")
+                .text_size(px(11.))
+                .line_height(px(16.))
+                .text_color(p.secondary)
+                .child(body),
+        )
+        .when(truncated, |boxed| {
+            boxed.child(
+                div()
+                    .text_size(px(11.))
+                    .line_height(px(16.))
+                    .text_color(p.faint)
+                    .child(format!("… 已截断，共 {total} 字符")),
+            )
+        })
+        .into_any_element()
+}
+
+/// Official `referenceSummary`: 引用会话 · labels under the user bubble.
+fn render_user_references(entry: &ChatEntry, cx: &mut Context<DshApp>) -> Option<gpui::Div> {
+    let labels = crate::state::user_references(entry);
+    if labels.is_empty() {
+        return None;
+    }
+    let p = dsh(cx);
+    Some(
+        div()
+            .w_full()
+            .text_right()
+            .text_size(px(12.))
+            .line_height(px(18.))
+            .text_color(p.faint)
+            .child(format!("引用会话 · {}", labels.join("、"))),
+    )
+}
+
 fn render_user_images(entry: &ChatEntry, cx: &mut Context<DshApp>) -> Option<gpui::Div> {
     let images = crate::state::user_images(entry);
     if images.is_empty() {

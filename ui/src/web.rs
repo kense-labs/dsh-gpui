@@ -3098,7 +3098,7 @@ impl DshApp {
                         }
                         Err(error) => {
                             conversation.history_loading = false;
-                            conversation.error = Some(format!("历史载入失败：{error}"));
+                            conversation.error = Some(format!("历史加载失败：{error}"));
                         }
                     }
                 }
