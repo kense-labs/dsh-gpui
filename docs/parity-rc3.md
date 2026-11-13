@@ -30,6 +30,7 @@ KWork 是 Rust/GPUI 客户端，通过 ACP 与 Host 通信；官方客户端是 
 | 文件侧栏 | `ui-sidebar-files` | 搜索、按工作区持久化的排除规则、显示隐藏项、忽略文件开关 |
 | 内置浏览器 | `ui-sidebar-browser` | 右栏标签、地址栏、前进后退刷新、恢复上次页面 |
 | 设置 | `ui-settings` | 服务目录、快捷键、正文偏好、开发者工具、隐藏工作区 |
+| API Key 显隐 | `ui-settings-models` ApiKeyInput | 编辑草稿时眼睛按钮切换明文/掩码（仅未保存草稿，保存后凭据仍为只写）；真机验证 |
 | 外观偏好 | `ui-theme` | 浅色 / 深色 / 跟随系统三选一，选中项跟随**已存偏好**而非解析结果；跟随系统时实时响应 macOS 外观切换（轮询）；偏好持久化 `themeMode`；真机验证 |
 | 命令面板 | `ui-command-picker` | 命令检索与执行 |
 | 输入区统计 | `ui-composer` | 轮/步/Token/缓存命中/耗时，点击展开统计弹窗；真机验证 |

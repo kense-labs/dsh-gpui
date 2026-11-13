@@ -10,7 +10,7 @@ use gpui::{App, Context, FontWeight, Subscription, Window, div, prelude::*, px};
 use kui::components::button::Button;
 use kui::primitives::editor::{EditEvent, Editor, InputMode};
 use kui::primitives::glyph::{Glyph, icon};
-use kui::primitives::ops_surface::{column, editor, input, note, replace, row};
+use kui::primitives::ops_surface::{column, editor, icon_btn, input, note, replace, row};
 use serde_json::{Value, json};
 
 #[derive(Clone, Copy)]
@@ -95,6 +95,17 @@ impl Welcome {
         self.error = None;
     }
 
+    /// Official ApiKeyInput reveal control: only the unsaved draft can be
+    /// revealed; stored keys stay write-only on the Host.
+    fn toggle_key_reveal(&mut self, cx: &mut Context<Self>) {
+        let revealed = !self.api_key.read(cx).revealed;
+        self.api_key.update(cx, |editor, cx| {
+            editor.revealed = revealed;
+            cx.notify();
+        });
+        cx.notify();
+    }
+
     fn refresh(&self, cx: &mut Context<Self>) {
         cx.emit(WelcomeEvent::Changed);
         cx.notify();
@@ -172,7 +183,29 @@ impl Welcome {
             )
             .child(note("API Key 存储在本机 Harness 凭据文件中。", cx));
         if self.editing_key {
-            content = content.child(input(&self.api_key, cx)).child(
+            let draft = self.api_key.read(cx);
+            let revealed = draft.revealed;
+            let has_value = !draft.value().is_empty();
+            let reveal_label = if revealed {
+                "隐藏密钥"
+            } else {
+                "显示密钥"
+            };
+            let mut key_row = row()
+                .w_full()
+                .gap(px(6.))
+                .items_center()
+                .child(div().flex_1().min_w_0().child(input(&self.api_key, cx)));
+            if has_value {
+                key_row = key_row.child(icon_btn(
+                    "api-key-reveal",
+                    reveal_label,
+                    Glyph::Eye,
+                    cx,
+                    |this: &mut Self, _, cx| this.toggle_key_reveal(cx),
+                ));
+            }
+            content = content.child(key_row).child(
                 row()
                     .gap(px(6.))
                     .child(
