@@ -3,7 +3,9 @@ name: Windows build
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    # workflow_dispatch requires the workflow on the default branch; push
+    # events read the workflow from the pushed ref, so build branches work too.
+    branches: [main, 'workbuddy/**']
     paths:
       - 'src-tauri/**'
       - 'ui/**'
