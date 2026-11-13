@@ -874,14 +874,11 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                     .or_else(|| event["seq"].as_u64().map(|seq| format!("retry-{seq}")))
                     .unwrap_or_else(|| format!("hist-retry-{}", out.entries.len()));
                 let retry = data.get("retry").and_then(Value::as_u64).unwrap_or(1);
-                let maximum = data
-                    .get("maxRetries")
-                    .map(|value| match value {
-                        Value::String(text) => text.clone(),
-                        Value::Number(number) => number.to_string(),
-                        _ => "5".to_string(),
-                    })
-                    .unwrap_or_else(|| "5".to_string());
+                let maximum = data.get("maxRetries").map(|value| match value {
+                    Value::String(text) => text.clone(),
+                    Value::Number(number) => number.to_string(),
+                    _ => "5".to_string(),
+                });
                 let delay_ms = data
                     .get("delayMs")
                     .and_then(|value| {
@@ -900,21 +897,46 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned();
-                out.entries.push(ChatEntry {
-                    key: format!("hist-retry-{retry_id}"),
-                    external_id: Some(retry_id),
-                    role: EntryRole::Retry,
-                    title: format!("{retry}/{maximum}"),
-                    text: failure,
-                    input: delay_ms.to_string(),
-                    status: if kind == "llm/retry-started" {
-                        "started".to_string()
-                    } else {
-                        "scheduled".to_string()
-                    },
-                    tool: None,
-                    at_ms,
-                });
+                // One retry chain reuses its retryId across attempts: a later
+                // llm/retry or its llm/retry-started updates the row instead of
+                // appending a duplicate (duplicate keys also made the row's
+                // pulsing dot animate forever).
+                // A durable log only records the attempts themselves, never the
+                // chain's final outcome, so a reopened transcript shows the row as
+                // settled: no perpetual waiting dot (and no animation frame loop
+                // re-rendering the whole transcript).
+                let status = "completed";
+                if let Some(entry) = out.entries.iter_mut().find(|entry| {
+                    entry.role == EntryRole::Retry
+                        && entry.external_id.as_deref() == Some(retry_id.as_str())
+                }) {
+                    entry.status = status.to_owned();
+                    if delay_ms > 0 {
+                        entry.input = delay_ms.to_string();
+                    }
+                    if !failure.is_empty() {
+                        entry.text = failure;
+                    }
+                    entry.at_ms = at_ms.or(entry.at_ms);
+                    let maximum = maximum
+                        .clone()
+                        .or_else(|| entry.title.split_once('/').map(|(_, max)| max.to_owned()));
+                    if let Some(maximum) = maximum {
+                        entry.title = format!("{retry}/{maximum}");
+                    }
+                } else {
+                    out.entries.push(ChatEntry {
+                        key: format!("hist-retry-{retry_id}"),
+                        external_id: Some(retry_id),
+                        role: EntryRole::Retry,
+                        title: format!("{retry}/{}", maximum.unwrap_or_else(|| "5".to_string())),
+                        text: failure,
+                        input: delay_ms.to_string(),
+                        status: status.to_string(),
+                        tool: None,
+                        at_ms,
+                    });
+                }
             }
             // Background jobs settle in the same durable log: a reopened session
             // rebuilds the row rather than losing the record of what ran.
@@ -1304,7 +1326,9 @@ mod tests {
         let row = &projected.entries[0];
         assert_eq!(row.role, EntryRole::Retry);
         assert_eq!(row.title, "1/5");
-        assert_eq!(row.status, "scheduled");
+        // A reopened transcript never shows a perpetual waiting dot: the chain's
+        // outcome is not in the durable log, so it renders settled.
+        assert_eq!(row.status, "completed");
         assert_eq!(row.input, "466", "delay milliseconds for the details row");
         assert_eq!(row.text, "DeepSeek Messages transport failed");
     }
@@ -1876,6 +1900,48 @@ mod tests {
         let header = crate::state::context_header(&context.input);
         assert_eq!(header.title, "跨会话召回");
         assert_eq!(header.label, "修复登录问题");
+    }
+
+    #[test]
+    fn one_retry_chain_stays_one_row() {
+        let events = vec![
+            json!({"type": "llm/retry", "seq": 1, "time": 10, "data": {
+                "retryId": "chain-1", "retry": 1, "maxRetries": 5, "delayMs": 466.2,
+                "failure": {"message": "DeepSeek Messages transport failed"}
+            }}),
+            json!({"type": "llm/retry-started", "seq": 2, "time": 20, "data": {
+                "retryId": "chain-1", "retry": 1
+            }}),
+            json!({"type": "llm/retry", "seq": 3, "time": 30, "data": {
+                "retryId": "chain-1", "retry": 2, "maxRetries": 5, "delayMs": 1081.6,
+                "failure": {"message": "DeepSeek Messages transport failed"}
+            }}),
+        ];
+        let projected = project_session_events(&events);
+        let retries: Vec<_> = projected
+            .entries
+            .iter()
+            .filter(|entry| entry.role == EntryRole::Retry)
+            .collect();
+        assert_eq!(retries.len(), 1, "one chain is one row");
+        assert_eq!(retries[0].title, "2/5");
+        assert_eq!(retries[0].status, "completed");
+        assert_eq!(retries[0].input, "1082");
+        assert_eq!(retries[0].text, "DeepSeek Messages transport failed");
+        // Distinct chains keep their own rows.
+        let mut second = events.clone();
+        second.push(json!({"type": "llm/retry", "seq": 4, "time": 40, "data": {
+            "retryId": "chain-2", "retry": 1, "maxRetries": 5, "delayMs": 500
+        }}));
+        let projected = project_session_events(&second);
+        assert_eq!(
+            projected
+                .entries
+                .iter()
+                .filter(|entry| entry.role == EntryRole::Retry)
+                .count(),
+            2
+        );
     }
 
     #[test]
