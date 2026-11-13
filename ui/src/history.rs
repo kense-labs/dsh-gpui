@@ -630,10 +630,18 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                     .or_else(|| data.pointer("/reason/reason/kind"))
                     .and_then(Value::as_str)
                     .unwrap_or("completed");
+                // A recorded failure becomes the official TurnErrorItem row; the
+                // other endings keep the compact turn-end chip.
+                if let Some(turn) = data.get("turn").and_then(Value::as_u64)
+                    && let Some(entry) =
+                        crate::state::turn_failure_entry(turn, &data["reason"], at_ms)
+                {
+                    out.entries.push(entry);
+                }
                 let text = match reason {
                     "aborted" | "interrupted" | "cancelled" | "user" => "已停止",
                     "max_tokens" => "输出达到 token 上限",
-                    "error" => "本轮出错",
+                    "error" => "",
                     _ => "",
                 };
                 if !text.is_empty() {

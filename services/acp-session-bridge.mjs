@@ -1992,6 +1992,9 @@ function observeSessionUpdates(ctx) {
     if (type === 'llm/retry') update.retryId = data.retryId;
     if (type === 'turn/end') {
       update.reason = data.reason?.kind;
+      // The client renders the terminal failure row (official TurnErrorItem),
+      // which needs the recorded code and message, not just the end kind.
+      update.reasonObject = data.reason;
       const plans = submittedPlanEvents(session, event.seq);
       if (plans.length > 0) update.planEvents = plans;
     }

@@ -6021,11 +6021,56 @@ fn render_entry(
             .w_full()
             .justify_center()
             .child(note(entry.text.clone(), cx)),
+        // 官方 TurnErrorItem：状态点 + 标题 + 本地化的失败原因 + 错误码。
         EntryRole::Error => row()
             .w_full()
+            .items_start()
             .gap(px(8.))
-            .child(icon(Glyph::Alert, 16., p.danger))
-            .child(div().text_color(p.danger).child(entry.text.clone())),
+            .child(
+                div()
+                    .flex_none()
+                    .mt(px(4.))
+                    .size(px(8.))
+                    .rounded_full()
+                    .bg(p.danger),
+            )
+            .child(
+                column()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .line_height(px(20.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(p.danger)
+                            .child(entry.title.clone()),
+                    )
+                    .when(!entry.text.is_empty(), |element| {
+                        element.child(
+                            div()
+                                .text_size(px(12.))
+                                .line_height(px(18.))
+                                .text_color(p.danger)
+                                .child(entry.text.clone()),
+                        )
+                    }),
+            )
+            .when(!entry.status.is_empty(), |element| {
+                element.child(
+                    div()
+                        .flex_none()
+                        .px(px(6.))
+                        .py(px(1.))
+                        .rounded(px(6.))
+                        .bg(p.hover)
+                        .text_size(px(11.))
+                        .line_height(px(16.))
+                        .text_color(p.faint)
+                        .child(entry.status.clone()),
+                )
+            }),
     }
 }
 

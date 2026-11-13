@@ -2575,7 +2575,8 @@ impl DshApp {
         if end == TurnEnd::MaxTokens {
             conversation.push_local(
                 EntryRole::System,
-                "输出达到 token 上限，可以继续发送消息。".into(),
+                "已达到输出 token 上限：回答被截断，已有输出保留在对话中。发送「继续」可让模型接着输出。"
+                    .into(),
             );
         }
         // Pending messages belong to the Host Inbox now: it opens the next turn
@@ -3194,6 +3195,21 @@ impl DshApp {
                 (_, "max_tokens") => TurnEnd::MaxTokens,
                 _ => TurnEnd::Completed,
             };
+            // Official TurnErrorItem: a terminal failure records why the turn
+            // stopped, so a quota or auth problem is not just "处理失败".
+            if let Some(turn) = update["turn"].as_u64()
+                && let Some(entry) = crate::state::turn_failure_entry(
+                    turn,
+                    &update["reasonObject"],
+                    update["time"].as_f64(),
+                )
+                && !conversation
+                    .entries
+                    .iter()
+                    .any(|existing| existing.key == entry.key)
+            {
+                conversation.entries.push(entry);
+            }
             self.finish_session_turn(session, end, cx);
         }
         if started {

@@ -775,6 +775,117 @@ fn role_name(role: EntryRole) -> &'static str {
     }
 }
 
+/// One localized terminal turn failure (official TurnErrorItem).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnFailure {
+    /// Official `message.turnError` / `message.taskStopped`.
+    pub title: &'static str,
+    /// Official `failureMessage()` text for the failure code.
+    pub message: String,
+    /// Machine-readable code chip; absent for an interrupted process.
+    pub code: Option<String>,
+}
+
+/// Read the failure row a `turn/end` reason implies, if any.
+///
+/// Mirrors official `endFailure` + `failureMessage`: provider `AUTH` errors keep
+/// their raw diagnostic out of the UI (it can echo the key), quota and sign-out
+/// failures get their localized copy, and any other recorded error keeps its
+/// message. User cancellations, completions, and max-token ends have no row.
+pub fn turn_failure(reason: &Value) -> Option<TurnFailure> {
+    let kind = reason
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if kind == "interrupted" {
+        return Some(TurnFailure {
+            title: "任务已停止",
+            message: "DSH 进程在本轮完成前退出（例如被强制结束、崩溃或关闭超时），重新启动后本轮已中止。未完成的工具调用结果未知。".to_owned(),
+            code: None,
+        });
+    }
+    if kind == "aborted" {
+        let cause = reason
+            .pointer("/reason/kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let detail = reason
+            .pointer("/reason/reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if cause != "hook" || detail != "deepseek-account/signed-out" {
+            return None;
+        }
+        return Some(TurnFailure {
+            title: "任务已停止",
+            message: "任务已因退出 DeepSeek 登录而停止。".to_owned(),
+            code: Some("ACCOUNT_SIGNED_OUT".to_owned()),
+        });
+    }
+    if kind != "error" {
+        return None;
+    }
+    let error = reason.get("error").cloned().unwrap_or(Value::Null);
+    let raw_code = error
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let quota = raw_code == "QUOTA"
+        || raw_code == "ACCOUNT_QUOTA"
+        || message.to_ascii_lowercase().contains("quota");
+    let (localized, code) = match raw_code {
+        "ACCOUNT_SIGNED_OUT" => (
+            "任务已因退出 DeepSeek 登录而停止。".to_owned(),
+            Some("ACCOUNT_SIGNED_OUT".to_owned()),
+        ),
+        "ACCOUNT_SIGN_IN_REQUIRED" => (
+            "请先登录 DeepSeek，并确认请求地址支持账号认证。".to_owned(),
+            Some("ACCOUNT_SIGN_IN_REQUIRED".to_owned()),
+        ),
+        "AUTH" if quota => ("当前请求的额度已用尽".to_owned(), Some(raw_code.to_owned())),
+        // The provider AUTH diagnostic can echo a masked credential, so only
+        // the localized cause is shown.
+        "AUTH" => ("API 密钥无效".to_owned(), Some("AUTH".to_owned())),
+        _ if quota => ("当前请求的额度已用尽".to_owned(), Some("QUOTA".to_owned())),
+        _ => {
+            let message = if message.is_empty() {
+                "本轮运行失败".to_owned()
+            } else {
+                message.to_owned()
+            };
+            (message, (!raw_code.is_empty()).then(|| raw_code.to_owned()))
+        }
+    };
+    Some(TurnFailure {
+        title: "本轮运行失败",
+        message: localized,
+        code,
+    })
+}
+
+/// Derive the transcript row one `turn/end` reason writes.
+///
+/// Shared by the live stream and history replay so a failed turn looks the same
+/// before and after a restart.
+pub fn turn_failure_entry(turn: u64, reason: &Value, at_ms: Option<f64>) -> Option<ChatEntry> {
+    let failure = turn_failure(reason)?;
+    Some(ChatEntry {
+        key: format!("turn-error-{turn}"),
+        external_id: Some(turn.to_string()),
+        role: EntryRole::Error,
+        title: failure.title.to_owned(),
+        text: failure.message,
+        input: String::new(),
+        status: failure.code.unwrap_or_default(),
+        tool: None,
+        at_ms,
+    })
+}
+
 /// Whether a non-human message source wakes a Turn (official TurnTriggerNodeView).
 ///
 /// Everything else is injected model history: the ACP transport forwards both
@@ -843,7 +954,7 @@ mod tests {
     use super::{
         ChatEntry, EntryRole, adopt_logged_user_message, apply_update, context_entries_text,
         context_source_label, is_auth_failure, job_detail_text, job_status_label,
-        prompt_failure_message, validate_api_key,
+        prompt_failure_message, turn_failure, turn_failure_entry, validate_api_key,
     };
     use serde_json::json;
 
@@ -942,6 +1053,78 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[1].role, EntryRole::User);
         assert_eq!(entries[1].title, "goal");
+    }
+
+    #[test]
+    fn turn_failures_localize_provider_errors() {
+        // Payloads copied from real `turn/end` reasons in ~/.dsh logs.
+        let auth = turn_failure(&json!({
+            "kind": "error",
+            "error": {
+                "message": "Authentication Fails, Your api key: ****3E7l is invalid (request_id: b1806464)",
+                "code": "AUTH", "status": 401,
+            },
+        }))
+        .expect("auth failure");
+        assert_eq!(auth.title, "本轮运行失败");
+        assert_eq!(auth.message, "API 密钥无效");
+        // The provider diagnostic can echo the credential, so it never renders.
+        assert!(!auth.message.contains("3E7l"));
+        assert_eq!(auth.code.as_deref(), Some("AUTH"));
+
+        let quota = turn_failure(&json!({
+            "kind": "error",
+            "error": {
+                "message": "token quota is not enough, token remain quota: $0.03, need quota: $0.03",
+                "code": "AUTH", "status": 403,
+            },
+        }))
+        .expect("quota failure");
+        assert_eq!(quota.message, "当前请求的额度已用尽");
+
+        let transport = turn_failure(&json!({
+            "kind": "error",
+            "error": {"message": "DeepSeek Messages transport failed", "code": "TRANSPORT"},
+        }))
+        .expect("transport failure");
+        assert_eq!(transport.message, "DeepSeek Messages transport failed");
+        assert_eq!(transport.code.as_deref(), Some("TRANSPORT"));
+    }
+
+    #[test]
+    fn user_stops_and_completions_have_no_failure_row() {
+        assert!(turn_failure(&json!({"kind": "completed"})).is_none());
+        assert!(turn_failure(&json!({"kind": "aborted", "reason": {"kind": "user"}})).is_none());
+        assert!(turn_failure(&json!({"kind": "max_tokens"})).is_none());
+        // A sign-out cancellation is a stopped task with its own copy.
+        let signed_out = turn_failure(&json!({
+            "kind": "aborted",
+            "reason": {"kind": "hook", "reason": "deepseek-account/signed-out"},
+        }))
+        .expect("signed-out stop");
+        assert_eq!(signed_out.title, "任务已停止");
+        // An interrupted process end keeps the recovery explanation.
+        let interrupted = turn_failure(&json!({"kind": "interrupted"})).expect("interrupted");
+        assert!(interrupted.message.contains("进程"));
+        assert!(interrupted.code.is_none());
+    }
+
+    #[test]
+    fn a_turn_failure_writes_one_transcript_row() {
+        let entry = turn_failure_entry(
+            3,
+            &json!({
+                "kind": "error",
+                "error": {"message": "Authentication Fails", "code": "AUTH", "status": 401},
+            }),
+            Some(12.0),
+        )
+        .expect("failure row");
+        assert_eq!(entry.role, EntryRole::Error);
+        assert_eq!(entry.key, "turn-error-3");
+        assert_eq!(entry.title, "本轮运行失败");
+        assert_eq!(entry.text, "API 密钥无效");
+        assert_eq!(entry.status, "AUTH");
     }
 
     #[test]
