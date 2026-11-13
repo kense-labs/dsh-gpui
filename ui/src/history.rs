@@ -131,6 +131,27 @@ fn content_texts(blocks: &[Value]) -> String {
         .join("\n")
 }
 
+/// Official Office row summary: the input file, and the output format of a
+/// conversion or recalculation.
+fn office_summary(name: &str, arguments: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(arguments).ok()?;
+    let input = value
+        .get("input")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|input| !input.is_empty())?;
+    let name_only = input.rsplit(['/', '\\']).next().unwrap_or(input);
+    if name == "office_render" {
+        return Some(name_only.to_owned());
+    }
+    let format = value
+        .get("format")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|format| !format.is_empty())?;
+    Some(format!("{name_only} → {format}"))
+}
+
 pub(crate) fn tool_title(name: &str, arguments: &str) -> String {
     // A replayed todo row must read the same as a live one, or reopening a
     // session silently downgrades it to the bare tool name.
@@ -144,12 +165,21 @@ pub(crate) fn tool_title(name: &str, arguments: &str) -> String {
     if name == "present" {
         return "交付文件".to_owned();
     }
-    // rc.3 tool titles for the Office tools (tool.title.office*).
-    match name {
-        "office_render" => return "渲染文档".to_owned(),
-        "office_convert" => return "转换文档".to_owned(),
-        "office_recalculate" => return "重算工作簿".to_owned(),
-        _ => {}
+    // rc.3 tool titles for the Office tools (tool.title.office*); their summary
+    // is the input file, plus the output format for convert/recalculate.
+    if matches!(
+        name,
+        "office_render" | "office_convert" | "office_recalculate"
+    ) {
+        let title = match name {
+            "office_render" => "渲染文档",
+            "office_convert" => "转换文档",
+            _ => "重算工作簿",
+        };
+        return match office_summary(name, arguments) {
+            Some(summary) => format!("{title} · {summary}"),
+            None => title.to_owned(),
+        };
     }
     if let Ok(value) = serde_json::from_str::<Value>(arguments) {
         if let Some(description) = value.get("description").and_then(Value::as_str) {
@@ -1714,6 +1744,25 @@ mod tests {
         assert_eq!(tool_title("office_render", "{}"), "渲染文档");
         assert_eq!(tool_title("office_convert", "{}"), "转换文档");
         assert_eq!(tool_title("office_recalculate", "{}"), "重算工作簿");
+        // The row summary is the input file (plus the output format when converting).
+        assert_eq!(
+            tool_title("office_render", r#"{"input":"/tmp/季度报告.docx"}"#),
+            "渲染文档 · 季度报告.docx"
+        );
+        assert_eq!(
+            tool_title(
+                "office_convert",
+                r#"{"input":"/tmp/季度报告.docx","format":"pdf"}"#
+            ),
+            "转换文档 · 季度报告.docx → pdf"
+        );
+        assert_eq!(
+            tool_title(
+                "office_recalculate",
+                r#"{"input":"C:\\Users\\leon\\预算.xlsx","format":"xlsx"}"#
+            ),
+            "重算工作簿 · 预算.xlsx → xlsx"
+        );
         assert_eq!(tool_title("present", "{}"), "交付文件");
         // A description still wins for ordinary tools.
         assert_eq!(
