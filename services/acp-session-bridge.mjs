@@ -58,6 +58,13 @@ const modelProviderMethods = new Set([
 ]);
 const questionStateMethod = '_dsh/gpui/session/questions';
 const questionDecisionMethod = '_dsh/gpui/session/question-decision';
+// The ACP prompt slot is single-flight, so a message composed while the agent
+// is busy cannot ride `session/prompt`. It becomes a durable Inbox item instead
+// (official ComposerSubmissionPolicy): `queue` appends a turn, `steer` joins
+// the running turn at its next step boundary.
+const queuePromptMethod = '_dsh/gpui/session/queue-prompt';
+const inboxStateMethod = '_dsh/gpui/session/inbox-state';
+const inboxActionMethod = '_dsh/gpui/session/inbox-action';
 const planReviews = new Map();
 const questionRequests = new Map();
 const messageMethods = new Map([
@@ -70,6 +77,7 @@ const extensionMethods = [
   permissionModeMethod, sessionCommandsMethod, executeSessionCommandMethod,
   runtimeSettingsMethod, webSettingsMethod, pluginCenterMethod, pluginInstallMethod,
   questionStateMethod, questionDecisionMethod, scheduleMethod, openHostSessionMethod, sessionArchiveMethod,
+  queuePromptMethod, inboxStateMethod, inboxActionMethod,
   ...modelProviderMethods, ...messageMethods.keys(),
 ];
 
@@ -1577,6 +1585,169 @@ function submittedPlanEvents(session, end) {
   return plans.reverse();
 }
 
+// --- Durable mid-turn submissions -------------------------------------------
+// Everything below reuses the Host's own Inbox: the message is admitted with
+// the same content vocabulary ACP prompts use (`admitAcpPrompt`), then either
+// appended to the next turn (`followup`) or steered into the running one.
+
+/** Accepted inline-image media types, identical to the ACP prompt admission. */
+const QUEUE_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+/** Canonical base64: whole quantum groups, one trailing padded group at most. */
+const CANONICAL_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+let llmModule;
+/** The Host's own LLM module, so message identity and freezing stay one implementation. */
+async function llmApi() {
+  return llmModule ??= await import(pathToFileURL(
+    createRequire(require.resolve('@deepseek-ai/dsh-base/package.json'))
+      .resolve('@deepseek-ai/dsh-llm')).href);
+}
+
+function queueRejected(message) {
+  return new SessionOperationError('session/queue-invalid', message);
+}
+
+/**
+ * Admit one composer payload into ordered core content.
+ * Mirrors `admitAcpPrompt`: validate every block first, persist the image batch
+ * as durable attachments, then rebuild the text/image order around the refs.
+ */
+async function queuePromptContent(ctx, agent, blocks) {
+  if (!Array.isArray(blocks) || blocks.length === 0) throw queueRejected('排队消息内容为空。');
+  const images = [];
+  for (const block of blocks) {
+    if (block?.type === 'text') {
+      if (typeof block.text !== 'string') throw queueRejected('排队消息的文本块无效。');
+      continue;
+    }
+    if (block?.type === 'image') {
+      const mediaType = typeof block.mimeType === 'string' && QUEUE_IMAGE_TYPES.has(block.mimeType)
+        ? block.mimeType : undefined;
+      if (mediaType === undefined) throw queueRejected('图片仅支持 PNG、JPG、WebP、GIF 格式。');
+      if (typeof block.data !== 'string' || !CANONICAL_BASE64.test(block.data)) {
+        throw queueRejected('图片数据不是规范的 base64。');
+      }
+      const data = Buffer.from(block.data, 'base64');
+      if (data.toString('base64') !== block.data) throw queueRejected('图片数据不是规范的 base64。');
+      images.push({ data, mediaType });
+      continue;
+    }
+    throw queueRejected('排队消息只支持文本和图片。');
+  }
+  let refs = [];
+  if (images.length > 0) {
+    const attachments = ctx.get('attachments');
+    const selection = agent.model.current();
+    if (attachments === undefined || selection === undefined) {
+      throw queueRejected('当前会话未准备好接收图片，请稍后重试。');
+    }
+    let info;
+    try {
+      info = await ctx.llm.resolveModelInfo(selection.provider, selection.model);
+    } catch {
+      throw queueRejected('无法确认当前模型是否支持图片。');
+    }
+    if (!Array.isArray(info?.inputModalities) || !info.inputModalities.includes('image')) {
+      throw queueRejected(`模型“${selection.model}”不支持图片输入。`);
+    }
+    try {
+      refs = await attachments.saveImages(images);
+    } catch (error) {
+      throw queueRejected(error instanceof Error ? error.message : String(error));
+    }
+  }
+  const content = [];
+  let pendingText = '';
+  let imageIndex = 0;
+  for (const block of blocks) {
+    if (block.type === 'text') {
+      pendingText += block.text;
+      continue;
+    }
+    if (pendingText.length > 0) {
+      content.push({ type: 'text', text: pendingText });
+      pendingText = '';
+    }
+    content.push({ type: 'image', attachment: refs[imageIndex++] });
+  }
+  if (pendingText.length > 0) content.push({ type: 'text', text: pendingText });
+  return content;
+}
+
+/** Resolve one live agent for an extension request. */
+function liveAgent(ctx, sessionId) {
+  const agent = ctx.get('agents')?.get(sessionId);
+  if (agent === undefined) throw new SessionOperationError('session/not-found', '会话不存在或尚未打开。');
+  return agent;
+}
+
+/** Pending Inbox rows in display order: queued turns first, then next-step steering. */
+function inboxRows(ctx, agent) {
+  let state;
+  try {
+    state = ctx.get('sessionProjections')?.snapshot(agent.session, ['inbox']).values.inbox;
+  } catch {
+    state = undefined;
+  }
+  const queued = state?.['next-turn'] ?? agent.inbox.nextTurn;
+  const steering = state?.['next-step'] ?? agent.inbox.nextStep;
+  const row = (message, mode) => ({
+    itemId: message.id,
+    mode,
+    text: contentBlocks(message.content),
+    hasImage: Array.isArray(message.content) && message.content.some(block => block?.type === 'image'),
+    sourceKind: message.source?.kind ?? 'user',
+  });
+  return [
+    ...queued.map(message => row(message, 'queue')),
+    ...steering.map(message => row(message, 'steer')),
+  ];
+}
+
+async function queuePrompt(ctx, params) {
+  const agent = liveAgent(ctx, params.sessionId);
+  const content = await queuePromptContent(ctx, agent, params.prompt);
+  const { createUserMessage } = await llmApi();
+  const message = createUserMessage({ content, source: { kind: 'user' } });
+  // Steering only owns the running turn; an idle agent takes the same message
+  // as the next turn instead of losing it (official `resolveSubmitMode`).
+  const steering = params.mode === 'steer' && agent.status === 'running';
+  if (steering) agent.steer(message);
+  else agent.followup(message);
+  return { itemId: message.id, mode: steering ? 'steer' : 'queue' };
+}
+
+function inboxState(ctx, params) {
+  const agent = liveAgent(ctx, params.sessionId);
+  // Echo the client's request sequence: a snapshot taken before a newer
+  // submission must not delete the row that submission added.
+  const requestSeq = Number.isSafeInteger(params.requestSeq) ? params.requestSeq : 0;
+  return { requestSeq, running: agent.status === 'running', items: inboxRows(ctx, agent) };
+}
+
+function inboxAction(ctx, params) {
+  const agent = liveAgent(ctx, params.sessionId);
+  const queued = agent.inbox.nextTurn.find(message => message.id === params.itemId);
+  const steering = agent.inbox.nextStep.find(message => message.id === params.itemId);
+  if (queued === undefined && steering === undefined) {
+    throw new SessionOperationError('session/queue-item', '排队消息已不在队列中。');
+  }
+  if (params.action === 'remove') {
+    return { removed: agent.inbox.remove(params.itemId) };
+  }
+  if (params.action === 'steer') {
+    // Official `session/steer-unavailable`: only a queued next-turn row can
+    // join a still-running turn.
+    if (queued === undefined || agent.status !== 'running') {
+      throw new SessionOperationError('session/steer-unavailable', '当前回合已结束，无法插话发送。');
+    }
+    agent.inbox.remove(params.itemId);
+    agent.steer(queued);
+    return { steered: true };
+  }
+  throw new SessionOperationError('session/queue-item', '不支持的排队消息操作。');
+}
+
 function observeSessionUpdates(ctx) {
   observePlanReviews(ctx);
   const notifyAgentStatus = (agent, running) => {
@@ -1622,6 +1793,19 @@ function observeSessionUpdates(ctx) {
       const source = data.source?.kind;
       if (source === 'user') {
         notify(session.id, { sessionUpdate: 'gpui_session_activity', time: event.time });
+        // The transcript row for a human message is durable: it is logged when
+        // the Inbox claims it, not when the client submits it. Forwarding the
+        // logged message lets the client reconcile its optimistic row, and is
+        // the only live source for a steering message admitted mid-turn.
+        notify(session.id, {
+          sessionUpdate: 'gpui_user_message',
+          messageId: data.id,
+          content: contentBlocks(data.content),
+          hasImage: Array.isArray(data.content)
+            && data.content.some(block => block?.type === 'image'),
+          time: event.time,
+          seq: event.seq,
+        });
       }
       // A non-human message is rendered as a trigger card (official
       // TurnTriggerNodeView), which needs the text and source kind. Forwarding
@@ -1678,6 +1862,14 @@ function observeSessionUpdates(ctx) {
         kind: data.kind,
         text: data.text,
       });
+      return;
+    }
+    // Every pending-Inbox mutation is durable and already carries its whole
+    // splice. The client re-reads the pending rows instead of rebuilding the
+    // splice chain itself, so a claimed steering item leaves the dock exactly
+    // when the Host admits it.
+    if (type === 'agent/inbox/spliced') {
+      notify(session.id, { sessionUpdate: 'gpui_inbox_changed', target: data.target });
       return;
     }
     // Background job lifecycle. `job/registered` opens a row and `job/settled`
@@ -1772,6 +1964,12 @@ async function extension({ id, method, params }) {
       response = { result: rows };
     } else if (typeof params?.sessionId !== 'string' || params.sessionId.length === 0) {
       response = { error: { code: -32602, message: 'Invalid session id' } };
+    } else if (method === queuePromptMethod) {
+      response = { result: await queuePrompt(ctx, params) };
+    } else if (method === inboxStateMethod) {
+      response = { result: inboxState(ctx, params) };
+    } else if (method === inboxActionMethod) {
+      response = { result: inboxAction(ctx, params) };
     } else if (method === recordMethod) {
       const feedback = ctx.get('sessionFeedback');
       response = feedback

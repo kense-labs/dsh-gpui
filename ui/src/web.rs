@@ -494,9 +494,23 @@ pub(crate) struct DraftAttachment {
     pub(crate) preview: Option<String>,
 }
 
-/// 排队发送：展示文案 + 已组装的 ACP prompt blocks。
+/// 排队发送：Host Inbox 里的待处理消息（官方 QueueDock 的一行）。
+///
+/// 消息一旦提交就归 Host 所有：`item_id` 是 Inbox 里的稳定身份，`mode` 说明
+/// 它等待新回合（排队）还是下一次步骤（插话）。客户端不再自己保存正文，
+/// 只按 Host 的待处理列表渲染，这样关闭应用也不会丢。
 #[derive(Clone)]
 pub(crate) struct QueuedPrompt {
+    pub(crate) item_id: String,
+    pub(crate) mode: crate::submit::SubmitMode,
+    pub(crate) display: String,
+    /// 加入队列时的本地序号：用于忽略比它更早请求的 Host 快照。
+    pub(crate) added_at: u64,
+}
+
+/// 已经组好 ACP prompt blocks、可以直接交给 `session/prompt` 的一条消息。
+#[derive(Clone)]
+pub(crate) struct OutgoingPrompt {
     pub(crate) display: String,
     pub(crate) prompt: Vec<Value>,
 }
@@ -803,8 +817,11 @@ impl DshApp {
             cx,
         );
         composer.update(cx, |editor, _| editor.set_command_submit(true));
+        // `EditorShortcutEvent` is Cmd/Ctrl+Enter: the complementary delivery
+        // gesture (official `resolveSubmitMode`), so a busy session steers
+        // instead of queueing.
         let submit = cx.subscribe_in(&composer, w, |this, _, _: &EditorShortcutEvent, w, cx| {
-            this.submit_prompt(w, cx);
+            this.submit_prompt_accelerated(w, cx);
         });
         let submit_plain = cx.subscribe_in(&composer, w, |this, _, event: &EditEvent, w, cx| {
             if *event == EditEvent::Submitted {
@@ -1769,6 +1786,9 @@ impl DshApp {
             invoke("plan_mode", json!({"sessionId": id}));
             invoke("question_state", json!({"sessionId": id}));
             invoke("session_commands", json!({"sessionId": id}));
+            // Reopening a session must restore the messages still waiting in
+            // the Host Inbox: they outlive the client that submitted them.
+            self.request_inbox_state(&id);
         }
         self.conversation.resumed_session = resumed;
         self.conversation.config_options = reply
@@ -2102,8 +2122,22 @@ impl DshApp {
         }
     }
 
-    /// Enter 提交入口：空闲即发送；生成中按官方行为排队。
+    /// Enter 提交入口：空闲即发送；生成中按官方行为投递到 Host Inbox。
     fn submit_prompt(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        self.submit_prompt_gesture(crate::submit::SubmitGesture::Enter, w, cx);
+    }
+
+    /// Cmd/Ctrl+Enter 提交入口：繁忙时使用与 Enter 互补的投递方式。
+    fn submit_prompt_accelerated(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        self.submit_prompt_gesture(crate::submit::SubmitGesture::Accelerated, w, cx);
+    }
+
+    fn submit_prompt_gesture(
+        &mut self,
+        gesture: crate::submit::SubmitGesture,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.conversation.permission_mode.changing()
             || self.confirm_permission.is_some()
             || self.conversation.command_busy
@@ -2146,8 +2180,11 @@ impl DshApp {
         {
             return;
         }
-        if self.conversation.running {
-            self.queue_prompt(w, cx);
+        // A prompt the Host has not settled yet still owns the single ACP
+        // prompt slot even after its turn ended, so a direct `session/prompt`
+        // would be rejected. Such a message goes through the Inbox as well.
+        if self.conversation.running || self.conversation.prompt_inflight {
+            self.queue_prompt(gesture, w, cx);
         } else {
             self.send_prompt(w, cx);
         }
@@ -2286,7 +2323,17 @@ impl DshApp {
         .detach();
     }
 
-    fn queue_prompt(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+    /// 繁忙时提交：投递到 Host Inbox（官方 `ComposerSubmissionPolicy`）。
+    ///
+    /// `queue` 等当前回合结束后再开一个新回合；`steer` 在当前回合的下一次
+    /// 步骤边界插入。消息一旦被 Host 接受就归它管：客户端只在 dock 里保留
+    /// 一行预览，关掉应用后由 `inbox_state` 补回。
+    fn queue_prompt(
+        &mut self,
+        gesture: crate::submit::SubmitGesture,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.connected() || self.creating_session {
             return;
         }
@@ -2294,20 +2341,110 @@ impl DshApp {
         if text.is_empty() && self.conversation.draft_attachments.is_empty() {
             return;
         }
+        let Some(session) = self.active_session.clone() else {
+            self.error = Some("会话尚未就绪，请稍后重试。".to_string());
+            cx.notify();
+            return;
+        };
+        // 兼容官方 `resolveSubmitMode`：会话无法插话（或已空闲）时一律排队；
+        // 具体落点仍由 Host 决定，因为它才是回合状态的所有者。
+        let mode = crate::submit::resolve_submit_mode(
+            crate::submit::DEFAULT_BUSY_ENTER,
+            self.conversation.running,
+            gesture,
+            self.conversation.acp_open,
+        );
         let (display, prompt) = build_prompt_payload(&text, &self.conversation.draft_attachments);
-        self.conversation.draft_attachments.clear();
-        replace(&self.composer, "", w, cx);
-        self.conversation
-            .queued_prompts
-            .push(QueuedPrompt { display, prompt });
+        let draft = self.composer.read(cx).value().to_owned();
+        let attachment_ids: Vec<String> = self
+            .conversation
+            .draft_attachments
+            .iter()
+            .map(|item| item.id.clone())
+            .collect();
+        self.dispatch_inbox_prompt(
+            session,
+            display,
+            prompt,
+            mode,
+            Some(CommandSubmission {
+                draft,
+                attachment_ids,
+            }),
+            w,
+            cx,
+        );
+    }
+
+    /// 把一条消息投递到 Host Inbox，并在成功后按需清理草稿与附件。
+    ///
+    /// 官方 admission 语义：投递失败时草稿和附件都留在原处，用户可以重试。
+    fn dispatch_inbox_prompt(
+        &mut self,
+        session: String,
+        display: String,
+        prompt: Vec<Value>,
+        mode: crate::submit::SubmitMode,
+        submission: Option<CommandSubmission>,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.error = None;
+        self.conversation.error = None;
+        self.page = WorkspacePage::Conversation;
         cx.notify();
+        cx.spawn_in(w, async move |this, cx| {
+            let result = bridge::invoke(
+                "queue_prompt",
+                json!({
+                    "sessionId": session,
+                    "prompt": prompt,
+                    "mode": mode.as_str(),
+                }),
+            )
+            .await;
+            let _ = this.update_in(cx, |this, w, cx| {
+                let selected = this.active_session.as_deref() == Some(session.as_str());
+                let Some(conversation) = this.conversation_mut(&session) else {
+                    return;
+                };
+                match result {
+                    Ok(reply) => {
+                        if let Some(item_id) = reply["itemId"].as_str() {
+                            let accepted =
+                                crate::submit::SubmitMode::from_wire(reply["mode"].as_str());
+                            conversation.push_inbox_row(item_id.to_owned(), accepted, display);
+                        }
+                        // 只有真正投递成功才清空草稿与附件。
+                        if let Some(CommandSubmission {
+                            ref draft,
+                            ref attachment_ids,
+                        }) = submission
+                        {
+                            conversation
+                                .draft_attachments
+                                .retain(|item| !attachment_ids.contains(&item.id));
+                            if !selected && conversation.draft == *draft {
+                                conversation.draft.clear();
+                            }
+                            if selected && this.composer.read(cx).value() == *draft {
+                                this.replace_composer_without_trigger("", w, cx);
+                            }
+                        }
+                    }
+                    Err(error) => conversation.error = Some(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn send_prompt(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         if !self.connected()
             || !self.conversation.acp_open
             || self.conversation.running
+            || self.conversation.prompt_inflight
             || self.creating_session
             || (self.conversation.history_loading && !self.conversation.history_prepend_pending)
         {
@@ -2337,11 +2474,11 @@ impl DshApp {
             session.blank = false;
         }
         self.error = None;
-        self.start_prompt(&session_id, QueuedPrompt { display, prompt }, cx);
+        self.start_prompt(&session_id, OutgoingPrompt { display, prompt }, cx);
         cx.notify();
     }
 
-    fn start_prompt(&mut self, session: &str, prompt: QueuedPrompt, cx: &mut Context<Self>) {
+    fn start_prompt(&mut self, session: &str, prompt: OutgoingPrompt, cx: &mut Context<Self>) {
         let defer_collapse = self.collapse_next_input;
         let Some(conversation) = self.conversation_mut(session) else {
             return;
@@ -2414,7 +2551,7 @@ impl DshApp {
         .detach();
     }
 
-    fn finish_session_turn(&mut self, session: &str, end: TurnEnd, cx: &mut Context<Self>) {
+    fn finish_session_turn(&mut self, session: &str, end: TurnEnd, _cx: &mut Context<Self>) {
         let Some(conversation) = self.conversation_mut(session) else {
             return;
         };
@@ -2426,12 +2563,10 @@ impl DshApp {
                 "输出达到 token 上限，可以继续发送消息。".into(),
             );
         }
-        let next = (end != TurnEnd::Failed && !conversation.queued_prompts.is_empty())
-            .then(|| conversation.queued_prompts.remove(0));
+        // Pending messages belong to the Host Inbox now: it opens the next turn
+        // on its own, so the client must not flush anything here. A failed
+        // prompt keeps its items queued for the user to review or remove.
         self.observe_local_session_activity(session, previous, false);
-        if let Some(next) = next {
-            self.start_prompt(session, next, cx);
-        }
         if self.active_session.as_deref() == Some(session) {
             self.maybe_follow_tail();
         }
@@ -2479,6 +2614,19 @@ impl DshApp {
                 TurnEnd::Failed
             }
         };
+        // A queued message can start the next turn before this ACP request
+        // settles, so the durable event stream may already have closed the
+        // turn. Ending it again would add a phantom turn summary.
+        if self
+            .conversation_mut(session)
+            .is_some_and(|conversation| !conversation.running)
+        {
+            if selected {
+                self.maybe_follow_tail();
+            }
+            cx.notify();
+            return;
+        }
         self.finish_session_turn(session, end, cx);
     }
 
@@ -2655,6 +2803,7 @@ impl DshApp {
                     }
                 }
             }
+            "inbox_state" => self.finish_inbox_state(owner, result, w, cx),
             "fork_session" => self.finish_fork(result, w, cx),
             "rename_session" => self.finish_session_rename(result, w, cx),
             "new_session" | "resume_session" => self.finish_session_open(result, w, cx),
@@ -2862,6 +3011,17 @@ impl DshApp {
         }
         let defer_collapse = self.collapse_next_input;
         let selected = self.active_session.as_deref() == Some(session);
+        // Inbox bookkeeping owns its own conversation lookup: a pending row can
+        // be claimed for a session that is currently parked, and the row must
+        // leave the dock either way.
+        if update["sessionUpdate"] == "gpui_user_message" {
+            self.apply_logged_user_message(session, update, cx);
+            return;
+        }
+        if update["sessionUpdate"] == "gpui_inbox_changed" {
+            self.request_inbox_state(session);
+            return;
+        }
         let Some(conversation) = self.conversation_mut(session) else {
             if self.creating_session {
                 self.opening_session_events.push(event);
@@ -2992,7 +3152,6 @@ impl DshApp {
         }
         if let Some(reason) = effect.turn_ended.as_deref()
             && conversation.running
-            && !conversation.prompt_inflight
         {
             use crate::history::turn_process::EndKind;
             let durable_end = update["turn"]
@@ -3528,6 +3687,7 @@ mod session_archive;
 mod session_context_menu;
 mod session_download;
 mod session_feedback;
+mod session_inbox;
 mod session_markdown;
 mod shortcut_settings;
 mod start_panel;
@@ -3663,6 +3823,17 @@ fn string_at(value: &Value, key: &str) -> String {
 }
 
 /// 组装 ACP `session/prompt` blocks：文本 + 内联图片（canonical base64）。
+/// 待投递行在 dock 里的展示文案：Host 只回文本，附件用占位符表示。
+fn pending_inbox_display(text: &str, has_image: bool) -> String {
+    let text = text.trim();
+    match (text.is_empty(), has_image) {
+        (true, true) => "[图片]".to_string(),
+        (true, false) => "（空消息）".to_string(),
+        (false, true) => format!("{text}\n[图片]"),
+        (false, false) => text.to_string(),
+    }
+}
+
 fn build_prompt_payload(text: &str, attachments: &[DraftAttachment]) -> (String, Vec<Value>) {
     let mut blocks = Vec::new();
     let mut display_lines = Vec::new();

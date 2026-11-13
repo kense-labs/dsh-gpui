@@ -626,6 +626,54 @@ pub async fn prompt(
         .await
 }
 
+/// Admit a composed message while the agent is busy as a durable Inbox item.
+/// `mode` is `queue` (next turn) or `steer` (next step of the running turn).
+#[tauri::command]
+pub async fn queue_prompt(
+    session_id: String,
+    prompt: Value,
+    mode: String,
+    service: State<'_, AcpService>,
+) -> Result<Value, String> {
+    connection(&service)
+        .await?
+        .request(
+            "_dsh/gpui/session/queue-prompt",
+            json!({"sessionId": session_id, "prompt": prompt, "mode": mode}),
+        )
+        .await
+}
+
+#[tauri::command]
+pub async fn inbox_state(
+    session_id: String,
+    service: State<'_, AcpService>,
+) -> Result<Value, String> {
+    connection(&service)
+        .await?
+        .request(
+            "_dsh/gpui/session/inbox-state",
+            json!({"sessionId": session_id}),
+        )
+        .await
+}
+
+#[tauri::command]
+pub async fn inbox_action(
+    session_id: String,
+    item_id: String,
+    action: String,
+    service: State<'_, AcpService>,
+) -> Result<Value, String> {
+    connection(&service)
+        .await?
+        .request(
+            "_dsh/gpui/session/inbox-action",
+            json!({"sessionId": session_id, "itemId": item_id, "action": action}),
+        )
+        .await
+}
+
 #[tauri::command]
 pub async fn cancel_session(
     session_id: String,

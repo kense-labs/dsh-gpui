@@ -102,7 +102,7 @@ enum Decision {
 struct PlanSubmission {
     draft: String,
     attachment_ids: Vec<String>,
-    prompt: Option<QueuedPrompt>,
+    prompt: Option<OutgoingPrompt>,
 }
 
 impl DshApp {
@@ -354,7 +354,7 @@ impl DshApp {
         }
         let prompt = (active && (!message.is_empty() || !attachments.is_empty())).then(|| {
             let (display, prompt) = build_prompt_payload(message, attachments);
-            QueuedPrompt { display, prompt }
+            OutgoingPrompt { display, prompt }
         });
         let attachment_ids = attachments.iter().map(|item| item.id.clone()).collect();
         self.set_plan_mode(
@@ -421,7 +421,7 @@ impl DshApp {
                         this.replace_composer_without_trigger("", w, cx);
                     }
                     if let Some(prompt) = prompt {
-                        this.continue_plan_prompt(&session, prompt, cx);
+                        this.continue_plan_prompt(&session, prompt, w, cx);
                     }
                 }
                 cx.notify();
@@ -433,20 +433,30 @@ impl DshApp {
     fn continue_plan_prompt(
         &mut self,
         session: &str,
-        prompt: QueuedPrompt,
+        prompt: OutgoingPrompt,
+        w: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(conversation) = self.conversation_mut(session) else {
-            return;
-        };
-        if conversation.running {
-            conversation.queued_prompts.push(prompt);
+        if let Some(row) = self.sessions.iter_mut().find(|row| row.id == session) {
+            row.title
+                .get_or_insert_with(|| short_session_title(&prompt.display));
+            row.blank = false;
+        }
+        if self
+            .conversation_mut(session)
+            .is_some_and(|conversation| conversation.running || conversation.prompt_inflight)
+        {
+            // 繁忙时同样交给 Host Inbox：/plan 的后续消息不能只存在客户端内存里。
+            self.dispatch_inbox_prompt(
+                session.to_owned(),
+                prompt.display,
+                prompt.prompt,
+                crate::submit::DEFAULT_BUSY_ENTER,
+                None,
+                w,
+                cx,
+            );
         } else {
-            if let Some(row) = self.sessions.iter_mut().find(|row| row.id == session) {
-                row.title
-                    .get_or_insert_with(|| short_session_title(&prompt.display));
-                row.blank = false;
-            }
             self.start_prompt(session, prompt, cx);
         }
     }

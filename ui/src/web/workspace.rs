@@ -3447,14 +3447,42 @@ impl DshApp {
             .on_click(cx.listener(|this, _, _, cx| this.cancel(cx)))
     }
 
-    /// 官方排队预览：每条可复制、取回编辑、删除。
+    /// 官方 QueueDock：Host Inbox 里每条待投递消息一行。
+    ///
+    /// 行来自 Host（关闭应用也不会丢），这里只负责展示与动作：复制、取回
+    /// 编辑、删除；排队中的行还可以改成插话，交给运行中的回合。
     fn render_queue_cards(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = dsh(cx);
+        let running = self.conversation.running;
+        let count = self.conversation.queued_prompts.len();
         let mut list = column().w_full().gap(px(6.));
+        if count > 1 {
+            list = list.child(
+                row()
+                    .w_full()
+                    .px(px(4.))
+                    .gap(px(6.))
+                    .items_center()
+                    .child(icon(Glyph::ArrowUp, 12., p.label_caption))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .line_height(px(16.))
+                            .text_color(p.label_caption)
+                            .child(format!("{count} 条排队消息")),
+                    ),
+            );
+        }
         for (index, queued) in self.conversation.queued_prompts.iter().enumerate() {
             let preview = short_text(&queued.display, 96);
             let for_copy = queued.display.clone();
-            let for_edit = queued.display.clone();
+            let mode = queued.mode;
+            let can_steer = running && mode == crate::submit::SubmitMode::Queue;
+            let steer_label = if can_steer {
+                "插话发送"
+            } else {
+                "排队中"
+            };
             list = list.child(
                 row()
                     .id(gpui::ElementId::Name(format!("queue-{index}").into()))
@@ -3470,6 +3498,19 @@ impl DshApp {
                     .bg(p.stage)
                     .child(
                         div()
+                            .flex_shrink_0()
+                            .px(px(6.))
+                            .py(px(1.))
+                            .rounded_full()
+                            .border(px(0.5))
+                            .border_color(p.line)
+                            .text_size(px(10.))
+                            .line_height(px(14.))
+                            .text_color(p.label_caption)
+                            .child(mode.label()),
+                    )
+                    .child(
+                        div()
                             .flex_1()
                             .min_w_0()
                             .text_size(px(13.))
@@ -3477,6 +3518,27 @@ impl DshApp {
                             .text_color(p.secondary)
                             .child(preview),
                     )
+                    .child(if can_steer {
+                        div()
+                            .id(gpui::ElementId::Name(format!("queue-steer-{index}").into()))
+                            .role(gpui::Role::Button)
+                            .aria_label(steer_label)
+                            .size(px(24.))
+                            .rounded(px(8.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(p.hover))
+                            .child(icon(Glyph::Send, 13., p.faint))
+                            .on_click(cx.listener(move |this, _, w, cx| {
+                                this.steer_queued_prompt(index, w, cx);
+                            }))
+                            .into_any_element()
+                    } else {
+                        // 没有运行中的回合时插话没有落点，占位保持行对齐。
+                        div().size(px(24.)).into_any_element()
+                    })
                     .child(
                         div()
                             .id(gpui::ElementId::Name(format!("queue-copy-{index}").into()))
@@ -3509,12 +3571,7 @@ impl DshApp {
                             .hover(|style| style.bg(p.hover))
                             .child(icon(Glyph::Edit, 13., p.faint))
                             .on_click(cx.listener(move |this, _, w, cx| {
-                                if index < this.conversation.queued_prompts.len() {
-                                    this.conversation.queued_prompts.remove(index);
-                                }
-                                replace(&this.composer, &for_edit, w, cx);
-                                this.focus_composer(w, cx);
-                                cx.notify();
+                                this.edit_queued_prompt(index, w, cx);
                             })),
                     )
                     .child(
@@ -3530,11 +3587,8 @@ impl DshApp {
                             .cursor_pointer()
                             .hover(|style| style.bg(p.hover))
                             .child(icon(Glyph::Close, 13., p.faint))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if index < this.conversation.queued_prompts.len() {
-                                    this.conversation.queued_prompts.remove(index);
-                                }
-                                cx.notify();
+                            .on_click(cx.listener(move |this, _, w, cx| {
+                                this.remove_queued_prompt(index, w, cx);
                             })),
                     ),
             );

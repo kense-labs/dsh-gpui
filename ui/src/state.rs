@@ -668,13 +668,100 @@ fn role_name(role: EntryRole) -> &'static str {
     }
 }
 
+/// Adopt the durable identity of one logged human message.
+///
+/// The transcript renders a submitted prompt optimistically before the Host
+/// logs it; when the durable `user/message` arrives the local row only needs its
+/// identity. A message admitted from the Inbox (a steering item, or a queued row
+/// that just became a turn) has no local row yet and is appended at the position
+/// the Host gave it. `display` is the preformatted row text for that new row.
+///
+/// @returns whether a new row was appended.
+pub fn adopt_logged_user_message(
+    entries: &mut Vec<ChatEntry>,
+    message_id: &str,
+    display: String,
+    at_ms: Option<f64>,
+) -> bool {
+    if entries
+        .iter()
+        .any(|entry| entry.external_id.as_deref() == Some(message_id))
+    {
+        return false;
+    }
+    if let Some(entry) = entries
+        .iter_mut()
+        .rev()
+        .find(|entry| entry.role == EntryRole::User && entry.external_id.is_none())
+    {
+        entry.external_id = Some(message_id.to_owned());
+        entry.at_ms = at_ms;
+        return false;
+    }
+    let mut entry = ChatEntry::local(EntryRole::User, format!("user-{message_id}"), display);
+    entry.external_id = Some(message_id.to_owned());
+    entry.at_ms = at_ms;
+    entries.push(entry);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        EntryRole, apply_update, context_entries_text, is_auth_failure, job_detail_text,
-        job_status_label, prompt_failure_message, validate_api_key,
+        ChatEntry, EntryRole, adopt_logged_user_message, apply_update, context_entries_text,
+        is_auth_failure, job_detail_text, job_status_label, prompt_failure_message,
+        validate_api_key,
     };
     use serde_json::json;
+
+    #[test]
+    fn a_logged_user_message_adopts_the_optimistic_row() {
+        // Normal send: the local row is already visible, so the durable event
+        // must only hand it the Host identity — never a second bubble.
+        let mut entries = Vec::new();
+        let mut local =
+            ChatEntry::local(EntryRole::User, "local-1", "带附件的显示文案 [图片] a.png");
+        local.at_ms = Some(1.0);
+        entries.push(local);
+        let appended = adopt_logged_user_message(&mut entries, "m-1", "[图片]".into(), Some(9.0));
+        assert!(!appended);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].external_id.as_deref(), Some("m-1"));
+        // The optimistic display keeps attachment names the log does not carry.
+        assert_eq!(entries[0].text, "带附件的显示文案 [图片] a.png");
+        assert_eq!(entries[0].at_ms, Some(9.0));
+    }
+
+    #[test]
+    fn an_admitted_inbox_message_appends_its_own_row() {
+        // Steering: the Host logs the message mid-turn with no local row
+        // before it, so the row appears where the log put it.
+        let mut entries = vec![ChatEntry::local(EntryRole::Assistant, "a-1", "正在处理")];
+        let appended = adopt_logged_user_message(&mut entries, "m-2", "补充说明".into(), Some(5.0));
+        assert!(appended);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].role, EntryRole::User);
+        assert_eq!(entries[1].text, "补充说明");
+        assert_eq!(entries[1].external_id.as_deref(), Some("m-2"));
+    }
+
+    #[test]
+    fn a_replayed_user_message_identity_is_idempotent() {
+        let mut entries = Vec::new();
+        assert!(adopt_logged_user_message(
+            &mut entries,
+            "m-3",
+            "第一条".into(),
+            Some(1.0)
+        ));
+        assert!(!adopt_logged_user_message(
+            &mut entries,
+            "m-3",
+            "第一条".into(),
+            Some(1.0)
+        ));
+        assert_eq!(entries.len(), 1);
+    }
 
     #[test]
     #[test]

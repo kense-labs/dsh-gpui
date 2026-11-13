@@ -22,6 +22,8 @@ mod sessions;
 #[cfg(any(target_family = "wasm", test))]
 mod shortcuts;
 pub mod state;
+#[cfg(any(target_family = "wasm", test))]
+pub mod submit;
 #[path = "../../shared/submitted_plan.rs"]
 mod submitted_plan;
 #[cfg(any(target_family = "wasm", test))]

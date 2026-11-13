@@ -18,6 +18,8 @@ pub(super) struct Conversation {
     pub(super) turn_summary: Option<TurnSummary>,
     pub(super) turn_usage_base: Option<u64>,
     pub(super) queued_prompts: Vec<QueuedPrompt>,
+    /// 待投递列表的本地单调序号；用于忽略比某一行更早请求的 Host 快照。
+    pub(super) inbox_seq: u64,
     pub(super) wrapped_code: std::collections::HashSet<String>,
     pub(super) turn_process: crate::history::turn_process::TurnProcess,
     pub(super) turn_disclosures: HashMap<u64, (u64, bool)>,
@@ -112,6 +114,85 @@ impl Conversation {
         let mut entry = ChatEntry::local(role, key, text);
         entry.at_ms = Some(bridge::now_ms());
         self.entries.push(entry);
+    }
+
+    /// 记下一行刚刚被 Host 接受的待投递消息。
+    pub(super) fn push_inbox_row(
+        &mut self,
+        item_id: String,
+        mode: crate::submit::SubmitMode,
+        display: String,
+    ) {
+        self.inbox_seq += 1;
+        let added_at = self.inbox_seq;
+        self.queued_prompts.push(QueuedPrompt {
+            item_id,
+            mode,
+            display,
+            added_at,
+        });
+    }
+
+    /// 为一次待投递快照请求分配序号；Host 会把它原样回传。
+    pub(super) fn inbox_snapshot_request(&mut self) -> u64 {
+        self.inbox_seq += 1;
+        self.inbox_seq
+    }
+
+    /// 用 Host 的待投递快照替换本地列表。
+    ///
+    /// 快照可能早于本地刚提交的一条消息（两次投递几乎同时发生时），所以
+    /// 只删除在快照请求之前就存在的行：`added_at` 是本地单调序号，
+    /// `issued_at` 是请求时的序号。
+    pub(super) fn apply_inbox_snapshot(&mut self, items: &[Value], issued_at: u64) {
+        let mut rows: Vec<QueuedPrompt> = Vec::with_capacity(items.len());
+        for item in items {
+            let Some(item_id) = item["itemId"].as_str() else {
+                continue;
+            };
+            let mode = crate::submit::SubmitMode::from_wire(item["mode"].as_str());
+            // 本地行记得附件名等展示细节，保留它；Host 恢复的行只有正文。
+            let local = self
+                .queued_prompts
+                .iter()
+                .find(|row| row.item_id == item_id);
+            let (display, added_at) = match local {
+                Some(row) => (row.display.clone(), row.added_at),
+                None => (
+                    pending_inbox_display(
+                        item["text"].as_str().unwrap_or_default(),
+                        item["hasImage"].as_bool().unwrap_or(false),
+                    ),
+                    0,
+                ),
+            };
+            rows.push(QueuedPrompt {
+                item_id: item_id.to_owned(),
+                mode,
+                display,
+                added_at,
+            });
+        }
+        for row in &self.queued_prompts {
+            if row.added_at > issued_at && !rows.iter().any(|kept| kept.item_id == row.item_id) {
+                rows.push(row.clone());
+            }
+        }
+        self.queued_prompts = rows;
+    }
+
+    /// Host 受理（claim）了一条待投递消息：它已经变成 transcript 里的持久行。
+    pub(super) fn admit_inbox_row(&mut self, item_id: &str) {
+        self.queued_prompts.retain(|row| row.item_id != item_id);
+    }
+
+    /// 把一条排队消息改成插话投递。
+    pub(super) fn steer_inbox_row(&mut self, item_id: &str) {
+        for row in &mut self.queued_prompts {
+            if row.item_id == item_id {
+                row.mode = crate::submit::SubmitMode::Steer;
+            }
+        }
     }
 
     pub(super) fn reconcile_assistant_stream(
