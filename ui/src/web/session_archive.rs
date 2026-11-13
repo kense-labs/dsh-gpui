@@ -77,16 +77,19 @@ impl DshApp {
                             app.apply_archive_snapshot(&reply);
                             app.save_workspace_preferences(cx);
                             app.close_archive_confirmation(w, cx);
-                            app.push_toast(
-                                if !archived {
-                                    "已取消归档"
-                                } else if stop_activity {
-                                    "已停止并归档"
+                            if archived {
+                                // Official archive notice: the toast carries the
+                                // session so it can offer 撤销 / 筛选已归档会话.
+                                let message = if stop_activity {
+                                    "已停止并归档，可"
                                 } else {
-                                    "会话已归档"
-                                },
-                                cx,
-                            );
+                                    "会话已归档，可"
+                                };
+                                let archived_id = id.clone();
+                                app.push_archive_toast(archived_id, message, cx);
+                            } else {
+                                app.push_toast("已取消归档", cx);
+                            }
                         }
                     }
                     Err(error) => {

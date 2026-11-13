@@ -3398,6 +3398,65 @@ impl DshApp {
             // `dsh-toast-in 160ms ease-out` then `dsh-toast-fade 1000ms ease`
             // delayed by the hold, which is what the layer's lifetimes encode.
             let (opacity, rise) = crate::anim::toast_frame(age);
+            // Official archive notice: message then inline 撤销 · 或 ·
+            // 筛选已归档会话 actions (ui-workspace archiveNotice toastActions).
+            let archive_session = toast.archive_session.clone();
+            let mut body = row()
+                .flex_wrap()
+                .items_center()
+                .gap(px(2.))
+                .child(div().child(toast.message.clone()));
+            if let Some(session) = archive_session {
+                let undo_session = session.clone();
+                let filter_session = session;
+                body = body
+                    .child(
+                        div()
+                            .id(gpui::ElementId::Name(
+                                format!("toast-undo-{undo_session}").into(),
+                            ))
+                            .role(gpui::Role::Button)
+                            .aria_label("撤销归档")
+                            .tab_index(0)
+                            .cursor_pointer()
+                            .text_color(p.link)
+                            .hover(|style| style.underline())
+                            .child("撤销")
+                            .on_click(cx.listener(move |this, _, w, cx| {
+                                this.toasts.retain(|toast| {
+                                    toast.archive_session.as_deref() != Some(&undo_session)
+                                });
+                                this.set_session_archived(
+                                    undo_session.clone(),
+                                    false,
+                                    false,
+                                    w,
+                                    cx,
+                                );
+                            })),
+                    )
+                    .child(div().opacity(0.75).child("或"))
+                    .child(
+                        div()
+                            .id(gpui::ElementId::Name(
+                                format!("toast-archived-filter-{filter_session}").into(),
+                            ))
+                            .role(gpui::Role::Button)
+                            .aria_label("筛选已归档会话")
+                            .tab_index(0)
+                            .cursor_pointer()
+                            .text_color(p.link)
+                            .hover(|style| style.underline())
+                            .child("筛选已归档会话")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toasts.retain(|toast| {
+                                    toast.archive_session.as_deref() != Some(&filter_session)
+                                });
+                                this.workspace_archived_filter = WorkspaceArchivedFilter::Show;
+                                cx.notify();
+                            })),
+                    );
+            }
             list = list.child(
                 div()
                     .max_w(px(640.))
@@ -3411,7 +3470,7 @@ impl DshApp {
                     .line_height(px(22.))
                     .opacity(opacity.clamp(0., 1.))
                     .top(px(rise))
-                    .child(toast.message.clone()),
+                    .child(body),
             );
         }
         list

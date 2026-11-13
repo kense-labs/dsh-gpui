@@ -597,6 +597,9 @@ pub(crate) struct Toast {
     pub(crate) message: String,
     /// 创建时刻；3s 后开始 1s 淡出，4s 移除。
     pub(crate) at: f64,
+    /// Session id when this toast offers the official archive actions
+    /// (撤销 / 筛选已归档会话).
+    pub(crate) archive_session: Option<String>,
 }
 
 /// One failed host-path open (official `FileOpenErrorDialog`).
@@ -1253,6 +1256,26 @@ impl DshApp {
     /// 官方 toast：160ms 滑入，停留 3s，1s 淡出后移除（总 4s）。
     /// 生命周期由 `anim` 的常量推导，避免渲染曲线与卸载定时器各写一个数而漂移。
     pub(crate) fn push_toast(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        self.push_toast_inner(message, None, cx);
+    }
+
+    /// Official archive notice: the same banner also offers 撤销 and
+    /// 筛选已归档会话 actions for the session that was just archived.
+    pub(crate) fn push_archive_toast(
+        &mut self,
+        session: String,
+        message: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.push_toast_inner(message, Some(session), cx);
+    }
+
+    fn push_toast_inner(
+        &mut self,
+        message: impl Into<String>,
+        archive_session: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let total_ms = (anim::TOAST_TOTAL_SECONDS * 1000.) as f64;
         // Wake slightly after the fade finishes so the last frame is not clipped.
         let wake_ms = total_ms as u64 + 100;
@@ -1261,6 +1284,7 @@ impl DshApp {
         self.toasts.push(Toast {
             message: message.into(),
             at: bridge::monotonic_ms(),
+            archive_session,
         });
         cx.notify();
         cx.spawn(async move |this, cx| {
