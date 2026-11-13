@@ -1947,6 +1947,9 @@ impl DshApp {
     }
 
     fn render_conversation(&mut self, w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Self-heal the live turn clock before any immutable borrows of the
+        // conversation are created (the tool tree below holds one).
+        self.start_turn_ticker(cx);
         self.prepare_rating_rows(w, cx);
         let p = dsh(cx);
         let flow_rows = super::flow_scroll::FlowRows::default();

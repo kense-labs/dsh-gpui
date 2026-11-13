@@ -717,6 +717,9 @@ pub(crate) struct DshApp {
     native_fullscreen: bool,
     pub(crate) welcome: gpui::Entity<Welcome>,
     turn_ticker_running: bool,
+    /// Last tick from the live turn clock. A stale flag with an old heartbeat
+    /// means the previous ticker exited without clearing the flag.
+    turn_ticker_heartbeat: f64,
     _composer_subscriptions: Vec<Subscription>,
     _workspace_rename_subscription: Subscription,
     _session_rename_subscription: Subscription,
@@ -1072,6 +1075,7 @@ impl DshApp {
             native_fullscreen: false,
             welcome,
             turn_ticker_running: false,
+            turn_ticker_heartbeat: 0.,
             _composer_subscriptions: vec![submit, submit_plain],
             _workspace_rename_subscription: workspace_rename_subscription,
             _session_rename_subscription: session_rename_subscription,
@@ -2333,10 +2337,18 @@ impl DshApp {
     }
 
     fn start_turn_ticker(&mut self, cx: &mut Context<Self>) {
-        if self.turn_ticker_running || !self.conversation.running {
+        if !self.conversation.running {
+            return;
+        }
+        let now = bridge::monotonic_ms();
+        // A previous ticker can exit when its `this.update` fails, leaving the
+        // flag true forever and freezing the elapsed seconds. A stale
+        // heartbeat means it is dead: restart instead of blocking every turn.
+        if self.turn_ticker_running && now - self.turn_ticker_heartbeat < 3_000. {
             return;
         }
         self.turn_ticker_running = true;
+        self.turn_ticker_heartbeat = now;
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -2344,6 +2356,20 @@ impl DshApp {
                     .await;
                 let live = this
                     .update(cx, |app, cx| {
+                        let now = bridge::monotonic_ms();
+                        app.turn_ticker_heartbeat = now;
+                        // A response can stop mid-stream without any end or
+                        // error event; end the turn so it cannot hang forever.
+                        if app.conversation.running
+                            && crate::validation::turn_stalled(
+                                now,
+                                app.conversation.last_event_ms,
+                                crate::validation::TURN_STALL_MS,
+                            )
+                        {
+                            app.conversation.finish_turn(TurnEnd::Failed);
+                            app.push_toast("长时间未收到响应，已停止等待，请重试。", cx);
+                        }
                         let live = app.conversation.running;
                         app.turn_ticker_running = live;
                         if live {
@@ -2800,6 +2826,11 @@ impl DshApp {
                 self.apply_durable_session_title(session, title, seq);
             }
             return;
+        }
+        // Any ACP content event proves the turn is still alive. State-only
+        // updates (agent status / title / activity) return before this point.
+        if let Some(conversation) = self.conversation_mut(session) {
+            conversation.last_event_ms = Some(bridge::monotonic_ms());
         }
         let defer_collapse = self.collapse_next_input;
         let selected = self.active_session.as_deref() == Some(session);

@@ -75,9 +75,16 @@ pub(crate) fn validate_recurrence(value: &str) -> Result<Recurrence, &'static st
     Err("运行规则格式无效，请检查后重试。")
 }
 
+/// A live turn with no ACP events for this long is treated as stalled.
+pub(crate) const TURN_STALL_MS: f64 = 120_000.;
+
+pub(crate) fn turn_stalled(now_ms: f64, last_event_ms: Option<f64>, threshold_ms: f64) -> bool {
+    last_event_ms.is_some_and(|last| now_ms - last >= threshold_ms)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Recurrence, valid_provider_url, validate_recurrence};
+    use super::{Recurrence, TURN_STALL_MS, turn_stalled, valid_provider_url, validate_recurrence};
 
     #[test]
     fn provider_urls_require_http_and_a_valid_host() {
@@ -102,6 +109,14 @@ mod tests {
         ] {
             assert!(!valid_provider_url(value), "should reject {value}");
         }
+    }
+
+    #[test]
+    fn stalled_turn_needs_a_real_event_gap() {
+        assert!(!turn_stalled(60_000., Some(50_000.), TURN_STALL_MS));
+        assert!(turn_stalled(180_000., Some(50_000.), TURN_STALL_MS));
+        // No timestamp yet (e.g. a freshly restored turn) must not time out.
+        assert!(!turn_stalled(180_000., None, TURN_STALL_MS));
     }
 
     #[test]

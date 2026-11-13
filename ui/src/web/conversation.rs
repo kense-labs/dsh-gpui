@@ -12,6 +12,9 @@ pub(super) struct Conversation {
     pub(super) running: bool,
     pub(super) prompt_inflight: bool,
     pub(super) turn_started: Option<f64>,
+    /// Monotonic ms of the last ACP content event. A live turn with no events
+    /// for too long is ended by the turn clock instead of hanging forever.
+    pub(super) last_event_ms: Option<f64>,
     pub(super) turn_summary: Option<TurnSummary>,
     pub(super) turn_usage_base: Option<u64>,
     pub(super) queued_prompts: Vec<QueuedPrompt>,
@@ -72,7 +75,9 @@ impl Conversation {
 
     pub(super) fn begin_turn(&mut self) {
         self.running = true;
-        self.turn_started = Some(bridge::monotonic_ms());
+        let now = bridge::monotonic_ms();
+        self.turn_started = Some(now);
+        self.last_event_ms = Some(now);
         self.turn_summary = None;
         self.turn_usage_base = self.usage.map(|(used, _)| used);
     }
@@ -93,6 +98,7 @@ impl Conversation {
             }
         }
         self.turn_started = None;
+        self.last_event_ms = None;
         self.last_turn_settled = Some(bridge::monotonic_ms());
         self.turn_summary = Some(TurnSummary { end, seconds, used });
         self.running = false;
