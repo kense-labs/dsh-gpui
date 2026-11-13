@@ -3426,6 +3426,13 @@ impl DshApp {
                                 this.toasts.retain(|toast| {
                                     toast.archive_session.as_deref() != Some(&undo_session)
                                 });
+                                // Optimistic restore: the Host round-trip can take
+                                // a couple of seconds, and the row should come back
+                                // the moment the user undoes the archive. A Host
+                                // failure surfaces its own toast and the next
+                                // snapshot reconciles the flag.
+                                this.archived_sessions.remove(&undo_session);
+                                cx.notify();
                                 this.set_session_archived(
                                     undo_session.clone(),
                                     false,
