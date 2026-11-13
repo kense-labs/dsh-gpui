@@ -21,6 +21,7 @@ mod provider_marks;
 mod questions;
 #[cfg(any(target_family = "wasm", test))]
 mod right_dock;
+pub mod search_rules;
 #[cfg(any(target_family = "wasm", test))]
 mod sessions;
 #[cfg(any(target_family = "wasm", test))]

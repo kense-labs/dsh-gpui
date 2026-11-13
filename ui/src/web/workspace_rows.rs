@@ -16,6 +16,34 @@ impl DshApp {
     }
 
     pub(super) fn apply_workspace_preferences(&mut self, reply: Value, cx: &mut Context<Self>) {
+        self.files_search_prefs = reply
+            .get("filesSearch")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .map(|(workspace, preference)| {
+                let rules = preference
+                    .get("rules")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|rule| {
+                        let path = rule.get("path").and_then(Value::as_str)?.trim();
+                        (!path.is_empty()).then(|| crate::search_rules::SearchRule {
+                            path: path.to_owned(),
+                            enabled: rule.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+                        })
+                    })
+                    .collect();
+                let view = crate::web::FilesSearchPreferenceView {
+                    rules,
+                    show_hidden: preference.get("showHidden").and_then(Value::as_bool),
+                    respect_gitignore: preference.get("respectGitignore").and_then(Value::as_bool),
+                };
+                (workspace.clone(), view)
+            })
+            .collect();
+        self.apply_files_search_workspace();
         self.workspace_open_with = reply["workspaceOpenWith"]
             .as_str()
             .filter(|value| !value.is_empty())
@@ -162,6 +190,40 @@ impl DshApp {
         collapsed.sort();
         pinned.sort();
         archived.sort();
+        let mut files_search: std::collections::HashMap<String, Value> = self
+            .files_search_prefs
+            .iter()
+            .map(|(workspace, preference)| {
+                (
+                    workspace.clone(),
+                    json!({
+                        "rules": preference
+                            .rules
+                            .iter()
+                            .map(|rule| json!({"path": rule.path, "enabled": rule.enabled}))
+                            .collect::<Vec<_>>(),
+                        "showHidden": preference.show_hidden,
+                        "respectGitignore": preference.respect_gitignore,
+                    }),
+                )
+            })
+            .collect();
+        let key = self.sidebar.workspace.trim_end_matches('/').to_owned();
+        if !key.is_empty() {
+            let current = self.files_search_preference_view();
+            files_search.insert(
+                key,
+                json!({
+                    "rules": current
+                        .rules
+                        .iter()
+                        .map(|rule| json!({"path": rule.path, "enabled": rule.enabled}))
+                        .collect::<Vec<_>>(),
+                    "showHidden": current.show_hidden,
+                    "respectGitignore": current.respect_gitignore,
+                }),
+            );
+        }
         invoke(
             "save_workspace_preferences",
             json!({
@@ -206,6 +268,7 @@ impl DshApp {
                         WorkDetailsMode::Detailed => "detailed",
                         WorkDetailsMode::Verbose => "verbose",
                     },
+                    "filesSearch": files_search,
                 }
             }),
         );

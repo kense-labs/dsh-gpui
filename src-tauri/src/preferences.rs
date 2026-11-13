@@ -39,6 +39,29 @@ pub struct WorkspacePreferences {
     pub link_open: Option<String>,
     /// Composer statistics detail level: `compact` or `detailed`.
     pub performance_usage: Option<String>,
+    /// Files-search preferences by workspace root (official per-workspace
+    /// sidebar-files search storage).
+    pub files_search: HashMap<String, FilesSearchPreference>,
+}
+
+/// One Files-search exclusion rule as persisted.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct FilesSearchRulePreference {
+    pub path: String,
+    pub enabled: bool,
+}
+
+/// One workspace root's persisted Files-search preferences.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct FilesSearchPreference {
+    /// Exclusion rules, newest first.
+    pub rules: Vec<FilesSearchRulePreference>,
+    /// Whether hidden entries participate; defaults to hidden.
+    pub show_hidden: Option<bool>,
+    /// Whether `.gitignore` rules apply; defaults to on.
+    pub respect_gitignore: Option<bool>,
 }
 
 #[tauri::command]
@@ -120,7 +143,7 @@ fn write_preferences(path: &PathBuf, preferences: &impl Serialize) -> Result<(),
 
 #[cfg(test)]
 mod tests {
-    use super::WorkspacePreferences;
+    use super::{FilesSearchPreference, FilesSearchRulePreference, WorkspacePreferences};
 
     #[test]
     fn link_open_preference_round_trips_as_camel_case() {
@@ -136,6 +159,40 @@ mod tests {
             serde_json::from_value(encoded).expect("deserialize preferences");
         assert_eq!(decoded.link_open.as_deref(), Some("new-tab"));
         assert_eq!(decoded.performance_usage.as_deref(), Some("compact"));
+    }
+
+    #[test]
+    fn files_search_preferences_round_trip_as_camel_case() {
+        let mut preferences = WorkspacePreferences::default();
+        preferences.files_search.insert(
+            "/Users/leon/Documents/KWork".to_string(),
+            FilesSearchPreference {
+                rules: vec![FilesSearchRulePreference {
+                    path: "node_modules".to_string(),
+                    enabled: false,
+                }],
+                show_hidden: Some(true),
+                respect_gitignore: Some(false),
+            },
+        );
+        preferences
+            .files_search
+            .insert("/tmp/other".to_string(), FilesSearchPreference::default());
+        let encoded = serde_json::to_value(&preferences).expect("encode");
+        let entry = &encoded["filesSearch"]["/Users/leon/Documents/KWork"];
+        assert_eq!(entry["rules"][0]["path"], "node_modules");
+        assert_eq!(entry["rules"][0]["enabled"], false);
+        assert_eq!(entry["showHidden"], true);
+        assert_eq!(entry["respectGitignore"], false);
+        let decoded: WorkspacePreferences = serde_json::from_value(encoded).expect("decode");
+        assert_eq!(
+            decoded.files_search.get("/Users/leon/Documents/KWork"),
+            preferences.files_search.get("/Users/leon/Documents/KWork")
+        );
+        // A file written before the search preferences existed still loads.
+        let older: WorkspacePreferences =
+            serde_json::from_str(r#"{"aliases":{}}"#).expect("older file");
+        assert!(older.files_search.is_empty());
     }
 
     #[test]

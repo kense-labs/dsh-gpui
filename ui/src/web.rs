@@ -587,6 +587,14 @@ pub(crate) struct FileOpenError {
     pub(crate) reveal: bool,
 }
 
+/// One workspace root's Files-search preferences (official per-workspace search storage).
+#[derive(Clone, Default)]
+pub(super) struct FilesSearchPreferenceView {
+    pub(super) rules: Vec<crate::search_rules::SearchRule>,
+    pub(super) show_hidden: Option<bool>,
+    pub(super) respect_gitignore: Option<bool>,
+}
+
 pub(crate) struct DshApp {
     pub(crate) status: ServiceStatus,
     service_starting: bool,
@@ -785,6 +793,16 @@ pub(crate) struct DshApp {
     pub(crate) files_search_editor: gpui::Entity<Editor>,
     _files_search_subscription: Subscription,
     pub(super) files_search: dock_files::FilesSearchState,
+    /// Search preferences of the active workspace (official Files search).
+    pub(super) files_search_rules: Vec<crate::search_rules::SearchRule>,
+    pub(super) files_search_show_hidden: bool,
+    pub(super) files_search_respect_gitignore: bool,
+    /// Whether the exclusion-rules panel is open under the search bar.
+    pub(super) files_search_settings_open: bool,
+    pub(super) files_search_rule_editor: gpui::Entity<Editor>,
+    pub(super) files_search_rule_error: Option<String>,
+    /// Search preferences of every workspace root this client has seen.
+    pub(super) files_search_prefs: HashMap<String, FilesSearchPreferenceView>,
     _model_filter_subscription: Subscription,
     _config_subscriptions: Vec<Subscription>,
     _welcome_subscription: Subscription,
@@ -928,6 +946,8 @@ impl DshApp {
             cx,
         );
         let files_search_editor = editor("搜索文件".into(), InputMode::Search, w, cx);
+        let files_search_rule_editor = editor("添加文件或目录".into(), InputMode::Single, w, cx);
+        files_search_rule_editor.update(cx, |input, _| input.font_size = 12.);
         files_search_editor.update(cx, |input, _| input.font_size = 13.);
         let files_search_subscription = cx.subscribe_in(
             &files_search_editor,
@@ -1179,6 +1199,13 @@ impl DshApp {
             files_search_editor,
             _files_search_subscription: files_search_subscription,
             files_search: dock_files::FilesSearchState::default(),
+            files_search_rules: crate::search_rules::default_rules(),
+            files_search_show_hidden: false,
+            files_search_respect_gitignore: true,
+            files_search_settings_open: false,
+            files_search_rule_editor,
+            files_search_rule_error: None,
+            files_search_prefs: HashMap::new(),
             _model_filter_subscription: model_filter_subscription,
             _config_subscriptions: Vec::new(),
             _welcome_subscription: welcome_subscription,
@@ -1294,6 +1321,9 @@ impl DshApp {
             self.sidebar.workspace.clone_from(&session.cwd);
             self.sidebar.file_trees.clear();
             self.sidebar.documents.clear();
+            // Official Files search preferences are per workspace root.
+            self.apply_files_search_workspace();
+            replace(&self.files_search_editor, "", w, cx);
         }
         self.sessions.retain(|known| known.id != session.id);
         self.sessions.insert(0, session.clone());
@@ -2099,6 +2129,41 @@ impl DshApp {
         );
     }
 
+    /// Load the active workspace root's Files-search preferences, falling back
+    /// to the official defaults.
+    pub(super) fn apply_files_search_workspace(&mut self) {
+        let key = self.sidebar.workspace.trim_end_matches('/').to_owned();
+        let preference = self
+            .files_search_prefs
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        self.files_search_rules = if preference.rules.is_empty() {
+            crate::search_rules::default_rules()
+        } else {
+            preference.rules
+        };
+        self.files_search_show_hidden = preference.show_hidden.unwrap_or(false);
+        self.files_search_respect_gitignore = preference.respect_gitignore.unwrap_or(true);
+        self.files_search_settings_open = false;
+        self.files_search_rule_error = None;
+        self.files_search = dock_files::FilesSearchState::default();
+    }
+
+    /// Snapshot the active workspace's Files-search preferences.
+    fn files_search_preference_view(&self) -> FilesSearchPreferenceView {
+        FilesSearchPreferenceView {
+            rules: self.files_search_rules.clone(),
+            show_hidden: Some(self.files_search_show_hidden),
+            respect_gitignore: Some(self.files_search_respect_gitignore),
+        }
+    }
+
+    /// Re-run the Files search after a preference changed (hidden entries etc.).
+    pub(super) fn run_files_search_for_ui(&mut self, cx: &mut Context<Self>) {
+        self.run_files_search(cx);
+    }
+
     /// Run the official Files-pane workspace search for the current query.
     fn run_files_search(&mut self, cx: &mut Context<Self>) {
         let query = self.files_search.query.trim().to_owned();
@@ -2115,17 +2180,14 @@ impl DshApp {
         let request_id = self.files_search.request;
         self.files_search.loading = true;
         self.files_search.error = None;
-        let excluded: Vec<String> = dock_files::DEFAULT_SEARCH_EXCLUSIONS
-            .iter()
-            .map(|path| (*path).to_owned())
-            .collect();
+        let excluded = crate::search_rules::enabled_paths(&self.files_search_rules);
         invoke(
             "search_workspace_files",
             json!({
                 "workspace": workspace,
                 "query": query,
-                "includeHidden": false,
-                "respectGitignore": true,
+                "includeHidden": self.files_search_show_hidden,
+                "respectGitignore": self.files_search_respect_gitignore,
                 "excludedPaths": excluded,
                 "requestId": request_id,
             }),
