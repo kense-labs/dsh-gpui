@@ -831,7 +831,7 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                 }
                 if let Some(&index) = tool_index.get(&call_id) {
                     let entry = &mut out.entries[index];
-                    entry.text = output;
+                    entry.text = crate::tool_output::display(&output);
                     entry.status = status.to_owned();
                 } else {
                     let arguments = event.get("questionArguments");

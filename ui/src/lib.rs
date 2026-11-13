@@ -40,6 +40,7 @@ mod terminal_keys;
 pub mod tokens;
 mod tool_calls;
 pub mod tool_detail;
+pub mod tool_output;
 pub mod turns;
 pub mod validation;
 

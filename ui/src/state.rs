@@ -229,7 +229,9 @@ pub fn apply_update(entries: &mut Vec<ChatEntry>, update: &Value) -> UpdateEffec
                     && entry.external_id.as_deref() == Some(id.as_str())
             }) {
                 if update.get("content").is_some() {
-                    entry.text = output;
+                    // The read/write tools wrap their payload in a wire envelope;
+                    // the row shows the payload, never `<path>…`.
+                    entry.text = crate::tool_output::display(&output);
                 }
                 if !matches!(entry.status.as_str(), "ASK_CANCELLED" | "ASK_ABORTED")
                     && let Some(status) = update["status"].as_str()
