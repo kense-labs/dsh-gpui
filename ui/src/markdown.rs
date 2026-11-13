@@ -307,6 +307,16 @@ fn ordered_item(trimmed: &str) -> Option<&str> {
     Some(separator.trim())
 }
 
+/// Whether a fence language is a display-TeX fence.
+///
+/// The official client typesets these with KaTeX; this UI shows the source.
+pub(crate) fn is_math_fence(lang: &str) -> bool {
+    matches!(
+        lang.trim().to_lowercase().as_str(),
+        "math" | "tex" | "latex" | "katex"
+    )
+}
+
 /// 兼容旧调用：仅返回粗体/代码区间（不含链接）。
 pub(crate) struct InlineSpan {
     pub(crate) start: usize,
@@ -700,6 +710,16 @@ mod tests {
             if let InlinePart::Text { text, .. } = part {
                 assert!(!text.contains("**"), "stray marker in {text:?}");
             }
+        }
+    }
+
+    #[test]
+    fn math_fences_use_their_own_presentation() {
+        for lang in ["math", "TeX", " latex ", "KATEX"] {
+            assert!(super::is_math_fence(lang), "{lang}");
+        }
+        for lang in ["", "rust", "mathematica", "text"] {
+            assert!(!super::is_math_fence(lang), "{lang}");
         }
     }
 

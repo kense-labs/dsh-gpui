@@ -6496,7 +6496,7 @@ fn render_entry(
                     } else if let Some(search) = &search {
                         detail = detail.child(render_search_card(search, p));
                     } else if let Some(web) = &web {
-                        detail = detail.child(render_web_card(web, p));
+                        detail = detail.child(render_web_card(web, p, cx));
                     } else if !entry.text.is_empty() {
                         let output = crate::tool_detail::detail_text(&entry.text);
                         detail = detail.child(code_text(&output.shown, p));
@@ -8691,6 +8691,11 @@ pub(super) fn render_markdown(
                     ),
                 }
             }
+            Block::Code { lang, text } if crate::markdown::is_math_fence(&lang) => {
+                // 官方用 KaTeX 排版；GPUI 侧无 TeX 引擎，这里居中展示 TeX 源码
+                // 并标注，避免把公式当普通代码块展示。
+                list.child(render_math_source(&text, p))
+            }
             Block::Code { lang, text } => {
                 // 官方：diff / patch 围栏以统一 diff 行代替普通代码内容。
                 let is_diff = matches!(lang.to_lowercase().as_str(), "diff" | "patch");
@@ -9223,7 +9228,44 @@ fn remap_inline_spans(source: &str, display: &str) -> Vec<crate::markdown::Inlin
 }
 
 /// Web fetch detail: the URL, its HTTP status, and the fetched body preview.
-fn render_web_card(card: &crate::tool_cards::WebCard, p: crate::tokens::Tokens) -> gpui::Div {
+/// Math fence fallback: centered TeX source with a label, since the local UI
+/// has no TeX typesetting engine (official renders KaTeX).
+fn render_math_source(text: &str, p: crate::tokens::Tokens) -> gpui::Div {
+    column()
+        .w_full()
+        .my(px(4.))
+        .gap(px(4.))
+        .rounded(px(crate::tokens::Tokens::RADIUS_LG))
+        .border(px(0.5))
+        .border_color(p.line)
+        .bg(p.md_code_block)
+        .px(px(16.))
+        .py(px(12.))
+        .child(
+            div()
+                .w_full()
+                .text_align(gpui::TextAlign::Center)
+                .text_size(px(14.))
+                .line_height(px(24.))
+                .text_color(p.ink)
+                .child(text.trim().to_owned()),
+        )
+        .child(
+            div()
+                .w_full()
+                .text_align(gpui::TextAlign::Center)
+                .text_size(px(11.))
+                .line_height(px(16.))
+                .text_color(p.faint)
+                .child("TeX 公式源码"),
+        )
+}
+
+fn render_web_card(
+    card: &crate::tool_cards::WebCard,
+    p: crate::tokens::Tokens,
+    cx: &mut Context<DshApp>,
+) -> gpui::Div {
     let mut block = column()
         .w_full()
         .gap(px(8.))
@@ -9233,15 +9275,24 @@ fn render_web_card(card: &crate::tool_cards::WebCard, p: crate::tokens::Tokens) 
         .bg(p.stage)
         .px(px(16.))
         .py(px(10.));
+    let open_url = card.url.clone();
     let mut header = row().w_full().gap(px(8.)).items_center().child(
         div()
+            .id(gpui::ElementId::Name(
+                format!("web-card-url-{}", card.url.len()).into(),
+            ))
             .flex_1()
             .min_w_0()
             .truncate()
+            .cursor_pointer()
             .text_size(px(12.))
             .line_height(px(18.))
             .text_color(p.link)
-            .child(card.url.clone()),
+            .hover(|style| style.underline())
+            .child(card.url.clone())
+            .on_click(cx.listener(move |this, _, w, cx| {
+                this.open_link(&open_url, w, cx);
+            })),
     );
     if let Some(status) = card.status {
         let failed = status >= 400;
