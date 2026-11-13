@@ -83,6 +83,13 @@ pub fn activity(name: &str) -> ProcessKind {
 
 #[cfg(any(target_family = "wasm", test))]
 pub(crate) fn live_tool_detail(name: &str, arguments: &str) -> String {
+    // The todo row summarizes the whole list (`3/4 已完成 · 当前任务`) rather than
+    // naming one argument, so it is derived before the generic key scan.
+    if name == "todo_write"
+        && let Some(summary) = todo_summary(arguments)
+    {
+        return todo_summary_text(&summary);
+    }
     const KEYS: &[&str] = &[
         "title",
         "description",
@@ -127,6 +134,84 @@ pub(crate) fn live_tool_detail(name: &str, arguments: &str) -> String {
         }
     }
     normalize_live_detail(name)
+}
+
+/// 官方行内摘要：`{done}/{total} 已完成`，有当前任务时再接 ` · 任务名`。
+///
+/// 并行数量（`+N`）在官方里是**不收缩的独立片段**；这里是纯文本摘要，所以接在
+/// 任务名之后，与官方的可见文案一致。
+pub fn todo_summary_text(summary: &PlanSummary) -> String {
+    let head = format!("{}/{} 已完成", summary.done, summary.total);
+    match summary.active_content.as_deref() {
+        Some(content) => {
+            let extra = if summary.active_extra > 0 {
+                format!(" +{}", summary.active_extra)
+            } else {
+                String::new()
+            };
+            format!("{head} · {content}{extra}")
+        }
+        None => head,
+    }
+}
+
+/// 官方 `planSummary` 的结果：计数与摘要的两半。
+///
+/// 两半故意不预先拼接：行会截断摘要文本，而拼在任务名末尾的计数正是窄行最先
+/// 被裁掉的部分——偏偏那时它最有信息量。调用方把 `active_extra` 放在不收缩的
+/// 独立片段里。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanSummary {
+    pub done: usize,
+    pub total: usize,
+    /// 第一个 `in_progress` 的内容；首个活动项不可用时为 `None`。
+    pub active_content: Option<String>,
+    /// 首个之外仍在进行的数量；没有 `active_content` 时为 0。
+    pub active_extra: usize,
+}
+
+/// 官方 `planSummary`：从整份待办快照推导计数与当前任务。
+///
+/// 可能有多个 `in_progress`（并行工作会同时跑多个任务），因此只取一项会静默丢掉
+/// 其余；这里点名第一项并数出其余并行数量。首个活动项的内容缺失、类型不对或去空白
+/// 后为空时 `active_content` 为 `None`——被拒绝的调用会原样保留参数，所以模型给的
+/// 字段任何一项都可能不可用。
+pub fn plan_summary(todos: &[serde_json::Value]) -> PlanSummary {
+    let is = |item: &serde_json::Value, status: &str| item["status"].as_str() == Some(status);
+    let active: Vec<&serde_json::Value> = todos
+        .iter()
+        .filter(|item| is(item, "in_progress"))
+        .collect();
+    let named = active
+        .first()
+        .and_then(|item| item["content"].as_str())
+        .map(str::trim)
+        .filter(|content| !content.is_empty())
+        .map(str::to_owned);
+    PlanSummary {
+        done: todos.iter().filter(|item| is(item, "completed")).count(),
+        total: todos.len(),
+        active_extra: if named.is_some() {
+            active.len().saturating_sub(1)
+        } else {
+            0
+        },
+        active_content: named,
+    }
+}
+
+/// 待办工具行的一行摘要：官方 `todo.completed` + 当前任务。
+///
+/// 参数不是合法 JSON（流式截断或模型给坏 JSON）时返回 `None`，由调用方回退到
+/// 通用摘要——与官方 `summarize` 的降级一致。
+pub fn todo_summary(arguments: &str) -> Option<PlanSummary> {
+    let parsed: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let todos = parsed.get("todos")?.as_array()?;
+    // 官方要求每一项都是对象；出现 null 元素时整条回退。
+    if todos.iter().any(|item| !item.is_object()) {
+        return None;
+    }
+    Some(plan_summary(todos))
 }
 
 #[cfg(any(target_family = "wasm", test))]
@@ -342,6 +427,93 @@ pub fn format_tokens_per_second(tps: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_todo_row_summarizes_the_whole_list() {
+        // Copied from a real `todo_write` call so the row stays pinned to the
+        // payload the model actually sends.
+        let args = r#"{"todos": [
+            {"content": "扫描磁盘与主目录整体占用，定位大文件/目录", "status": "in_progress"},
+            {"content": "检查废纸篓、缓存、日志、临时文件等典型残留", "status": "pending"},
+            {"content": "检查开发工具缓存（Xcode/npm/cargo/pip/docker 等）", "status": "pending"}
+        ]}"#;
+        assert_eq!(
+            live_tool_detail("todo_write", args),
+            "0/3 已完成 · 扫描磁盘与主目录整体占用，定位大文件/目录"
+        );
+    }
+
+    #[test]
+    fn a_finished_list_reports_counts_without_a_current_task() {
+        let args = r#"{"todos": [
+            {"content": "一", "status": "completed"},
+            {"content": "二", "status": "completed"}
+        ]}"#;
+        assert_eq!(live_tool_detail("todo_write", args), "2/2 已完成");
+    }
+
+    #[test]
+    fn parallel_active_items_report_the_extra_count() {
+        // Several items may be in progress at once; naming only the first would
+        // silently drop the rest.
+        let args = r#"{"todos": [
+            {"content": "主任务", "status": "in_progress"},
+            {"content": "并行任务", "status": "in_progress"},
+            {"content": "另一个", "status": "in_progress"},
+            {"content": "已完成项", "status": "completed"}
+        ]}"#;
+        assert_eq!(
+            live_tool_detail("todo_write", args),
+            "1/4 已完成 · 主任务 +2"
+        );
+        let summary = todo_summary(args).unwrap();
+        assert_eq!(summary.active_extra, 2);
+        assert_eq!(summary.done, 1);
+        assert_eq!(summary.total, 4);
+    }
+
+    #[test]
+    fn malformed_or_unusable_todo_args_fall_back_to_the_generic_summary() {
+        // Mid-stream truncation and rejected calls keep their args verbatim.
+        assert!(todo_summary("{\"todos\": [").is_none());
+        assert!(todo_summary("not json").is_none());
+        assert!(todo_summary("null").is_none());
+        assert!(todo_summary("{\"todos\": null}").is_none());
+        assert!(todo_summary("{}").is_none());
+        // A null item makes the whole list unusable, matching the official rule.
+        assert!(todo_summary(r#"{"todos": [null]}"#).is_none());
+        // The caller then falls through to the pre-existing generic detail, which
+        // for unparseable args is the tool name itself.
+        assert_eq!(
+            live_tool_detail("todo_write", "{\"todos\": ["),
+            "todo_write"
+        );
+    }
+
+    #[test]
+    fn active_items_without_usable_content_still_report_counts() {
+        // `content` missing, mistyped or blank: counts are known-good, so the row
+        // shows them and drops only the active-item clause.
+        for args in [
+            r#"{"todos": [{"status": "in_progress"}]}"#,
+            r#"{"todos": [{"content": null, "status": "in_progress"}]}"#,
+            r#"{"todos": [{"content": "   ", "status": "in_progress"}]}"#,
+            r#"{"todos": [{"content": 42, "status": "in_progress"}]}"#,
+        ] {
+            assert_eq!(live_tool_detail("todo_write", args), "0/1 已完成", "{args}");
+            let summary = todo_summary(args).unwrap();
+            assert_eq!(summary.active_content, None);
+            assert_eq!(summary.active_extra, 0);
+        }
+    }
+
+    #[test]
+    fn other_tools_keep_the_generic_argument_scan() {
+        assert_eq!(
+            live_tool_detail("read", r#"{"file_path": "/tmp/a"}"#),
+            "/tmp/a"
+        );
+    }
 
     #[test]
     fn activity_maps_official_tool_names() {

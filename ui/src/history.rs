@@ -62,6 +62,13 @@ fn content_texts(blocks: &[Value]) -> String {
 }
 
 fn tool_title(name: &str, arguments: &str) -> String {
+    // A replayed todo row must read the same as a live one, or reopening a
+    // session silently downgrades it to the bare tool name.
+    if name == "todo_write"
+        && let Some(summary) = crate::process::todo_summary(arguments)
+    {
+        return crate::process::todo_summary_text(&summary);
+    }
     if let Ok(value) = serde_json::from_str::<Value>(arguments) {
         if let Some(description) = value.get("description").and_then(Value::as_str) {
             if !description.is_empty() {
@@ -625,6 +632,25 @@ mod tests {
                 "Options — Where?\n回答：Local (Recommended), extra\n\nWhat else?\n已跳过"
             );
         }
+    }
+
+    #[test]
+    #[test]
+    fn a_replayed_todo_row_keeps_the_live_summary() {
+        // A reopened session must show the same todo summary a live turn showed,
+        // not the bare tool name.
+        assert_eq!(
+            tool_title(
+                "todo_write",
+                r#"{"todos": [
+                    {"content": "扫描磁盘", "status": "completed"},
+                    {"content": "检查缓存", "status": "in_progress"}
+                ]}"#
+            ),
+            "1/2 已完成 · 检查缓存"
+        );
+        // Unusable args fall back to the tool name, as before.
+        assert_eq!(tool_title("todo_write", "{\"todos\": ["), "todo_write");
     }
 
     #[test]
