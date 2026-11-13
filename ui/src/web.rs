@@ -1789,6 +1789,7 @@ impl DshApp {
             // Reopening a session must restore the messages still waiting in
             // the Host Inbox: they outlive the client that submitted them.
             self.request_inbox_state(&id);
+            self.request_goal_state(&id);
         }
         self.conversation.resumed_session = resumed;
         self.conversation.config_options = reply
@@ -2804,6 +2805,7 @@ impl DshApp {
                 }
             }
             "inbox_state" => self.finish_inbox_state(owner, result, w, cx),
+            "goal_state" | "goal_action" => self.finish_goal_state(owner, result, w, cx),
             "fork_session" => self.finish_fork(result, w, cx),
             "rename_session" => self.finish_session_rename(result, w, cx),
             "new_session" | "resume_session" => self.finish_session_open(result, w, cx),
@@ -3020,6 +3022,10 @@ impl DshApp {
         }
         if update["sessionUpdate"] == "gpui_inbox_changed" {
             self.request_inbox_state(session);
+            return;
+        }
+        if update["sessionUpdate"] == "gpui_goal_changed" {
+            self.handle_goal_changed(session, update, cx);
             return;
         }
         let Some(conversation) = self.conversation_mut(session) else {
@@ -3666,6 +3672,7 @@ mod files;
 mod floating_panes;
 mod flow_motion;
 mod flow_scroll;
+mod goal_bar;
 mod header_chrome;
 mod live_shimmer;
 mod menu_groups;

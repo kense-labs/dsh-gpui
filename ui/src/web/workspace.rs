@@ -3142,6 +3142,9 @@ impl DshApp {
                     )
                 },
             )
+            .when(self.conversation.goal.is_some(), |element| {
+                element.child(self.render_goal_bar(cx))
+            })
             .when(!self.conversation.queued_prompts.is_empty(), |element| {
                 element.child(self.render_queue_cards(cx))
             })
@@ -3445,6 +3448,140 @@ impl DshApp {
             .hover(|style| style.bg(t.hover_solid))
             .child(div().size(px(10.)).rounded(px(3.)).bg(t.ink))
             .on_click(cx.listener(|this, _, _, cx| this.cancel(cx)))
+    }
+
+    /// 官方 GoalBar：composer 上方 36px 的目标条。
+    ///
+    /// 图标 + 阶段标签 + 单行省略的目标正文 + 动作：进行中且可自动继续时给
+    /// 暂停，非进行中的阶段给恢复，任何阶段都可以编辑或清除。创建目标仍归
+    /// `/goal` 命令，这条只管理层状态。
+    fn render_goal_bar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let p = dsh(cx);
+        let Some(goal) = self.conversation.goal.clone() else {
+            return div().into_any_element();
+        };
+        let busy = self.conversation.goal_busy;
+        let can_pause = goal.can_pause();
+        let can_resume = goal.can_resume();
+        let action_button =
+            |id: &'static str,
+             label: &'static str,
+             glyph: Glyph,
+             enabled: bool,
+             cx: &mut Context<Self>,
+             on_click: fn(&mut DshApp, &mut Window, &mut Context<DshApp>)| {
+                let button = div()
+                    .id(gpui::ElementId::Name(id.into()))
+                    .role(gpui::Role::Button)
+                    .aria_label(label)
+                    .size(px(24.))
+                    .rounded(px(crate::tokens::Tokens::RADIUS_SM))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(icon(glyph, 14., p.faint));
+                if enabled && !busy {
+                    button
+                        .cursor_pointer()
+                        .hover(|style| style.bg(p.hover))
+                        .on_click(cx.listener(move |this, _, w, cx| on_click(this, w, cx)))
+                } else {
+                    button.opacity(0.4)
+                }
+            };
+        let mut bar = row()
+            .id("goal-bar")
+            .w_full()
+            .h(px(36.))
+            .px(px(12.))
+            .py(px(4.))
+            .gap(px(10.))
+            .items_center()
+            .rounded(px(crate::tokens::Tokens::RADIUS_SM))
+            .border(px(0.5))
+            .border_color(p.line)
+            .bg(p.stage)
+            .when_some(goal.title().map(str::to_owned), |bar, title| {
+                let reason: gpui::SharedString = format!("受阻原因：{title}").into();
+                bar.tooltip(move |_, cx| cx.new(|_| TurnActionHint(reason.clone())).into())
+            })
+            .child(
+                gpui::svg()
+                    .data(include_bytes!("../../assets/goal.svg") as &[u8])
+                    .size(px(14.))
+                    .flex_none()
+                    .text_color(p.faint),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(13.))
+                    .line_height(px(24.))
+                    .text_color(p.ink)
+                    .child(goal.label()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(13.))
+                    .line_height(px(20.))
+                    .text_color(p.label_dimmed)
+                    .child(goal.objective_preview(120)),
+            );
+        if let Some(error) = self.conversation.goal_error.clone() {
+            bar = bar.child(
+                div()
+                    .flex_none()
+                    .max_w(px(180.))
+                    .truncate()
+                    .text_size(px(12.))
+                    .line_height(px(18.))
+                    .text_color(p.danger)
+                    .child(error),
+            );
+        }
+        // The official strip renders exactly the verbs the phase allows: pause
+        // only for an armed active goal, resume for every other phase.
+        if can_pause {
+            bar = bar.child(action_button(
+                "goal-pause",
+                "暂停目标",
+                Glyph::Pause,
+                true,
+                cx,
+                |this, w, cx| this.run_goal_action("pause", w, cx),
+            ));
+        }
+        if can_resume {
+            bar = bar.child(action_button(
+                "goal-resume",
+                "恢复目标",
+                Glyph::Play,
+                true,
+                cx,
+                |this, w, cx| this.run_goal_action("resume", w, cx),
+            ));
+        }
+        bar = bar
+            .child(action_button(
+                "goal-edit",
+                "编辑目标",
+                Glyph::Edit,
+                true,
+                cx,
+                |this, w, cx| this.edit_goal_objective(w, cx),
+            ))
+            .child(action_button(
+                "goal-clear",
+                "清除目标",
+                Glyph::Trash,
+                true,
+                cx,
+                |this, w, cx| this.run_goal_action("clear", w, cx),
+            ));
+        bar.into_any_element()
     }
 
     /// 官方 QueueDock：Host Inbox 里每条待投递消息一行。

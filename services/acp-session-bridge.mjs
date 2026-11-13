@@ -65,6 +65,10 @@ const questionDecisionMethod = '_dsh/gpui/session/question-decision';
 const queuePromptMethod = '_dsh/gpui/session/queue-prompt';
 const inboxStateMethod = '_dsh/gpui/session/inbox-state';
 const inboxActionMethod = '_dsh/gpui/session/inbox-action';
+// The composer's GoalBar reads the same live goal view the official client
+// projects, and its pause/resume/clear verbs are the goal service's own.
+const goalStateMethod = '_dsh/gpui/session/goal-state';
+const goalActionMethod = '_dsh/gpui/session/goal-action';
 const planReviews = new Map();
 const questionRequests = new Map();
 const messageMethods = new Map([
@@ -77,7 +81,7 @@ const extensionMethods = [
   permissionModeMethod, sessionCommandsMethod, executeSessionCommandMethod,
   runtimeSettingsMethod, webSettingsMethod, pluginCenterMethod, pluginInstallMethod,
   questionStateMethod, questionDecisionMethod, scheduleMethod, openHostSessionMethod, sessionArchiveMethod,
-  queuePromptMethod, inboxStateMethod, inboxActionMethod,
+  queuePromptMethod, inboxStateMethod, inboxActionMethod, goalStateMethod, goalActionMethod,
   ...modelProviderMethods, ...messageMethods.keys(),
 ];
 
@@ -1748,6 +1752,56 @@ function inboxAction(ctx, params) {
   throw new SessionOperationError('session/queue-item', '不支持的排队消息操作。');
 }
 
+/** Current live goal view, or null when no goal is set. */
+function currentGoalView(ctx, agent) {
+  const goals = ctx.get('goals');
+  if (goals === undefined) return null;
+  try {
+    return goals.get(agent) ?? null;
+  } catch {
+    // The agent may have been disposed between the event and this read.
+    return null;
+  }
+}
+
+function goalState(ctx, params) {
+  const agent = liveAgent(ctx, params.sessionId);
+  return { goal: currentGoalView(ctx, agent) };
+}
+
+function goalAction(ctx, params) {
+  const goals = ctx.get('goals');
+  if (goals === undefined) {
+    throw new SessionOperationError('session/goal-unavailable', '当前服务未启用目标功能。');
+  }
+  const agent = liveAgent(ctx, params.sessionId);
+  const current = goals.get(agent);
+  if (current === undefined) {
+    throw new SessionOperationError('session/goal-missing', '当前会话没有进行中的目标。');
+  }
+  // Every mutation is compare-and-set on the revision the client saw, so a
+  // stale bar cannot overwrite a newer goal.
+  const ref = {
+    id: current.id,
+    revision: Number.isSafeInteger(params.revision) ? params.revision : current.revision,
+  };
+  switch (params.action) {
+    case 'pause': goals.pause(agent, ref); break;
+    case 'resume': goals.resume(agent, ref); break;
+    case 'clear': goals.clear(agent, ref); break;
+    case 'edit': {
+      if (typeof params.objective !== 'string' || params.objective.trim().length === 0) {
+        throw new SessionOperationError('session/goal-invalid', '目标内容不能为空。');
+      }
+      goals.edit(agent, ref, { objective: params.objective.trim() });
+      break;
+    }
+    default:
+      throw new SessionOperationError('session/goal-invalid', '不支持的目标操作。');
+  }
+  return { goal: currentGoalView(ctx, agent) };
+}
+
 function observeSessionUpdates(ctx) {
   observePlanReviews(ctx);
   const notifyAgentStatus = (agent, running) => {
@@ -1759,6 +1813,13 @@ function observeSessionUpdates(ctx) {
   };
   ctx.on('agent/status', ({ agent, status }) => notifyAgentStatus(agent, status === 'running'));
   ctx.on('agent/disposed', ({ agent }) => notifyAgentStatus(agent, false));
+  // A goal created, paused, resumed, edited, blocked, or cleared commits one
+  // `goal/change`; forwarding the fresh live view keeps the composer strip in
+  // step without polling.
+  ctx.on('goal/changed', ({ agent }) => notify(agent.id, {
+    sessionUpdate: 'gpui_goal_changed',
+    goal: currentGoalView(ctx, agent),
+  }));
   ctx.on('agent/assistant-stream', ({ agent, frame }) => {
     if (frame.type === 'chunk') {
       const chunk = frame.chunk;
@@ -1970,6 +2031,10 @@ async function extension({ id, method, params }) {
       response = { result: inboxState(ctx, params) };
     } else if (method === inboxActionMethod) {
       response = { result: inboxAction(ctx, params) };
+    } else if (method === goalStateMethod) {
+      response = { result: goalState(ctx, params) };
+    } else if (method === goalActionMethod) {
+      response = { result: goalAction(ctx, params) };
     } else if (method === recordMethod) {
       const feedback = ctx.get('sessionFeedback');
       response = feedback

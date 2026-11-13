@@ -97,6 +97,8 @@ fn main() {
             acp::queue_prompt,
             acp::inbox_state,
             acp::inbox_action,
+            acp::goal_state,
+            acp::goal_action,
             acp::cancel_session,
             acp::set_config_option,
             acp::respond_permission,

@@ -674,6 +674,44 @@ pub async fn inbox_action(
         .await
 }
 
+/// Read the session's current goal (durable phase plus process-local activation).
+#[tauri::command]
+pub async fn goal_state(
+    session_id: String,
+    service: State<'_, AcpService>,
+) -> Result<Value, String> {
+    connection(&service)
+        .await?
+        .request(
+            "_dsh/gpui/session/goal-state",
+            json!({"sessionId": session_id}),
+        )
+        .await
+}
+
+/// Pause, resume, clear, or edit the current goal through the goal service.
+#[tauri::command]
+pub async fn goal_action(
+    session_id: String,
+    action: String,
+    revision: Option<u64>,
+    objective: Option<String>,
+    service: State<'_, AcpService>,
+) -> Result<Value, String> {
+    connection(&service)
+        .await?
+        .request(
+            "_dsh/gpui/session/goal-action",
+            json!({
+                "sessionId": session_id,
+                "action": action,
+                "revision": revision,
+                "objective": objective,
+            }),
+        )
+        .await
+}
+
 #[tauri::command]
 pub async fn cancel_session(
     session_id: String,

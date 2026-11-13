@@ -18,6 +18,12 @@ pub(super) struct Conversation {
     pub(super) turn_summary: Option<TurnSummary>,
     pub(super) turn_usage_base: Option<u64>,
     pub(super) queued_prompts: Vec<QueuedPrompt>,
+    /// Current goal shown by the composer's GoalBar; None renders nothing.
+    pub(super) goal: Option<crate::goal::GoalView>,
+    /// One goal mutation in flight; the strip disables its verbs meanwhile.
+    pub(super) goal_busy: bool,
+    /// Last rejected goal verb, shown inside the strip (official `actionError`).
+    pub(super) goal_error: Option<String>,
     /// 待投递列表的本地单调序号；用于忽略比某一行更早请求的 Host 快照。
     pub(super) inbox_seq: u64,
     pub(super) wrapped_code: std::collections::HashSet<String>,
