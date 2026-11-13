@@ -3039,8 +3039,29 @@ impl DshApp {
         } else {
             "发消息或创建任务, / 调用指令, @ 文件或对话"
         };
+        let brand = p.state_business_primary;
         self.composer.update(cx, |editor, _| {
             editor.set_placeholder(placeholder);
+            // 官方：已认领的 slash command 是品牌蓝的原子 chip
+            // （--dsw-alias-state-business-primary）。KUI Editor 通过 run
+            // styler 给行首 token 上色；灰提示仍由下方单独一行渲染，因为
+            // KUI 在 ghost 文本显示时会跳过 run styler。
+            editor.set_run_styler(std::rc::Rc::new(move |text: &str, base: &gpui::TextRun| {
+                let Some(len) = crate::commands::claimed_command_len(text) else {
+                    return vec![base.clone()];
+                };
+                let mut chip = base.clone();
+                chip.len = len;
+                chip.color = brand;
+                chip.font.weight = gpui::FontWeight::MEDIUM;
+                let mut rest = base.clone();
+                rest.len = text.len() - len;
+                if rest.len == 0 {
+                    vec![chip]
+                } else {
+                    vec![chip, rest]
+                }
+            }));
         });
         // Harness renders a grey ghost hint after an empty claimed command chip.
         let draft = self.composer.read(cx).value().to_owned();

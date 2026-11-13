@@ -178,6 +178,16 @@ pub(crate) fn command_claim_hint(draft: &str) -> Option<&'static str> {
     }
 }
 
+/// 行首已认领指令 token 的字节长度，用于给它上官方品牌蓝
+/// `--dsw-alias-state-business-primary`。`TextRun.len` 以 UTF-8 字节计。
+pub(crate) fn claimed_command_len(draft: &str) -> Option<usize> {
+    let rest = draft.strip_prefix('/')?;
+    let end = rest
+        .find(char::is_whitespace)
+        .map_or(draft.len(), |index| index + 1);
+    (end > 1).then_some(end)
+}
+
 /// 把中英文输入写法归一成 ACP 注册的 canonical 命令名。
 pub(crate) fn canonical_host_command(line: &str) -> Option<(String, String)> {
     let trimmed = line.trim();
@@ -290,8 +300,8 @@ pub(crate) fn fuzzy_name_rank(query: &str, label: &str) -> Option<(bool, i64)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandCatalog, canonical_host_command, command_claim_hint, fuzzy_name_rank,
-        localized_command_token, visible_commands,
+        CommandCatalog, canonical_host_command, claimed_command_len, command_claim_hint,
+        fuzzy_name_rank, localized_command_token, visible_commands,
     };
     use serde_json::json;
 
@@ -327,6 +337,16 @@ mod tests {
             .map(|spec| spec.key)
             .collect::<Vec<_>>();
         assert!(keys.contains(&"compact"));
+    }
+
+    #[test]
+    fn claimed_command_span_covers_the_leading_slash_token() {
+        assert_eq!(claimed_command_len("/目标 "), Some("/目标".len()));
+        assert_eq!(claimed_command_len("/goal 完成发布"), Some("/goal".len()));
+        assert_eq!(claimed_command_len("/计划"), Some("/计划".len()));
+        assert_eq!(claimed_command_len("/"), None);
+        assert_eq!(claimed_command_len("普通消息"), None);
+        assert_eq!(claimed_command_len("  /goal"), None);
     }
 
     #[test]
