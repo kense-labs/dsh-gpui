@@ -64,6 +64,27 @@ impl SessionDownloads {
 }
 
 impl DshApp {
+    /// `/export` 的输入写法（含官方中文别名 `/导出`）。
+    ///
+    /// 菜单项与输入行必须等价：官方把两者接到同一个命令，KWork 之前只做了菜单
+    /// 路径，直接键入 `/导出` 会被当成普通消息发给模型。
+    pub(super) fn submit_export_command(&mut self, w: &mut Window, cx: &mut Context<Self>) -> bool {
+        let draft = self.composer.read(cx).value().trim().to_owned();
+        let Some(rest) = crate::commands::strip_command_token(&draft, "export") else {
+            return false;
+        };
+        self.replace_composer_without_trigger("", w, cx);
+        if rest.trim().is_empty() {
+            self.composer_menu = None;
+            self.start_session_download(w, cx);
+        } else {
+            // The official handler rejects a path argument for this command.
+            self.conversation.error = Some("/export 不接受路径参数。".to_owned());
+            cx.notify();
+        }
+        true
+    }
+
     pub(super) fn start_session_download(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         let Some(session) = self.active_session.clone() else {
             return;

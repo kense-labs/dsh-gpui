@@ -2113,13 +2113,19 @@ impl DshApp {
         // Client-owned commands open their own surface. Resolving the built-in
         // token (rather than comparing the raw line) keeps the Chinese spellings
         // working: `/权限` previously fell through to the model as plain text.
+        // An argument switches the preset directly, matching the official
+        // handler (`/permission <preset>`), and still runs the confirmation gate
+        // for the dangerous presets.
         // `/model` is a KWork extension rather than an official builtin, so it is
         // matched literally alongside them.
         let draft = self.composer.read(cx).value().trim().to_owned();
-        let menu = match resolve_command_token(&draft) {
-            Some((name, rest)) if rest.trim().is_empty() && name == "permission" => {
-                Some(ComposerMenu::PermissionChoices)
-            }
+        let resolved = resolve_command_token(&draft);
+        let argument = resolved
+            .as_ref()
+            .filter(|(name, _)| name == "permission")
+            .map(|(_, rest)| rest.trim().to_owned());
+        let menu = match argument.as_deref() {
+            Some("") => Some(ComposerMenu::PermissionChoices),
             _ if matches!(draft.as_str(), "/model") => Some(ComposerMenu::CommandModels),
             _ => None,
         };
@@ -2128,7 +2134,13 @@ impl DshApp {
             cx.notify();
             return;
         }
+        if let Some(preset) = argument.filter(|preset| !preset.is_empty()) {
+            self.replace_composer_without_trigger("", w, cx);
+            self.choose_permission(preset.to_owned(), w, cx);
+            return;
+        }
         if self.submit_feedback_command(w, cx)
+            || self.submit_export_command(w, cx)
             || self.submit_plan_command(w, cx)
             || self.submit_host_command(w, cx)
         {
