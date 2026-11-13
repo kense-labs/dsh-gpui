@@ -302,8 +302,51 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                 let Some(title) = user_visible_source(source) else {
                     continue;
                 };
-                let text = blocks_text;
-                if text.trim().is_empty() {
+                // Attached images are rendered as thumbnails in the user bubble
+                // (official UserContent), so they travel in the row's `input`
+                // instead of the `[图片]` placeholder text.
+                let images: Vec<crate::state::UserImage> = data
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|block| {
+                        if block.get("type").and_then(Value::as_str) != Some("image") {
+                            return None;
+                        }
+                        let attachment = block.get("attachment")?;
+                        Some(crate::state::UserImage {
+                            attachment_id: attachment.get("attachmentId")?.as_str()?.to_owned(),
+                            media_type: attachment
+                                .get("mediaType")
+                                .and_then(Value::as_str)
+                                .unwrap_or("image/png")
+                                .to_owned(),
+                            name: attachment
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                            width: attachment.get("width").and_then(Value::as_u64),
+                            height: attachment.get("height").and_then(Value::as_u64),
+                            data_url: None,
+                        })
+                    })
+                    .collect();
+                let text = if images.is_empty() {
+                    blocks_text
+                } else {
+                    let text_blocks: Vec<Value> = data
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                        .cloned()
+                        .collect();
+                    content_texts(&text_blocks)
+                };
+                if text.trim().is_empty() && images.is_empty() {
                     continue;
                 }
                 // Goal rounds wrap the objective; surface as turn trigger, not a giant bubble.
@@ -350,7 +393,11 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                     role: EntryRole::User,
                     title,
                     text,
-                    input: String::new(),
+                    input: if images.is_empty() {
+                        String::new()
+                    } else {
+                        crate::state::user_images_json(&images)
+                    },
                     status: detail.to_owned(),
                     tool: None,
                     at_ms,
@@ -1140,9 +1187,9 @@ mod tests {
     }
 
     #[test]
-    fn a_prompt_that_was_only_an_image_keeps_a_placeholder() {
-        // Billing artifacts and the durable image block carry no text: dropping
-        // them erased the whole user bubble when the session was reopened.
+    fn a_prompt_that_was_only_an_image_keeps_its_attachment() {
+        // The durable image block carries no text; the bubble renders the picture
+        // from its attachment reference, so the row must survive projection.
         let events = vec![json!({
             "type":"user/message","seq":3,"time":20,
             "data":{"id":"img-1","source":{"kind":"user"},
@@ -1150,8 +1197,25 @@ mod tests {
         })];
         let projected = project_session_events(&events);
         assert_eq!(projected.entries.len(), 1);
-        assert_eq!(projected.entries[0].role, EntryRole::User);
-        assert_eq!(projected.entries[0].text, "[图片]");
+        let entry = &projected.entries[0];
+        assert_eq!(entry.role, EntryRole::User);
+        assert!(entry.text.is_empty());
+        let images = crate::state::user_images(entry);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].attachment_id, "a-1");
+        assert_eq!(images[0].media_type, "image/png");
+        assert!(images[0].data_url.is_none());
+        // A mixed prompt keeps its text and the picture.
+        let events = vec![json!({
+            "type":"user/message","seq":4,"time":21,
+            "data":{"id":"img-2","source":{"kind":"user"},
+                "content":[{"type":"text","text":"看看这个"},
+                    {"type":"image","attachment":{"attachmentId":"a-2","mediaType":"image/webp"}}]}
+        })];
+        let projected = project_session_events(&events);
+        assert_eq!(projected.entries[0].text, "看看这个");
+        assert_eq!(crate::state::user_images(&projected.entries[0]).len(), 1);
+        assert!(!projected.entries[0].input.contains("[图片]"));
     }
 
     fn a_replayed_todo_row_keeps_the_live_summary() {

@@ -1871,12 +1871,21 @@ function observeSessionUpdates(ctx) {
         // the Inbox claims it, not when the client submits it. Forwarding the
         // logged message lets the client reconcile its optimistic row, and is
         // the only live source for a steering message admitted mid-turn.
+        const images = (Array.isArray(data.content) ? data.content : [])
+          .filter(block => block?.type === 'image' && block.attachment !== undefined)
+          .map(block => ({
+            attachmentId: block.attachment.attachmentId,
+            mediaType: block.attachment.mediaType,
+            name: block.attachment.name,
+            width: block.attachment.width,
+            height: block.attachment.height,
+          }))
         notify(session.id, {
           sessionUpdate: 'gpui_user_message',
           messageId: data.id,
           content: contentBlocks(data.content),
-          hasImage: Array.isArray(data.content)
-            && data.content.some(block => block?.type === 'image'),
+          hasImage: images.length > 0,
+          images,
           time: event.time,
           seq: event.seq,
         });

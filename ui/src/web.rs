@@ -565,6 +565,14 @@ pub(crate) struct TurnSummary {
     pub(crate) used: Option<u64>,
 }
 
+/// One picture shown in the full-screen viewer (official 查看大图 dialog).
+#[derive(Clone)]
+pub(crate) struct ImageViewer {
+    pub(crate) data_url: String,
+    pub(crate) media_type: String,
+    pub(crate) name: String,
+}
+
 #[derive(Clone)]
 pub(crate) struct Toast {
     pub(crate) message: String,
@@ -675,6 +683,10 @@ pub(crate) struct DshApp {
     session_title_seqs: HashMap<String, u64>,
     pub(crate) archived_sessions: std::collections::HashSet<String>,
     pub(crate) toasts: Vec<Toast>,
+    /// User-message images already requested from the host (by attachment id).
+    pub(crate) requested_attachments: std::collections::HashSet<String>,
+    /// Full-screen picture opened from a user bubble (official image dialog).
+    pub(crate) image_viewer: Option<ImageViewer>,
     confirm_permission: Option<String>,
     pub(crate) full_access_acknowledged: bool,
     pub(crate) stats_dialog: Option<StatsDialog>,
@@ -1052,6 +1064,8 @@ impl DshApp {
             session_title_seqs: HashMap::new(),
             archived_sessions: std::collections::HashSet::new(),
             toasts: Vec::new(),
+            requested_attachments: std::collections::HashSet::new(),
+            image_viewer: None,
             confirm_permission: None,
             full_access_acknowledged: false,
             stats_dialog: None,
@@ -1939,6 +1953,36 @@ impl DshApp {
             (PendingAction::New { .. }, Err(error)) => {
                 self.opening_session_events.clear();
                 self.error = Some(error);
+            }
+        }
+    }
+
+    /// Ask the host to read every user-message image the transcript still lacks.
+    ///
+    /// The Harness logs attachment references, not pixels, so each bubble needs
+    /// one `read_attachment` round trip before it can show the picture.
+    fn request_user_images(&mut self) {
+        for entry in self
+            .conversation
+            .entries
+            .iter()
+            .filter(|entry| entry.role == crate::state::EntryRole::User)
+        {
+            for image in crate::state::user_images(entry) {
+                if image.data_url.is_some()
+                    || !self
+                        .requested_attachments
+                        .insert(image.attachment_id.clone())
+                {
+                    continue;
+                }
+                invoke(
+                    "read_attachment",
+                    json!({
+                        "attachmentId": image.attachment_id,
+                        "mediaType": image.media_type,
+                    }),
+                );
             }
         }
     }
@@ -2960,6 +3004,7 @@ impl DshApp {
                     match result {
                         Ok(reply) => {
                             self.apply_session_history(session, &reply, prepend);
+                            self.request_user_images();
                             if !prepend {
                                 self.settle_history_scroll(session, cx);
                             }
@@ -2971,6 +3016,24 @@ impl DshApp {
                     }
                 }
             }
+            // One user-message picture finished decoding into a data URL: patch it
+            // into every visible row that references the attachment.
+            "read_attachment" => match result {
+                Ok(reply) => {
+                    if let (Some(id), Some(data_url)) = (
+                        reply.get("attachmentId").and_then(Value::as_str),
+                        reply.get("dataUrl").and_then(Value::as_str),
+                    ) {
+                        crate::state::set_user_image_data(
+                            &mut self.conversation.entries,
+                            id,
+                            data_url,
+                        );
+                        cx.notify();
+                    }
+                }
+                Err(_) => {}
+            },
             "list_sessions" => match result {
                 Ok(reply) => self.apply_session_page(&reply),
                 Err(error) => {

@@ -6,6 +6,7 @@ pub mod anim;
 mod assistant_stream;
 #[cfg(any(target_family = "wasm", test))]
 mod commands;
+pub mod data_url;
 #[cfg(any(target_family = "wasm", test))]
 mod files;
 pub mod goal;

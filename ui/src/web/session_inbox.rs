@@ -82,6 +82,42 @@ impl DshApp {
             display,
             Some(at),
         );
+        // Attached images travel as attachment references; the row keeps them so
+        // the bubble can show thumbnails once the host reads the objects.
+        let images: Vec<crate::state::UserImage> = update["images"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|image| {
+                Some(crate::state::UserImage {
+                    attachment_id: image.get("attachmentId")?.as_str()?.to_owned(),
+                    media_type: image
+                        .get("mediaType")
+                        .and_then(Value::as_str)
+                        .unwrap_or("image/png")
+                        .to_owned(),
+                    name: image
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    width: image.get("width").and_then(Value::as_u64),
+                    height: image.get("height").and_then(Value::as_u64),
+                    data_url: None,
+                })
+            })
+            .collect();
+        if !images.is_empty()
+            && let Some(entry) = conversation.entries.iter_mut().find(|entry| {
+                entry.role == crate::state::EntryRole::User
+                    && entry.external_id.as_deref() == Some(message_id)
+            })
+        {
+            entry.input = crate::state::user_images_json(&images);
+        }
+        if !images.is_empty() {
+            self.request_user_images();
+        }
         if appended && selected {
             self.maybe_follow_tail();
             cx.notify();

@@ -1135,6 +1135,113 @@ pub fn compaction_entry(
     }
 }
 
+/// One image attached to a user row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserImage {
+    pub attachment_id: String,
+    pub media_type: String,
+    pub name: String,
+    pub width: Option<u64>,
+    pub height: Option<u64>,
+    /// Data URL filled in by `read_attachment` once the host has read the object.
+    pub data_url: Option<String>,
+}
+
+/// Parse the images a user row carries (stored as JSON in `input`).
+pub fn user_images(entry: &ChatEntry) -> Vec<UserImage> {
+    if entry.role != EntryRole::User {
+        return Vec::new();
+    }
+    let Ok(value) = serde_json::from_str::<Value>(&entry.input) else {
+        return Vec::new();
+    };
+    value
+        .get("images")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|image| {
+            let attachment_id = image.get("attachmentId")?.as_str()?.to_owned();
+            Some(UserImage {
+                attachment_id,
+                media_type: image
+                    .get("mediaType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("image/png")
+                    .to_owned(),
+                name: image
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                width: image.get("width").and_then(Value::as_u64),
+                height: image.get("height").and_then(Value::as_u64),
+                data_url: image
+                    .get("dataUrl")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            })
+        })
+        .collect()
+}
+
+/// Serialize images into the user row's `input` JSON (the field is otherwise
+/// unused for user rows; keeping it here avoids widening ChatEntry).
+pub fn user_images_json(images: &[UserImage]) -> String {
+    let value = Value::Array(
+        images
+            .iter()
+            .map(|image| {
+                let mut item = serde_json::json!({
+                    "attachmentId": image.attachment_id,
+                    "mediaType": image.media_type,
+                    "name": image.name,
+                });
+                if let Some(width) = image.width {
+                    item["width"] = Value::from(width);
+                }
+                if let Some(height) = image.height {
+                    item["height"] = Value::from(height);
+                }
+                if let Some(data_url) = &image.data_url {
+                    item["dataUrl"] = Value::from(data_url.clone());
+                }
+                item
+            })
+            .collect(),
+    );
+    serde_json::json!({ "images": value }).to_string()
+}
+
+/// Patch a loaded data URL into every user row that references the attachment.
+pub fn set_user_image_data(entries: &mut [ChatEntry], attachment_id: &str, data_url: &str) {
+    for entry in entries
+        .iter_mut()
+        .filter(|entry| entry.role == EntryRole::User)
+    {
+        if !entry.input.contains(attachment_id) {
+            continue;
+        }
+        let Ok(mut value) = serde_json::from_str::<Value>(&entry.input) else {
+            continue;
+        };
+        let mut changed = false;
+        if let Some(images) = value.get_mut("images").and_then(Value::as_array_mut) {
+            for image in images {
+                if image.get("attachmentId").and_then(Value::as_str) == Some(attachment_id)
+                    && image.get("dataUrl").is_none()
+                {
+                    image["dataUrl"] = Value::from(data_url.to_owned());
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            entry.input = value.to_string();
+        }
+    }
+}
+
 /// Official `DeliverablesTail`: the files a closing turn announced through
 /// `deliverables/presented`. Cards are self-contained (path + optional
 /// description), so the row keeps the validated file list as JSON in `input`.

@@ -347,6 +347,7 @@ impl DshApp {
             .when(!self.toasts.is_empty(), |element| {
                 element.child(self.render_toasts(cx))
             })
+            .children(self.render_image_viewer(cx))
             .children(self.render_session_download(w, cx))
             .children(self.render_session_feedback(w, cx))
             .children(self.render_session_feedback_notice(w, cx))
@@ -4136,10 +4137,21 @@ impl DshApp {
                         .as_deref()
                         .filter(|data| data.starts_with("data:image/"))
                     {
-                        gpui::img(preview.to_string())
-                            .size_full()
-                            .object_fit(gpui::ObjectFit::Cover)
-                            .into_any_element()
+                        match user_image_source(preview, &item.mime) {
+                            Some(source) => gpui::img(source)
+                                .size_full()
+                                .object_fit(gpui::ObjectFit::Cover)
+                                .into_any_element(),
+                            None => div()
+                                .size_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(11.))
+                                .text_color(p.faint)
+                                .child("IMG")
+                                .into_any_element(),
+                        }
                     } else {
                         div()
                             .size_full()
@@ -5969,7 +5981,15 @@ fn render_entry(
                             .bg(p.bubble)
                             .text_size(px(14.))
                             .line_height(px(22.))
-                            .child(entry.text.clone()),
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.))
+                            .when_some(render_user_images(entry, cx), |bubble, images| {
+                                bubble.child(images)
+                            })
+                            .when(!entry.text.trim().is_empty(), |bubble| {
+                                bubble.child(entry.text.clone())
+                            }),
                     )
                     .child(
                         row()
@@ -6695,6 +6715,185 @@ fn render_deliverable_card(
             this.open_workspace_document(pane, open_path.clone(), w, cx);
         }))
         .into_any_element()
+}
+
+/// Decoded pictures keyed by their data URL, so a later frame reuses the decode
+/// instead of rebuilding an 80KB image on every paint.
+fn user_image_cache()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<gpui::Image>>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<gpui::Image>>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Build the image source for a decoded attachment picture.
+///
+/// The web host cannot fetch `data:` URLs through its HTTP client, so the bytes
+/// are decoded here and given to the element as an in-memory image.
+fn user_image_source(data_url: &str, media_type: &str) -> Option<gpui::ImageSource> {
+    if let Ok(cache) = user_image_cache().lock()
+        && let Some(image) = cache.get(data_url)
+    {
+        return Some(image.clone().into());
+    }
+    let bytes = crate::data_url::decode_base64_data_url(data_url)?;
+    let format = match media_type {
+        "image/jpeg" | "image/jpg" => gpui::ImageFormat::Jpeg,
+        "image/webp" => gpui::ImageFormat::Webp,
+        "image/gif" => gpui::ImageFormat::Gif,
+        _ => gpui::ImageFormat::Png,
+    };
+    let image = std::sync::Arc::new(gpui::Image::from_bytes(format, bytes));
+    if let Ok(mut cache) = user_image_cache().lock() {
+        cache.insert(data_url.to_owned(), image.clone());
+    }
+    Some(image.into())
+}
+
+/// User-message pictures (official UserContent): a row of rounded thumbnails
+/// that open the full-screen viewer. Attachment objects are read lazily, so a
+/// thumbnail falls back to 加载图片… until its data URL arrives.
+fn render_user_images(entry: &ChatEntry, cx: &mut Context<DshApp>) -> Option<gpui::Div> {
+    let images = crate::state::user_images(entry);
+    if images.is_empty() {
+        return None;
+    }
+    let p = dsh(cx);
+    let mut rail = row().gap(px(8.)).flex_wrap();
+    for (index, image) in images.into_iter().enumerate() {
+        let key = format!("{}-{index}", entry.key);
+        let name = image.name.clone();
+        let media_type = image.media_type.clone();
+        rail = rail.child(match image.data_url {
+            Some(data_url) => div()
+                .id(gpui::ElementId::Name(format!("user-image-{key}").into()))
+                .role(gpui::Role::Button)
+                .aria_label(format!("查看大图 {name}"))
+                .tab_index(0)
+                .size(px(96.))
+                .flex_none()
+                .rounded(px(12.))
+                .overflow_hidden()
+                .cursor_pointer()
+                .child(match user_image_source(&data_url, &media_type) {
+                    Some(source) => gpui::img(source)
+                        .size_full()
+                        .object_fit(gpui::ObjectFit::Cover)
+                        .into_any_element(),
+                    None => div()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(11.))
+                        .text_color(p.faint)
+                        .child("图片无法预览")
+                        .into_any_element(),
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.image_viewer = Some(crate::web::ImageViewer {
+                        data_url: data_url.clone(),
+                        media_type: media_type.clone(),
+                        name: name.clone(),
+                    });
+                    cx.notify();
+                }))
+                .into_any_element(),
+            None => div()
+                .size(px(96.))
+                .flex_none()
+                .rounded(px(12.))
+                .bg(p.md_code_block)
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(11.))
+                .text_color(p.faint)
+                .child("加载图片…")
+                .into_any_element(),
+        });
+    }
+    Some(rail)
+}
+
+/// Full-screen picture dialog (official image dialog): masked backdrop with the
+/// picture centred and a close control.
+impl DshApp {
+    fn render_image_viewer(&self, cx: &mut Context<DshApp>) -> Option<gpui::AnyElement> {
+        let viewer = self.image_viewer.clone()?;
+        let p = dsh(cx);
+        Some(
+            div()
+                .id("image-viewer")
+                .absolute()
+                .inset_0()
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(p.bg_mask_1)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.image_viewer = None;
+                    cx.notify();
+                }))
+                .child(
+                    column()
+                        .gap(px(8.))
+                        .items_center()
+                        .child(
+                            div().rounded(px(12.)).overflow_hidden().bg(p.stage).child(
+                                match user_image_source(&viewer.data_url, &viewer.media_type) {
+                                    Some(source) => gpui::img(source)
+                                        .w(px(760.))
+                                        .max_h(px(560.))
+                                        .object_fit(gpui::ObjectFit::Contain)
+                                        .into_any_element(),
+                                    None => div()
+                                        .p(px(24.))
+                                        .text_size(px(13.))
+                                        .text_color(p.faint)
+                                        .child("图片无法预览")
+                                        .into_any_element(),
+                                },
+                            ),
+                        )
+                        .when(!viewer.name.is_empty(), |column| {
+                            column.child(
+                                div()
+                                    .text_size(px(12.))
+                                    .line_height(px(18.))
+                                    .text_color(p.faint)
+                                    .child(viewer.name.clone()),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .id("image-viewer-close")
+                        .absolute()
+                        .top(px(24.))
+                        .right(px(28.))
+                        .role(gpui::Role::Button)
+                        .aria_label("关闭图片预览")
+                        .tab_index(0)
+                        .size(px(32.))
+                        .rounded_full()
+                        .bg(p.stage)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(p.hover))
+                        .child(icon(Glyph::Close, 16., p.ink))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.image_viewer = None;
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
 }
 
 fn render_tool_change(entry: &ChatEntry, expanded: bool, cx: &mut Context<DshApp>) -> gpui::Div {

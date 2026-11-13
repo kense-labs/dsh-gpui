@@ -656,6 +656,66 @@ pub async fn peek_session_titles(sessions: Vec<SessionTitleQuery>) -> Result<Val
 }
 
 /// Merge durable local sessions (projcache) that ACP `session/list` may omit.
+/// Read one stored attachment as a data: URL for transcript images.
+///
+/// The Harness dedupes user images into `~/.dsh/attachments/v1/objects/<aa>/<sha>`
+/// and logs only the reference, so the UI needs this to show the picture again
+/// instead of the `[图片]` placeholder.
+#[tauri::command]
+pub async fn read_attachment(attachment_id: String, media_type: String) -> Result<Value, String> {
+    let hash = attachment_id
+        .strip_prefix("sha256:")
+        .unwrap_or(&attachment_id)
+        .trim()
+        .to_owned();
+    if hash.len() < 3 || !hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(format!("无效的附件 id：{attachment_id}"));
+    }
+    let prefix = &hash[..2];
+    let path = dsh_home()
+        .join("attachments/v1/objects")
+        .join(prefix)
+        .join(&hash);
+    let bytes = tokio::task::spawn_blocking(move || std::fs::read(&path))
+        .await
+        .map_err(|error| format!("读取附件失败：{error}"))?
+        .map_err(|error| format!("读取附件失败：{error}"))?;
+    let media_type = if media_type.trim().is_empty() {
+        "image/png".to_string()
+    } else {
+        media_type
+    };
+    let encoded = base64_encode(&bytes);
+    Ok(json!({
+        "attachmentId": attachment_id,
+        "dataUrl": format!("data:{media_type};base64,{encoded}"),
+    }))
+}
+
+/// Minimal standard base64 encoder (no padding-free variant needed here).
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(b2 & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 #[tauri::command]
 pub async fn list_local_sessions() -> Result<Value, String> {
     let sessions = tokio::task::spawn_blocking(scan_local_sessions)
@@ -801,5 +861,20 @@ mod local_scan_tests {
             hit,
             "expected Kense titled session in local scan: {sessions:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::base64_encode;
+
+    #[test]
+    fn base64_matches_rfc4648_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64_encode(&[0xff, 0x00, 0x10]), "/wAQ");
     }
 }

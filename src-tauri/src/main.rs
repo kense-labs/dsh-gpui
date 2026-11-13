@@ -91,6 +91,7 @@ fn main() {
             history::export::archive::download_session_log,
             history::peek_session_titles,
             history::list_local_sessions,
+            history::read_attachment,
             acp::close_session,
             acp::set_session_archived,
             acp::prompt,
