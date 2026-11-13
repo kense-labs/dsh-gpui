@@ -18,6 +18,55 @@ const FOLDER_OPEN: &[u8] = include_bytes!("../../assets/files-folder-open.svg");
 const FILE_OTHER: &[u8] = include_bytes!("../../assets/files-other.svg");
 const FILE_OTHER_FOLD: &[u8] = include_bytes!("../../assets/files-other-fold.svg");
 
+/// Search exclusions the official Files search starts with (name or relative path).
+pub(super) const DEFAULT_SEARCH_EXCLUSIONS: &[&str] = &[
+    ".git",
+    ".hg",
+    ".next",
+    ".pnpm-store",
+    ".svn",
+    ".turbo",
+    ".yarn",
+    "build",
+    "coverage",
+    "dist",
+    "node_modules",
+    ".DS_Store",
+    ".Spotlight-V100",
+    ".Trashes",
+    ".fseventsd",
+    "Thumbs.db",
+    "desktop.ini",
+    "$RECYCLE.BIN",
+    "System Volume Information",
+];
+
+/// One workspace search's client state (official Files search).
+#[derive(Default)]
+pub(crate) struct FilesSearchState {
+    pub query: String,
+    /// `(path, type)` pairs as the Host answered them; type is `file`/`directory`.
+    pub matches: Vec<(String, String)>,
+    pub truncated: bool,
+    pub incomplete: bool,
+    pub error: Option<String>,
+    pub loading: bool,
+    /// Latest request id; stale answers for older ids are ignored.
+    pub request: u64,
+    pub scroll: ScrollHandle,
+}
+
+impl FilesSearchState {
+    /// Reset the results when the query becomes empty.
+    pub fn clear(&mut self) {
+        self.matches.clear();
+        self.truncated = false;
+        self.incomplete = false;
+        self.error = None;
+        self.loading = false;
+    }
+}
+
 #[derive(Default)]
 pub(super) struct DockFileTree {
     levels: HashMap<String, FileLevel>,
@@ -55,6 +104,25 @@ impl FileLevel {
 }
 
 impl DockFileTree {
+    /// Expand every directory on the way to one path so a search result can be
+    /// revealed in the tree.
+    pub(super) fn expand_path(&mut self, path: &str) {
+        self.revealed = Some(path.to_owned());
+        let mut current = String::new();
+        for segment in path.split('/') {
+            if segment.is_empty() {
+                continue;
+            }
+            if !current.is_empty() {
+                current.push('/');
+            }
+            current.push_str(segment);
+            if current != path {
+                self.expanded.insert(current.clone());
+            }
+        }
+    }
+
     pub(super) fn suspend(&mut self) {
         if std::mem::take(&mut self.shown) {
             self.levels.values_mut().for_each(FileLevel::invalidate);
@@ -423,8 +491,148 @@ impl DshApp {
                     ),
             )
             .children(self.render_workspace_open_split(Some(pane), workspace, cx));
-        page.child(header)
-            .child(self.render_workspace_tree(pane, None, cx))
+        let search_bar = div()
+            .w_full()
+            .flex_none()
+            .px(px(8.))
+            .pb(px(6.))
+            .child(input(&self.files_search_editor, cx));
+        let page = page.child(header).child(search_bar);
+        if self.files_search.query.trim().is_empty() {
+            page.child(self.render_workspace_tree(pane, None, cx))
+        } else {
+            page.child(self.render_files_search(pane, cx))
+        }
+    }
+
+    /// Official Files search results: shallow-first rows with the empty,
+    /// truncated, incomplete, and failure notes below them.
+    pub(super) fn render_files_search(
+        &self,
+        pane: DockPaneId,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let p = dsh(cx);
+        let size = self.dock_title_font_size();
+        let search = &self.files_search;
+        let mut body = div()
+            .id("files-search-scroll")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .pl(px(8.))
+            .pr(px(7.))
+            .py(px(8.))
+            .text_size(px(size))
+            .line_height(px(size * 1.5))
+            .text_color(p.label_primary)
+            .track_scroll(&search.scroll);
+        if let Some(error) = search.error.clone() {
+            body = body.child(
+                column()
+                    .w_full()
+                    .gap(px(6.))
+                    .child(file_note(format!("搜索失败：{error}"), cx))
+                    .child(
+                        div()
+                            .id("files-search-retry")
+                            .role(gpui::Role::Button)
+                            .aria_label("重试")
+                            .tab_index(0)
+                            .ml(px(10.))
+                            .px(px(8.))
+                            .py(px(2.))
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .text_size(px(12.))
+                            .text_color(p.label_secondary)
+                            .hover(|style| style.bg(p.hover))
+                            .child("重试")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.files_search.request =
+                                    this.files_search.request.wrapping_add(1);
+                                this.run_files_search(cx);
+                            })),
+                    ),
+            );
+        } else {
+            if search.loading && search.matches.is_empty() {
+                body = body.child(file_note("正在搜索…", cx));
+            }
+            for (index, (path, kind)) in search.matches.iter().enumerate() {
+                let is_directory = kind == "directory";
+                let open_path = path.clone();
+                let row = row()
+                    .id(gpui::ElementId::Name(
+                        format!("files-search-row-{index}").into(),
+                    ))
+                    .role(gpui::Role::Button)
+                    .aria_label(path.clone())
+                    .tab_index(0)
+                    .w_full()
+                    .min_w_0()
+                    .gap(px(6.))
+                    .px(px(6.))
+                    .h(px(22.))
+                    .rounded(px(6.))
+                    .items_center()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(p.hover))
+                    .child(icon(
+                        if is_directory {
+                            Glyph::Folder
+                        } else {
+                            Glyph::FileText
+                        },
+                        14.,
+                        p.faint,
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(p.label_primary)
+                            .child(path.clone()),
+                    );
+                body = body.child(if is_directory {
+                    row.on_click(cx.listener(move |this, _, w, cx| {
+                        if let Some(tree) = this.sidebar.file_trees.get_mut(&pane) {
+                            tree.expand_path(&open_path);
+                        }
+                        replace(&this.files_search_editor, "", w, cx);
+                        this.files_search.query.clear();
+                        this.files_search.clear();
+                        cx.notify();
+                    }))
+                } else {
+                    row.on_click(cx.listener(move |this, _, w, cx| {
+                        this.open_workspace_document(pane, open_path.clone(), w, cx);
+                    }))
+                });
+            }
+            if !search.loading && search.matches.is_empty() {
+                body = body
+                    .child(file_note("没有匹配项", cx))
+                    .child(file_note(
+                        "隐藏项、排除的文件和目录，以及被忽略文件（如 .gitignore）忽略的文件和目录不会显示。",
+                        cx,
+                    ));
+            }
+            if search.truncated {
+                body = body.child(file_note(
+                    format!("只显示前 {} 个结果，请缩小搜索范围。", search.matches.len()),
+                    cx,
+                ));
+            }
+            if search.incomplete {
+                body = body.child(file_note(
+                    "文件数超过搜索上限，或部分目录未能读取，因此结果可能不完整。",
+                    cx,
+                ));
+            }
+        }
+        body.into_any_element()
     }
 
     pub(super) fn render_workspace_tree(

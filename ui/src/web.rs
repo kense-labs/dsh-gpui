@@ -781,6 +781,10 @@ pub(crate) struct DshApp {
     _workspace_rename_subscription: Subscription,
     _session_rename_subscription: Subscription,
     _search_subscription: Subscription,
+    /// Files-pane search field and its latest workspace answer.
+    pub(crate) files_search_editor: gpui::Entity<Editor>,
+    _files_search_subscription: Subscription,
+    pub(super) files_search: dock_files::FilesSearchState,
     _model_filter_subscription: Subscription,
     _config_subscriptions: Vec<Subscription>,
     _welcome_subscription: Subscription,
@@ -922,6 +926,28 @@ impl DshApp {
             InputMode::Single,
             w,
             cx,
+        );
+        let files_search_editor = editor("搜索文件".into(), InputMode::Search, w, cx);
+        files_search_editor.update(cx, |input, _| input.font_size = 13.);
+        let files_search_subscription = cx.subscribe_in(
+            &files_search_editor,
+            w,
+            |this, _, event: &EditEvent, w, cx| match event {
+                EditEvent::Changed => {
+                    let query = this.files_search_editor.read(cx).value().trim().to_owned();
+                    if query != this.files_search.query {
+                        this.files_search.query = query;
+                        this.run_files_search(cx);
+                    }
+                }
+                EditEvent::Escape => {
+                    replace(&this.files_search_editor, "", w, cx);
+                    this.files_search.query.clear();
+                    this.files_search.clear();
+                    cx.notify();
+                }
+                _ => {}
+            },
         );
         let search_editor = editor("搜索会话名称".into(), InputMode::Search, w, cx);
         search_editor.update(cx, |input, _| {
@@ -1150,6 +1176,9 @@ impl DshApp {
             _workspace_rename_subscription: workspace_rename_subscription,
             _session_rename_subscription: session_rename_subscription,
             _search_subscription: search_subscription,
+            files_search_editor,
+            _files_search_subscription: files_search_subscription,
+            files_search: dock_files::FilesSearchState::default(),
             _model_filter_subscription: model_filter_subscription,
             _config_subscriptions: Vec::new(),
             _welcome_subscription: welcome_subscription,
@@ -2068,6 +2097,40 @@ impl DshApp {
             "turn_token_usage",
             json!({ "sessionId": session_id, "cwd": cwd }),
         );
+    }
+
+    /// Run the official Files-pane workspace search for the current query.
+    fn run_files_search(&mut self, cx: &mut Context<Self>) {
+        let query = self.files_search.query.trim().to_owned();
+        if query.is_empty() {
+            self.files_search.clear();
+            cx.notify();
+            return;
+        }
+        let workspace = self.sidebar.workspace.clone();
+        if workspace.trim().is_empty() {
+            return;
+        }
+        self.files_search.request = self.files_search.request.wrapping_add(1);
+        let request_id = self.files_search.request;
+        self.files_search.loading = true;
+        self.files_search.error = None;
+        let excluded: Vec<String> = dock_files::DEFAULT_SEARCH_EXCLUSIONS
+            .iter()
+            .map(|path| (*path).to_owned())
+            .collect();
+        invoke(
+            "search_workspace_files",
+            json!({
+                "workspace": workspace,
+                "query": query,
+                "includeHidden": false,
+                "respectGitignore": true,
+                "excludedPaths": excluded,
+                "requestId": request_id,
+            }),
+        );
+        cx.notify();
     }
 
     fn request_session_history(&mut self) {
@@ -3107,6 +3170,43 @@ impl DshApp {
                             conversation.error = conversation.history_error.clone();
                         }
                     }
+                }
+            }
+            // Files-pane workspace search answer; stale requests are dropped.
+            "search_workspace_files" => {
+                let answer_request = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|reply| reply.get("requestId").and_then(Value::as_u64))
+                    .unwrap_or(self.files_search.request);
+                if answer_request == self.files_search.request {
+                    self.files_search.loading = false;
+                    match result {
+                        Ok(reply) => {
+                            self.files_search.error = None;
+                            self.files_search.matches = reply
+                                .get("matches")
+                                .and_then(Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|entry| {
+                                    let path = entry.get("path").and_then(Value::as_str)?;
+                                    let kind =
+                                        entry.get("type").and_then(Value::as_str).unwrap_or("file");
+                                    Some((path.to_owned(), kind.to_owned()))
+                                })
+                                .collect();
+                            self.files_search.truncated =
+                                reply.get("truncated") == Some(&Value::Bool(true));
+                            self.files_search.incomplete =
+                                reply.get("incomplete") == Some(&Value::Bool(true));
+                        }
+                        Err(error) => {
+                            self.files_search.error = Some(error);
+                            self.files_search.matches.clear();
+                        }
+                    }
+                    cx.notify();
                 }
             }
             // Host path open/reveal: a refusal becomes the official dialog.

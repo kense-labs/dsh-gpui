@@ -13,6 +13,7 @@ mod shortcut_bindings;
 mod shortcuts;
 mod terminal;
 mod workspace;
+mod workspace_search;
 
 use acp::AcpService;
 use auth::AuthService;
@@ -130,6 +131,7 @@ fn main() {
             workspace::applications::open_workspace_application,
             workspace::open_browser_url,
             workspace::open_path,
+            workspace_search::search_workspace_files,
             browser::browser_shell_generation,
             browser::present_embedded_browser,
             browser::close_embedded_browser,

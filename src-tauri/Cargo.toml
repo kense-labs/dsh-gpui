@@ -27,6 +27,7 @@ tempfile = "3"
 indexmap = "2"
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 notify = "8.2.0"
+ignore = "0.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-text = "21"
