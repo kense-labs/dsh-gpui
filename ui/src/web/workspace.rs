@@ -6420,8 +6420,18 @@ fn render_entry(
                 )
                 .when(expanded, |element| {
                     let mut detail = column().w_full().pl(px(4.)).py(px(4.)).gap(px(6.));
-                    // 大参数/长输出只排版有界前缀，避免在布局里整段排版百万字符。
-                    if !entry.input.is_empty() {
+                    // 官方类型化工具行：shell 命令、read 行号块、grep 分组结果；
+                    // 其余工具仍展示参数与输出（有界截断，避免整段排版百万字符）。
+                    let tool = entry.tool_name().to_owned();
+                    let shell = crate::tool_cards::shell_command(&tool, &entry.input);
+                    let read = crate::tool_cards::read_lines(&tool, &entry.text);
+                    let search = crate::tool_cards::search_card(&tool, &entry.text);
+                    // 类型化卡片自己呈现输入（命令/路径已在标题或块上），不再
+                    // 重复展示原始 JSON 参数。
+                    let typed = shell.is_some() || read.is_some() || search.is_some();
+                    if let Some(shell) = &shell {
+                        detail = detail.child(render_shell_command(shell, p));
+                    } else if !typed && !entry.input.is_empty() {
                         let input = crate::tool_detail::detail_text(&entry.input);
                         detail = detail.child(code_text(&input.shown, p));
                         if input.truncated() {
@@ -6431,7 +6441,11 @@ fn render_entry(
                             ));
                         }
                     }
-                    if !entry.text.is_empty() {
+                    if let Some(read) = &read {
+                        detail = detail.child(render_read_lines(read, p));
+                    } else if let Some(search) = &search {
+                        detail = detail.child(render_search_card(search, p));
+                    } else if !entry.text.is_empty() {
                         let output = crate::tool_detail::detail_text(&entry.text);
                         detail = detail.child(code_text(&output.shown, p));
                         if output.truncated() {
@@ -9153,6 +9167,194 @@ fn remap_inline_spans(source: &str, display: &str) -> Vec<crate::markdown::Inlin
         display_cursor += len;
     }
     spans
+}
+
+/// Shell tool detail: the command line the tool ran, as a terminal block.
+fn render_shell_command(
+    shell: &crate::tool_cards::ShellCommand,
+    p: crate::tokens::Tokens,
+) -> gpui::Div {
+    let mut block = column()
+        .w_full()
+        .gap(px(4.))
+        .rounded(px(12.))
+        .border(px(0.5))
+        .border_color(p.line)
+        .bg(p.stage)
+        .px(px(16.))
+        .py(px(10.))
+        .child(
+            row()
+                .w_full()
+                .gap(px(6.))
+                .items_start()
+                .child(
+                    div()
+                        .flex_none()
+                        .font_family("monospace")
+                        .text_size(px(12.))
+                        .line_height(px(20.))
+                        .text_color(p.faint)
+                        .child("$"),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .font_family("monospace")
+                        .text_size(px(12.))
+                        .line_height(px(20.))
+                        .text_color(p.secondary)
+                        .child(shell.command.clone()),
+                ),
+        );
+    if let Some(description) = &shell.description {
+        block = block.child(
+            div()
+                .text_size(px(12.))
+                .line_height(px(18.))
+                .text_color(p.faint)
+                .child(description.clone()),
+        );
+    }
+    block
+}
+
+/// Read tool detail: the numbered file lines as a code block.
+fn render_read_lines(read: &crate::tool_cards::ReadLines, p: crate::tokens::Tokens) -> gpui::Div {
+    const MAX_LINES: usize = 400;
+    let shown = read.lines.iter().take(MAX_LINES);
+    let mut block = column()
+        .w_full()
+        .gap_0()
+        .rounded(px(12.))
+        .border(px(0.5))
+        .border_color(p.line)
+        .bg(p.stage)
+        .py(px(8.))
+        .font_family("monospace")
+        .text_size(px(12.))
+        .line_height(px(20.));
+    for (number, text) in shown {
+        block = block.child(
+            row()
+                .w_full()
+                .gap(px(10.))
+                .px(px(12.))
+                .items_start()
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(34.))
+                        .text_color(p.faint)
+                        .child(format!("{number}")),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_color(p.secondary)
+                        .child(text.clone()),
+                ),
+        );
+    }
+    if let Some(footer) = &read.footer {
+        block = block.child(
+            div()
+                .px(px(12.))
+                .pt(px(4.))
+                .text_size(px(11.))
+                .line_height(px(16.))
+                .text_color(p.faint)
+                .child(footer.clone()),
+        );
+    }
+    if read.lines.len() > MAX_LINES {
+        block = block.child(tool_detail_note(
+            format!("… 已截断，共 {} 行", read.lines.len()),
+            p,
+        ));
+    }
+    block
+}
+
+/// Grep tool detail: matches grouped by file.
+fn render_search_card(card: &crate::tool_cards::SearchCard, p: crate::tokens::Tokens) -> gpui::Div {
+    const MAX_MATCHES: usize = 100;
+    let mut block = column()
+        .w_full()
+        .gap(px(4.))
+        .rounded(px(12.))
+        .border(px(0.5))
+        .border_color(p.line)
+        .bg(p.stage)
+        .py(px(8.));
+    if let Some(headline) = &card.headline {
+        block = block.child(
+            div()
+                .px(px(12.))
+                .pb(px(2.))
+                .text_size(px(11.))
+                .line_height(px(16.))
+                .text_color(p.faint)
+                .child(headline.clone()),
+        );
+    }
+    let mut seen = 0usize;
+    let mut truncated = false;
+    for file in &card.files {
+        if seen >= MAX_MATCHES {
+            truncated = true;
+            break;
+        }
+        block = block.child(
+            div()
+                .px(px(12.))
+                .pt(px(6.))
+                .truncate()
+                .text_size(px(12.))
+                .line_height(px(18.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(p.label_secondary)
+                .child(file.path.clone()),
+        );
+        for m in &file.matches {
+            if seen >= MAX_MATCHES {
+                truncated = true;
+                break;
+            }
+            seen += 1;
+            block = block.child(
+                row()
+                    .w_full()
+                    .gap(px(10.))
+                    .px(px(12.))
+                    .items_start()
+                    .font_family("monospace")
+                    .text_size(px(12.))
+                    .line_height(px(20.))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(34.))
+                            .text_color(p.faint)
+                            .child(format!("{}", m.line)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_color(p.secondary)
+                            .child(m.text.clone()),
+                    ),
+            );
+        }
+    }
+    let total: usize = card.files.iter().map(|file| file.matches.len()).sum();
+    if truncated || total > MAX_MATCHES {
+        block = block.child(tool_detail_note(format!("… 已截断，共 {total} 处匹配"), p));
+    }
+    block
 }
 
 /// One faint note under a truncated expanded section.
