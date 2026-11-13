@@ -6998,16 +6998,27 @@ fn render_context_injection(
 ) -> gpui::Div {
     let p = dsh(cx);
     let key = entry.key.clone();
-    let title = "上下文注入";
-    let source = entry.title.clone();
-    let body = entry.text.clone();
-    let expandable = !body.trim().is_empty();
+    let header = crate::state::context_header(&entry.input);
+    let body = crate::state::context_body_view(&entry.input, &entry.text);
+    let label = if header.label.is_empty() {
+        entry.title.clone()
+    } else {
+        header.label.clone()
+    };
+    let recall = header.role == crate::state::ContextRole::Recall;
+    let expandable = context_body_has_content(&body);
     let open = expanded && expandable;
     let toggle_key = key.clone();
+    let title = header.title;
+    let aria = if label.is_empty() {
+        title.to_owned()
+    } else {
+        format!("{title} {label}")
+    };
     let mut row = row()
         .id(gpui::ElementId::Name(format!("context-{key}").into()))
         .role(gpui::Role::Button)
-        .aria_label(format!("{title} {source}"))
+        .aria_label(aria)
         .aria_expanded(open)
         .tab_index(0)
         .tab_stop(expandable)
@@ -7021,13 +7032,16 @@ fn render_context_injection(
             row.cursor_pointer().hover(|style| style.bg(p.hover))
         })
         .text_color(p.faint)
-        .child(
+        .child(if recall {
+            icon(Glyph::Comment, 14., p.faint).into_any_element()
+        } else {
             gpui::svg()
                 .data(include_bytes!("../../assets/context-injection.svg") as &[u8])
                 .size(px(14.))
                 .flex_none()
-                .text_color(p.faint),
-        )
+                .text_color(p.faint)
+                .into_any_element()
+        })
         .child(
             div()
                 .flex_none()
@@ -7035,16 +7049,30 @@ fn render_context_injection(
                 .line_height(px(20.))
                 .child(title),
         )
-        .child(div().flex_none().size(px(2.)).rounded_full().bg(p.faint))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .text_size(px(13.))
-                .line_height(px(20.))
-                .child(source),
-        );
+        .when(!label.is_empty(), |row| {
+            row.child(div().flex_none().size(px(2.)).rounded_full().bg(p.faint))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(13.))
+                        .line_height(px(20.))
+                        .child(label),
+                )
+        })
+        .when_some(header.summary, |row, summary| {
+            row.child(div().flex_none().size(px(2.)).rounded_full().bg(p.faint))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(13.))
+                        .line_height(px(20.))
+                        .child(summary),
+                )
+        });
     if expandable {
         row = row
             .child(icon(
@@ -7070,10 +7098,167 @@ fn render_context_injection(
                 .text_size(px(12.))
                 .line_height(px(18.))
                 .text_color(p.secondary)
-                .child(body),
+                .child(render_context_body(&body, p)),
         );
     }
     card
+}
+
+/// Whether one context body has anything to show when expanded.
+fn context_body_has_content(body: &crate::state::ContextBodyView) -> bool {
+    use crate::state::ContextBodyView;
+    match body {
+        ContextBodyView::Catalog { entries, .. } => !entries.is_empty(),
+        ContextBodyView::Snapshot { sections } => !sections.is_empty(),
+        ContextBodyView::Instructions { changes, text } => {
+            !changes.is_empty() || !text.trim().is_empty()
+        }
+        ContextBodyView::Relay { .. } | ContextBodyView::Recall { .. } => true,
+        ContextBodyView::Notice { text } | ContextBodyView::Opaque { text } => {
+            !text.trim().is_empty()
+        }
+    }
+}
+
+/// Plain text rendered with its real line breaks (official bodies use `<pre>`).
+fn context_text_lines(text: &str, color: gpui::Hsla) -> gpui::Div {
+    let mut column = column().w_full().gap_0();
+    for line in text.lines() {
+        column = column.child(div().w_full().min_h(px(18.)).text_color(color).child(
+            if line.is_empty() {
+                " ".to_string()
+            } else {
+                line.to_string()
+            },
+        ));
+    }
+    column
+}
+
+fn context_notice_row(text: String, p: crate::tokens::Tokens) -> gpui::Div {
+    div()
+        .w_full()
+        .text_color(p.faint)
+        .text_size(px(12.))
+        .child(text)
+}
+
+/// One context body, chosen by the producer-declared form (official ContextBody).
+fn render_context_body(
+    body: &crate::state::ContextBodyView,
+    p: crate::tokens::Tokens,
+) -> gpui::Div {
+    use crate::state::ContextBodyView;
+    let mut list = column().w_full().gap(px(6.));
+    match body {
+        ContextBodyView::Catalog {
+            entries,
+            replaced,
+            truncated,
+        } => {
+            if *replaced {
+                list = list.child(context_notice_row("替换目录".to_owned(), p));
+            }
+            for (name, description) in entries {
+                list = list.child(
+                    row()
+                        .w_full()
+                        .items_start()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .flex_none()
+                                .font_family("monospace")
+                                .text_color(p.ink)
+                                .child(name.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_color(p.secondary)
+                                .child(description.clone()),
+                        ),
+                );
+            }
+            if let Some(rest) = truncated {
+                list = list.child(context_notice_row(format!("…还有 {rest} 条"), p));
+            }
+        }
+        ContextBodyView::Snapshot { sections } => {
+            list = list.child(context_notice_row("取代先前的快照".to_owned(), p));
+            for (name, text) in sections {
+                list = list.child(
+                    column()
+                        .w_full()
+                        .gap_0()
+                        .child(
+                            div()
+                                .w_full()
+                                .text_color(p.label_primary)
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(name.clone()),
+                        )
+                        .child(context_text_lines(text, p.secondary)),
+                );
+            }
+        }
+        ContextBodyView::Notice { text } => {
+            list = list.child(context_text_lines(text, p.secondary));
+        }
+        ContextBodyView::Instructions { changes, text } => {
+            for (path, action) in changes {
+                list = list.child(
+                    row()
+                        .w_full()
+                        .items_start()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_color(p.ink)
+                                .child(path.clone()),
+                        )
+                        .child(div().flex_none().text_color(p.faint).child(*action)),
+                );
+            }
+            if !text.trim().is_empty() {
+                list = list.child(context_text_lines(text, p.secondary));
+            }
+        }
+        ContextBodyView::Relay { sender, text } => {
+            list = list.child(context_notice_row(format!("来自会话 {sender}"), p));
+            list = list.child(context_text_lines(text, p.secondary));
+        }
+        ContextBodyView::Recall { sessions, text } => {
+            for (label, retained, omitted, truncated) in sessions {
+                let counts = format!("保留 {retained} 条 · 省略 {omitted} 条");
+                list = list.child(
+                    row()
+                        .w_full()
+                        .items_start()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_color(p.ink)
+                                .child(label.clone()),
+                        )
+                        .child(div().flex_none().text_color(p.faint).child(counts))
+                        .when(*truncated, |row| {
+                            row.child(div().flex_none().text_color(p.faint).child("已截断"))
+                        }),
+                );
+            }
+            list = list.child(context_text_lines(text, p.secondary));
+        }
+        ContextBodyView::Opaque { text } => {
+            list = list.child(context_text_lines(text, p.secondary));
+        }
+    }
+    list
 }
 
 /// 官方 GenericCommandCard：指令名 + 分隔点 + 折叠摘要，多行正文可展开。

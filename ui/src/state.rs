@@ -703,6 +703,308 @@ pub fn context_source_label(kind: &str) -> &str {
     }
 }
 
+/// Which model-facing role a logged non-user message plays.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ContextRole {
+    #[default]
+    Inject,
+    /// Material lifted out of another session's log.
+    Recall,
+}
+
+/// Header of one context-injection row (official `ContextProducerView` + title).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContextHeader {
+    pub role: ContextRole,
+    /// Localized row title: 上下文注入 or 跨会话召回.
+    pub title: &'static str,
+    /// Producer label; empty when the source carries no readable kind.
+    pub label: String,
+    /// Collapsed one-line account, only for the `notice` form.
+    pub summary: Option<String>,
+}
+
+/// One context form body, mirroring the official `ContextBody` unions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContextBodyView {
+    /// Published skill catalog: name + description rows.
+    Catalog {
+        entries: Vec<(String, String)>,
+        replaced: bool,
+        truncated: Option<usize>,
+    },
+    /// Named runtime/time snapshot contributions.
+    Snapshot { sections: Vec<(String, String)> },
+    /// A notice's model-facing text.
+    Notice { text: String },
+    /// Reconciled instruction files (`(path, localized action)`), then text.
+    Instructions {
+        changes: Vec<(String, &'static str)>,
+        text: String,
+    },
+    /// Cross-agent relay: sender session id, then text.
+    Relay { sender: String, text: String },
+    /// Cross-session recall: completeness per referenced session, then text.
+    Recall {
+        sessions: Vec<(String, u64, u64, bool)>,
+        text: String,
+    },
+    /// The default body: model-facing text as recorded.
+    Opaque { text: String },
+}
+
+fn context_source<'a>(value: &'a Value) -> &'a Value {
+    value
+        .get("source")
+        .filter(|source| source.is_object())
+        .unwrap_or(value)
+}
+
+/// Model-facing content recorded with a context message, in block order.
+fn context_model_text(value: &Value) -> String {
+    value
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<String>()
+        })
+        .unwrap_or_default()
+}
+
+fn joined_non_empty(values: impl IntoIterator<Item = String>) -> Option<String> {
+    let labels: Vec<String> = values
+        .into_iter()
+        .filter(|value| !value.trim().is_empty())
+        .collect();
+    (!labels.is_empty()).then(|| labels.join(", "))
+}
+
+/// Header of one context row from its stored payload.
+///
+/// Known producers replace the bare kind with what the durable source actually
+/// names (instruction paths, referenced session labels, the loaded skill);
+/// every other producer keeps its durable kind verbatim, like the official
+/// projection.
+pub fn context_header(payload: &str) -> ContextHeader {
+    let value: Value = serde_json::from_str(payload).unwrap_or(Value::Null);
+    let source = context_source(&value);
+    let kind = source
+        .get("kind")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("sourceKind").and_then(Value::as_str))
+        .unwrap_or_default();
+    let form = source
+        .get("form")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("form").and_then(Value::as_str));
+    let summary = (form == Some("notice"))
+        .then(|| {
+            source
+                .get("summary")
+                .and_then(Value::as_str)
+                .filter(|summary| !summary.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .flatten();
+    let strings = |list: &str, field: &str| {
+        source
+            .get(list)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get(field).and_then(Value::as_str))
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    let (role, title, label) = match kind {
+        "session-reference" => (
+            ContextRole::Recall,
+            "跨会话召回",
+            joined_non_empty(strings("references", "label")).unwrap_or_else(|| kind.to_owned()),
+        ),
+        "agent-instructions" => (
+            ContextRole::Inject,
+            "上下文注入",
+            joined_non_empty(strings("changes", "path")).unwrap_or_else(|| kind.to_owned()),
+        ),
+        "skill-invocation" => (
+            ContextRole::Inject,
+            "上下文注入",
+            source
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| kind.to_owned()),
+        ),
+        "" => (ContextRole::Inject, "上下文注入", String::new()),
+        other => (ContextRole::Inject, "上下文注入", other.to_owned()),
+    };
+    ContextHeader {
+        role,
+        title,
+        label,
+        summary,
+    }
+}
+
+/// Body of one context row from its stored payload.
+///
+/// Every form is read all-or-nothing: a declared form whose records are not
+/// fully readable falls back to the opaque body rather than presenting a
+/// confident but incomplete account.
+pub fn context_body_view(payload: &str, fallback: &str) -> ContextBodyView {
+    let value: Value = serde_json::from_str(payload).unwrap_or(Value::Null);
+    let source = context_source(&value);
+    let text = context_model_text(&value);
+    let text = if text.trim().is_empty() {
+        fallback.to_owned()
+    } else {
+        text
+    };
+    let opaque = || ContextBodyView::Opaque { text: text.clone() };
+    let form = source
+        .get("form")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("form").and_then(Value::as_str));
+    match form {
+        Some("catalog") => {
+            let Some(entries) = source.get("entries").and_then(Value::as_array) else {
+                return opaque();
+            };
+            let mut out = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let (Some(name), Some(description)) = (
+                    entry.get("name").and_then(Value::as_str),
+                    entry.get("description").and_then(Value::as_str),
+                ) else {
+                    return opaque();
+                };
+                if name.is_empty() {
+                    return opaque();
+                }
+                out.push((name.to_owned(), description.to_owned()));
+            }
+            const MAX_ENTRIES: usize = 200;
+            let truncated = (out.len() > MAX_ENTRIES).then(|| out.len() - MAX_ENTRIES);
+            out.truncate(MAX_ENTRIES);
+            ContextBodyView::Catalog {
+                entries: out,
+                replaced: source.get("update") == Some(&Value::Bool(true)),
+                truncated,
+            }
+        }
+        Some("snapshot") => {
+            let Some(sections) = source.get("sections").and_then(Value::as_array) else {
+                return opaque();
+            };
+            let mut out = Vec::with_capacity(sections.len());
+            for section in sections {
+                let (Some(name), Some(section_text)) = (
+                    section.get("name").and_then(Value::as_str),
+                    section.get("text").and_then(Value::as_str),
+                ) else {
+                    return opaque();
+                };
+                if name.is_empty() {
+                    return opaque();
+                }
+                out.push((name.to_owned(), section_text.to_owned()));
+            }
+            if out.is_empty() {
+                return opaque();
+            }
+            ContextBodyView::Snapshot { sections: out }
+        }
+        Some("notice") => ContextBodyView::Notice { text },
+        Some("instructions") => {
+            let Some(changes) = source.get("changes").and_then(Value::as_array) else {
+                return opaque();
+            };
+            let baseline = source.get("baseline") == Some(&Value::Bool(true));
+            let mut out = Vec::with_capacity(changes.len());
+            for change in changes {
+                let (Some(path), Some(action)) = (
+                    change.get("path").and_then(Value::as_str),
+                    change.get("action").and_then(Value::as_str),
+                ) else {
+                    return opaque();
+                };
+                if path.is_empty() {
+                    return opaque();
+                }
+                let label = match action {
+                    "remove" => "已移除",
+                    "set" if baseline => "已载入",
+                    "set" => "已新增",
+                    "replace" if baseline => "已载入",
+                    "replace" => "已更新",
+                    _ => return opaque(),
+                };
+                if !out
+                    .iter()
+                    .any(|(seen, _): &(String, &'static str)| *seen == path)
+                {
+                    out.push((path.to_owned(), label));
+                }
+            }
+            if out.is_empty() {
+                return opaque();
+            }
+            ContextBodyView::Instructions { changes: out, text }
+        }
+        Some("relay") => {
+            let sender = source
+                .get("senderSessionId")
+                .and_then(Value::as_str)
+                .filter(|sender| !sender.is_empty());
+            match sender {
+                Some(sender) => ContextBodyView::Relay {
+                    sender: sender.to_owned(),
+                    text,
+                },
+                None => opaque(),
+            }
+        }
+        Some("recall") => {
+            let Some(references) = source.get("references").and_then(Value::as_array) else {
+                return opaque();
+            };
+            let mut out = Vec::with_capacity(references.len());
+            for reference in references {
+                let label = reference.get("label").and_then(Value::as_str);
+                let retained = reference.get("retainedMessages").and_then(Value::as_u64);
+                let omitted = reference.get("omittedMessages").and_then(Value::as_u64);
+                let truncated = reference.get("truncated").and_then(Value::as_bool);
+                let (Some(label), Some(retained), Some(omitted), Some(truncated)) =
+                    (label, retained, omitted, truncated)
+                else {
+                    return opaque();
+                };
+                if label.is_empty() {
+                    return opaque();
+                }
+                out.push((label.to_owned(), retained, omitted, truncated));
+            }
+            if out.is_empty() {
+                return opaque();
+            }
+            ContextBodyView::Recall {
+                sessions: out,
+                text,
+            }
+        }
+        _ => opaque(),
+    }
+}
+
 /// Body of one context-injection row.
 ///
 /// The skill catalog carries structured `entries`; every other producer is a
@@ -838,7 +1140,6 @@ fn apply_context_injection(entries: &mut Vec<ChatEntry>, update: &Value) {
     if id.is_empty() {
         return;
     }
-    let source = string_field(update, "sourceKind");
     let changes = tool_changes(&update["toolChanges"]);
     if !changes.is_empty() {
         let entry = tool_change_entry(&id, &changes, update.get("time").and_then(Value::as_f64));
@@ -852,7 +1153,8 @@ fn apply_context_injection(entries: &mut Vec<ChatEntry>, update: &Value) {
         return;
     }
     let text = context_entries_text(update);
-    let title = context_source_label(&source).to_owned();
+    let payload = update.to_string();
+    let title = context_header(&payload).label;
     let status = if update["update"] == true {
         "update".to_owned()
     } else {
@@ -862,6 +1164,7 @@ fn apply_context_injection(entries: &mut Vec<ChatEntry>, update: &Value) {
         entry.role == EntryRole::Context && entry.external_id.as_deref() == Some(id.as_str())
     }) {
         entry.title = title;
+        entry.input = payload;
         if !text.is_empty() {
             entry.text = text;
         }
@@ -874,7 +1177,7 @@ fn apply_context_injection(entries: &mut Vec<ChatEntry>, update: &Value) {
         role: EntryRole::Context,
         title,
         text,
-        input: String::new(),
+        input: payload,
         status,
         tool: None,
         at_ms: update.get("time").and_then(Value::as_f64),
@@ -1436,7 +1739,8 @@ pub fn adopt_logged_user_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatEntry, EntryRole, adopt_logged_user_message, apply_update, context_entries_text,
+        ChatEntry, ContextBodyView, ContextRole, EntryRole, adopt_logged_user_message,
+        apply_update, context_body_view, context_entries_text, context_header,
         context_source_label, is_auth_failure, job_detail_text, job_status_label,
         prompt_failure_message, trigger_title, turn_failure, turn_failure_entry, turn_usage_map,
         validate_api_key,
@@ -1480,6 +1784,186 @@ mod tests {
     }
 
     #[test]
+    fn context_headers_use_the_official_producer_labels() {
+        // Unknown producers keep their durable kind verbatim.
+        let time = serde_json::json!({
+            "source": {"kind": "time-context", "form": "snapshot", "sections": []},
+            "content": [{"type": "text", "text": "now"}],
+        });
+        let header = context_header(&time.to_string());
+        assert_eq!(header.role, ContextRole::Inject);
+        assert_eq!(header.title, "上下文注入");
+        assert_eq!(header.label, "time-context");
+        assert_eq!(header.summary, None);
+
+        // A notice puts its one-line account on the collapsed row.
+        let notice = serde_json::json!({
+            "source": {"kind": "tool-jobs", "form": "notice", "summary": "后台任务已完成"},
+            "content": [{"type": "text", "text": "done"}],
+        });
+        let header = context_header(&notice.to_string());
+        assert_eq!(header.label, "tool-jobs");
+        assert_eq!(header.summary.as_deref(), Some("后台任务已完成"));
+
+        // Instruction rows are labelled by the files they reconciled.
+        let instructions = serde_json::json!({
+            "source": {"kind": "agent-instructions", "form": "instructions", "changes": [
+                {"action": "set", "path": "AGENTS.md"},
+                {"action": "replace", "path": "KUI/AGENTS.md"},
+            ]},
+        });
+        assert_eq!(
+            context_header(&instructions.to_string()).label,
+            "AGENTS.md, KUI/AGENTS.md"
+        );
+
+        // A loaded skill names itself; a recall names the referenced sessions.
+        let skill = serde_json::json!({
+            "source": {"kind": "skill-invocation", "form": "instructions", "name": "ppt-generation"},
+        });
+        assert_eq!(context_header(&skill.to_string()).label, "ppt-generation");
+        let recall = serde_json::json!({
+            "source": {"kind": "session-reference", "form": "recall", "references": [
+                {"label": "修复登录问题", "retainedMessages": 3, "omittedMessages": 1, "truncated": false},
+            ]},
+        });
+        let header = context_header(&recall.to_string());
+        assert_eq!(header.role, ContextRole::Recall);
+        assert_eq!(header.title, "跨会话召回");
+        assert_eq!(header.label, "修复登录问题");
+
+        // A live update carries the kind at the top level.
+        let live = serde_json::json!({"sourceKind": "runtime-context", "form": "snapshot"});
+        assert_eq!(context_header(&live.to_string()).label, "runtime-context");
+        // No readable kind drops the label entirely.
+        assert_eq!(context_header("{}").label, "");
+    }
+
+    #[test]
+    fn context_bodies_follow_the_declared_form_with_opaque_fallback() {
+        // snapshot: named sections replace the joined framing prose.
+        let snapshot = serde_json::json!({
+            "source": {"kind": "runtime-context", "form": "snapshot", "sections": [
+                {"name": "working-directory:current", "text": "Current working directory: \"/\"."},
+                {"name": "sandbox:policy", "text": "workspace-write"},
+            ]},
+            "content": [{"type": "text", "text": "Current runtime context. This snapshot supersedes earlier snapshots."}],
+        });
+        match context_body_view(&snapshot.to_string(), "") {
+            ContextBodyView::Snapshot { sections } => {
+                assert_eq!(sections.len(), 2);
+                assert_eq!(sections[0].0, "working-directory:current");
+                assert_eq!(sections[1].1, "workspace-write");
+            }
+            other => panic!("expected snapshot body, got {other:?}"),
+        }
+
+        // catalog: entries plus the replacement marker.
+        let catalog = serde_json::json!({
+            "source": {"kind": "skill-catalog", "form": "catalog", "update": true, "entries": [
+                {"name": "ppt-generation", "description": "生成演示文稿"},
+            ]},
+        });
+        match context_body_view(&catalog.to_string(), "") {
+            ContextBodyView::Catalog {
+                entries,
+                replaced,
+                truncated,
+            } => {
+                assert_eq!(
+                    entries,
+                    vec![("ppt-generation".to_owned(), "生成演示文稿".to_owned())]
+                );
+                assert!(replaced);
+                assert_eq!(truncated, None);
+            }
+            other => panic!("expected catalog body, got {other:?}"),
+        }
+        // An empty catalog is a real replacement, not a fallback.
+        let empty_catalog = serde_json::json!({
+            "source": {"kind": "skill-catalog", "form": "catalog", "update": true, "entries": []},
+        });
+        assert!(matches!(
+            context_body_view(&empty_catalog.to_string(), ""),
+            ContextBodyView::Catalog { entries, .. } if entries.is_empty()
+        ));
+
+        // notice: the model-facing text.
+        let notice = serde_json::json!({
+            "source": {"kind": "tool-goal", "form": "notice", "summary": "complete: 算圆周率"},
+            "content": [{"type": "text", "text": "<goal_complete>\nObjective: 算圆周率"}],
+        });
+        match context_body_view(&notice.to_string(), "") {
+            ContextBodyView::Notice { text } => assert!(text.contains("<goal_complete>")),
+            other => panic!("expected notice body, got {other:?}"),
+        }
+
+        // instructions: actions localize against the baseline flag.
+        let instructions = serde_json::json!({
+            "source": {"kind": "agent-instructions", "form": "instructions", "baseline": false, "changes": [
+                {"action": "set", "path": "AGENTS.md"},
+                {"action": "replace", "path": "KUI/AGENTS.md"},
+                {"action": "remove", "path": "OLD.md"},
+            ]},
+            "content": [{"type": "text", "text": "<system-reminder>..."}],
+        });
+        match context_body_view(&instructions.to_string(), "") {
+            ContextBodyView::Instructions { changes, text } => {
+                assert_eq!(
+                    changes,
+                    vec![
+                        ("AGENTS.md".to_owned(), "已新增"),
+                        ("KUI/AGENTS.md".to_owned(), "已更新"),
+                        ("OLD.md".to_owned(), "已移除"),
+                    ]
+                );
+                assert!(text.contains("<system-reminder>"));
+            }
+            other => panic!("expected instructions body, got {other:?}"),
+        }
+
+        // relay and recall.
+        let relay = serde_json::json!({
+            "source": {"kind": "agent-message", "form": "relay", "senderSessionId": "7a3a"},
+            "content": [{"type": "text", "text": "Agent 7a3a sent a message"}],
+        });
+        match context_body_view(&relay.to_string(), "") {
+            ContextBodyView::Relay { sender, .. } => assert_eq!(sender, "7a3a"),
+            other => panic!("expected relay body, got {other:?}"),
+        }
+        let recall = serde_json::json!({
+            "source": {"kind": "session-reference", "form": "recall", "references": [
+                {"label": "修复登录", "retainedMessages": 3, "omittedMessages": 1, "truncated": true},
+            ]},
+            "content": [{"type": "text", "text": "material"}],
+        });
+        match context_body_view(&recall.to_string(), "") {
+            ContextBodyView::Recall { sessions, .. } => {
+                assert_eq!(sessions, vec![("修复登录".to_owned(), 3, 1, true)]);
+            }
+            other => panic!("expected recall body, got {other:?}"),
+        }
+
+        // An unreadable declared form falls back to the opaque model text.
+        let broken = serde_json::json!({
+            "source": {"kind": "skill-catalog", "form": "catalog", "entries": [{"name": "x"}]},
+            "content": [{"type": "text", "text": "catalog prose"}],
+        });
+        match context_body_view(&broken.to_string(), "fallback") {
+            ContextBodyView::Opaque { text } => assert_eq!(text, "catalog prose"),
+            other => panic!("expected opaque body, got {other:?}"),
+        }
+        // Without model-facing content the row's recorded text is the fallback.
+        match context_body_view(
+            &serde_json::json!({"sourceKind": "goal"}).to_string(),
+            "记录文本",
+        ) {
+            ContextBodyView::Opaque { text } => assert_eq!(text, "记录文本"),
+            other => panic!("expected opaque body, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn a_time_context_injection_is_a_context_row_not_a_trigger() {
         let mut entries = Vec::new();
         let effect = apply_update(
@@ -1495,7 +1979,7 @@ mod tests {
         assert!(!effect.turn_triggered);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].role, EntryRole::Context);
-        assert_eq!(entries[0].title, "时间上下文");
+        assert_eq!(entries[0].title, "time-context");
         assert_eq!(
             entries[0].text,
             "Time sampled while preparing turn 2, step 1"
@@ -1600,7 +2084,7 @@ mod tests {
         assert!(!effect.turn_triggered);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].role, EntryRole::Context);
-        assert_eq!(entries[0].title, "时间上下文");
+        assert_eq!(entries[0].title, "time-context");
         // A waking producer keeps its trigger card and opens the turn.
         let effect = apply_update(
             &mut entries,
@@ -1879,7 +2363,7 @@ mod tests {
         assert!(!effect.turn_triggered);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].role, EntryRole::Context);
-        assert_eq!(entries[0].title, "技能目录");
+        assert_eq!(entries[0].title, "skill-catalog");
         assert_eq!(
             entries[0].text,
             "ppt-generation — 生成演示文稿\nask-form — 表单提问"

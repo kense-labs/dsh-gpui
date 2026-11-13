@@ -77,11 +77,10 @@ const goalActionMethod = '_dsh/gpui/session/goal-action';
 // replaces the shadowed history; cache them so the live marker can cite the
 // official 已压缩 N 条历史记录 count like a reopened session does.
 const compactionSummaries = new Map()
-const TRIGGER_SOURCES = new Set([
-  'goal', 'schedule', 'webhook', 'github', 'agent', 'agent-message', 'team',
-  'team-message', 'subagent', 'subagent-settled', 'job', 'tool-jobs', 'tool-goal',
-  'plugin',
-]);
+// Durable agent inbox per session: a non-human message is a turn trigger only
+// when the inbox claimed it for the next turn (official `waking`); a notice that
+// arrives mid-turn stays a collapsed context row, exactly like the replay does.
+const inboxes = new WeakMap()
 const planReviews = new Map();
 const questionRequests = new Map();
 const messageMethods = new Map([
@@ -1858,6 +1857,17 @@ function observeSessionUpdates(ctx) {
     }
   }, { global: true });
   ctx.on('session/event', (session, event) => {
+    if (event.type !== 'agent/inbox/spliced') return
+    const data = event.data ?? {}
+    let state = inboxes.get(session)
+    if (!state) inboxes.set(session, state = { queues: { 'next-turn': [], 'next-step': [] }, claimed: new Set() })
+    const queue = state.queues[data.target === 'next-step' ? 'next-step' : 'next-turn']
+    const start = Number.isSafeInteger(data.start) ? data.start : 0
+    const removed = Number.isSafeInteger(data.removedCount) ? data.removedCount : 0
+    for (const message of queue.slice(start, start + removed)) state.claimed.add(message.id)
+    queue.splice(start, removed, ...(Array.isArray(data.inserted) ? data.inserted : []))
+  }, { global: true });
+  ctx.on('session/event', (session, event) => {
     const { type, data, surfaceOp } = event;
     if (type === 'plan/mode') {
       notify(session.id, { sessionUpdate: 'gpui_plan_mode', active: data.active });
@@ -1912,11 +1922,18 @@ function observeSessionUpdates(ctx) {
           })
           return
         }
-        if (!TRIGGER_SOURCES.has(source)) {
+        // Claimed by the inbox for this turn → waking trigger; otherwise a
+        // mid-turn injection keeps the context row.
+        const waking = inboxes.get(session)?.claimed.has(data.id) === true;
+        if (!waking) {
           notify(session.id, {
             sessionUpdate: 'context_injection',
             messageId: data.id,
             sourceKind: source,
+            // Full durable source so the client can present the form-specific
+            // body (sections, summary, changes, sender, references) with the same
+            // data a reopened session has in its log.
+            source: data.source,
             form: data.source?.form,
             entries: data.source?.entries,
             update: data.source?.update === true,

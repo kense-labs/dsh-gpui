@@ -134,6 +134,13 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
         String,
         (Option<String>, Option<usize>, Option<u64>),
     > = std::collections::HashMap::new();
+    // Durable agent inbox: a non-human message is a turn trigger only when the
+    // inbox claimed it for the next turn (official `waking`); an injected notice
+    // that arrives mid-turn stays a context row. Splices remove the prior claim,
+    // so the removed ids are remembered as claimed for the later logged message.
+    let mut inbox: std::collections::HashMap<&'static str, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut claimed_inputs: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for event in events {
         if let Some(seq) = event.get("seq").and_then(Value::as_u64) {
@@ -147,6 +154,35 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
         };
         let at_ms = event.get("time").and_then(Value::as_f64);
         let data = event.get("data").cloned().unwrap_or(Value::Null);
+        if kind == "agent/inbox/spliced" {
+            let target = match data.get("target").and_then(Value::as_str) {
+                Some("next-step") => "next-step",
+                _ => "next-turn",
+            };
+            let queue = inbox.entry(target).or_default();
+            let start = data.get("start").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let removed = data
+                .get("removedCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            for index in start..start.saturating_add(removed).min(queue.len()) {
+                if let Some(id) = queue.get(index) {
+                    claimed_inputs.insert(id.clone());
+                }
+            }
+            if start <= queue.len() {
+                let end = start.saturating_add(removed).min(queue.len());
+                queue.drain(start..end);
+            }
+            if let Some(inserted) = data.get("inserted").and_then(Value::as_array) {
+                for message in inserted {
+                    if let Some(id) = message.get("id").and_then(Value::as_str) {
+                        queue.insert(start.min(queue.len()), id.to_owned());
+                    }
+                }
+            }
+            continue;
+        }
         if matches!(kind, "tool/ptc-dispatch" | "tool/ptc-dispatch-start") {
             crate::tool_calls::apply_dispatch(&mut out.entries, event);
         }
@@ -263,7 +299,11 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                     .map(|blocks| content_texts(blocks))
                     .unwrap_or_default();
                 if source != "user" && source != "user-question-reply" {
-                    if user_visible_source(source).is_some() {
+                    let waking = data
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| claimed_inputs.contains(id));
+                    if user_visible_source(source).is_some() && waking {
                         // Fall through to the trigger row below.
                     } else {
                         let id = data.get("id").and_then(Value::as_str).map(str::to_string);
@@ -276,15 +316,16 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                             }
                         };
                         if !body.trim().is_empty() {
+                            let payload = data.to_string();
                             out.entries.push(ChatEntry {
                                 key: id.clone().unwrap_or_else(|| {
                                     format!("hist-context-{}", out.entries.len())
                                 }),
                                 external_id: id,
                                 role: EntryRole::Context,
-                                title: crate::state::context_source_label(source).to_owned(),
+                                title: crate::state::context_header(&payload).label,
                                 text: body,
-                                input: String::new(),
+                                input: payload,
                                 status: if data.pointer("/source/update")
                                     == Some(&Value::Bool(true))
                                 {
@@ -1169,22 +1210,102 @@ mod tests {
     }
 
     #[test]
+    fn a_mid_turn_notice_is_a_context_row_and_a_claimed_goal_is_a_trigger() {
+        let events = vec![
+            json!({"type": "turn/start", "seq": 1, "data": {"turn": 3}}),
+            json!({"type": "step/start", "seq": 2, "data": {"turn": 3, "step": 2}}),
+            json!({
+                "type": "user/message", "seq": 3, "time": 20,
+                "data": {
+                    "id": "notice-1",
+                    "source": {"kind": "tool-jobs", "form": "notice", "summary": "后台任务已完成：bun test"},
+                    "content": [{"type": "text", "text": "<job_settled>后台任务已完成</job_settled>"}],
+                }
+            }),
+            json!({"type": "tool/result", "seq": 4, "surfaceOp": "append", "data": {
+                "turn": 3, "callId": "call-1",
+                "message": {"role": "tool", "toolCallId": "call-1",
+                    "source": {"kind": "tool", "callId": "call-1"},
+                    "content": [{"type": "text", "text": "ok"}]}
+            }}),
+            json!({"type": "turn/end", "seq": 5, "data": {"turn": 3, "reason": {"kind": "completed"}}}),
+            // A resumed goal round is claimed through the inbox before it is logged.
+            json!({
+                "type": "agent/inbox/spliced", "seq": 6,
+                "data": {"target": "next-turn", "start": 0,
+                    "inserted": [{"id": "goal-2", "role": "user", "source": {"kind": "goal"}}]}
+            }),
+            json!({"type": "turn/start", "seq": 7, "data": {"turn": 4}}),
+            json!({
+                "type": "agent/inbox/spliced", "seq": 8,
+                "data": {"target": "next-turn", "start": 0, "removedCount": 1, "inserted": []}
+            }),
+            json!({
+                "type": "user/message", "seq": 9, "time": 30,
+                "data": {
+                    "id": "goal-2",
+                    "source": {"kind": "goal"},
+                    "content": [{"type": "text", "text": "<goal_round>Objective: 继续</goal_round>"}],
+                }
+            }),
+        ];
+        let projected = project_session_events(&events);
+        let context = projected
+            .entries
+            .iter()
+            .find(|entry| entry.external_id.as_deref() == Some("notice-1"))
+            .expect("mid-turn notice row");
+        assert_eq!(context.role, EntryRole::Context);
+        assert_eq!(context.title, "tool-jobs");
+        // The payload keeps the summary the collapsed row shows.
+        assert_eq!(
+            crate::state::context_header(&context.input)
+                .summary
+                .as_deref(),
+            Some("后台任务已完成：bun test")
+        );
+        assert!(matches!(
+            crate::state::context_body_view(&context.input, &context.text),
+            crate::state::ContextBodyView::Notice { text } if text.contains("job_settled")
+        ));
+        // Only the claimed message becomes a trigger row.
+        let trigger = projected
+            .entries
+            .iter()
+            .find(|entry| entry.role == EntryRole::User)
+            .expect("claimed goal trigger");
+        assert_eq!(trigger.title, "goal");
+    }
+
+    #[test]
     fn a_replayed_subagent_notice_keeps_its_outcome() {
         // Payload copied from a real parent log: the durable source records the
         // child's stop reason, which selects the trigger card's title.
-        let events = vec![json!({
-            "type": "user/message", "seq": 20, "time": 30,
-            "data": {
-                "id": "settled-1",
-                "source": {
-                    "kind": "subagent-settled", "form": "notice",
-                    "summary": "Background subagent agent-1 finished.",
-                    "stopReason": "completed",
-                    "senderSessionId": "73652a28-dab6-4fd7-8aa5-a6a6d99132a8",
-                },
-                "content": [{"type": "text", "text": "Background subagent agent-1 finished."}],
-            }
-        })];
+        let events = vec![
+            json!({
+                "type": "agent/inbox/spliced", "seq": 17,
+                "data": {"target": "next-turn", "start": 0,
+                    "inserted": [{"id": "settled-1", "role": "user", "source": {"kind": "subagent-settled"}}]}
+            }),
+            json!({"type": "turn/start", "seq": 18, "data": {"turn": 1}}),
+            json!({
+                "type": "agent/inbox/spliced", "seq": 19,
+                "data": {"target": "next-turn", "start": 0, "removedCount": 1, "inserted": []}
+            }),
+            json!({
+                "type": "user/message", "seq": 20, "time": 30,
+                "data": {
+                    "id": "settled-1",
+                    "source": {
+                        "kind": "subagent-settled", "form": "notice",
+                        "summary": "Background subagent agent-1 finished.",
+                        "stopReason": "completed",
+                        "senderSessionId": "73652a28-dab6-4fd7-8aa5-a6a6d99132a8",
+                    },
+                    "content": [{"type": "text", "text": "Background subagent agent-1 finished."}],
+                }
+            }),
+        ];
         let projected = project_session_events(&events);
         assert_eq!(projected.entries.len(), 1);
         let entry = &projected.entries[0];
@@ -1454,8 +1575,20 @@ mod tests {
                     "content": [{"type": "text", "text": "runtime facts"}]
                 }
             }),
+            // A goal round is claimed through the durable inbox before it is
+            // logged as a message; that claim is what makes it a trigger.
             json!({
-                "type": "user/message", "seq": 6, "time": 12,
+                "type": "agent/inbox/spliced", "seq": 7,
+                "data": {"target": "next-turn", "start": 0,
+                    "inserted": [{"id": "goal-round", "role": "user", "source": {"kind": "goal"}}]}
+            }),
+            json!({"type": "turn/start", "seq": 8, "data": {"turn": 1}}),
+            json!({
+                "type": "agent/inbox/spliced", "seq": 9,
+                "data": {"target": "next-turn", "start": 0, "removedCount": 1, "inserted": []}
+            }),
+            json!({
+                "type": "user/message", "seq": 10, "time": 12,
                 "data": {
                     "id": "goal-round",
                     "source": {"kind": "goal"},
@@ -1470,9 +1603,9 @@ mod tests {
             .filter(|entry| entry.role == EntryRole::Context)
             .collect();
         assert_eq!(contexts.len(), 2);
-        assert_eq!(contexts[0].title, "时间上下文");
+        assert_eq!(contexts[0].title, "time-context");
         assert!(contexts[0].text.contains("Time sampled"));
-        assert_eq!(contexts[1].title, "运行时上下文");
+        assert_eq!(contexts[1].title, "runtime-context");
         // A goal round still wakes the turn and stays a trigger row.
         let trigger = projected
             .entries
