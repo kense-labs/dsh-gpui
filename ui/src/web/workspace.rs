@@ -6214,6 +6214,7 @@ fn render_entry(
         EntryRole::Context => render_context_injection(entry, expanded, cx),
         EntryRole::ToolChange => render_tool_change(entry, expanded, cx),
         EntryRole::Compaction => render_compaction(entry, expanded, cx),
+        EntryRole::Deliverable => render_deliverables(entry, expanded, cx),
         EntryRole::SystemPrompt => render_system_prompt(entry, expanded, cx),
         EntryRole::Job => render_job_row(entry, expanded, cx),
         EntryRole::System if entry.title == "turn-end" => row().w_full().justify_start().child(
@@ -6515,6 +6516,185 @@ fn render_compaction(entry: &ChatEntry, expanded: bool, cx: &mut Context<DshApp>
         );
     }
     card
+}
+
+/// 官方 DeliverablesTail：本轮交付文件的卡片区。
+///
+/// 单个文件铺满一行，多个文件两列网格；超过四个时折叠为「全部 N 个文件」。
+/// 点击卡片在右侧文档面板打开该文件（官方是侧边栏预览）。
+fn render_deliverables(entry: &ChatEntry, expanded: bool, cx: &mut Context<DshApp>) -> gpui::Div {
+    let files: Vec<Value> = serde_json::from_str(&entry.input).unwrap_or_default();
+    if files.is_empty() {
+        return column();
+    }
+    let p = dsh(cx);
+    const COLLAPSED: usize = 4;
+    let collapsible = files.len() > COLLAPSED;
+    let open = expanded && collapsible;
+    let shown: Vec<Value> = if collapsible && !open {
+        files.iter().take(COLLAPSED).cloned().collect()
+    } else {
+        files.clone()
+    };
+    let toggle_key = entry.key.clone();
+    let single = shown.len() == 1;
+    let mut cards = column().w_full().gap(px(10.));
+    let mut index = 0;
+    while index < shown.len() {
+        let mut line = row().w_full().gap(px(10.)).items_stretch();
+        let end = (index + 2).min(shown.len());
+        for file in &shown[index..end] {
+            line = line.child(render_deliverable_card(file, single, cx));
+        }
+        if end - index == 1 && !single {
+            // Keep the last odd card at half width like the official grid.
+            line = line.child(div().flex_1());
+        }
+        cards = cards.child(line);
+        index = end;
+    }
+    if collapsible {
+        let toggle = row()
+            .id(gpui::ElementId::Name(
+                format!("deliverables-toggle-{toggle_key}").into(),
+            ))
+            .role(gpui::Role::Button)
+            .aria_label(if open {
+                "收起交付文件列表"
+            } else {
+                "展开全部交付文件"
+            })
+            .aria_expanded(open)
+            .tab_index(0)
+            .cursor_pointer()
+            .gap(px(4.))
+            .items_center()
+            .text_size(px(12.))
+            .line_height(px(18.))
+            .text_color(p.faint)
+            .hover(|style| style.text_color(p.secondary))
+            .child(if open {
+                format!("收起")
+            } else {
+                format!("全部 {} 个文件", files.len())
+            })
+            .child(icon(
+                if open { Glyph::Up } else { Glyph::Down },
+                12.,
+                p.faint,
+            ))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                toggle_entry(&mut this.conversation.expanded_entries, &toggle_key);
+                cx.notify();
+            }));
+        cards = cards.child(row().w_full().justify_center().child(toggle));
+    }
+    column().w_full().mt(px(12.)).child(cards)
+}
+
+/// One delivery card: file box + name + description (or upper-cased extension).
+fn render_deliverable_card(
+    file: &Value,
+    single: bool,
+    cx: &mut Context<DshApp>,
+) -> gpui::AnyElement {
+    let p = dsh(cx);
+    let path = file
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let description = file
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let name = path
+        .rsplit(['/', '\\'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(&path)
+        .to_owned();
+    let fallback = name
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_uppercase())
+        .filter(|ext| !ext.is_empty())
+        .unwrap_or_else(|| "文件".to_owned());
+    let detail = if description.is_empty() {
+        fallback
+    } else {
+        description
+    };
+    let open_path = path.clone();
+    div()
+        .id(gpui::ElementId::Name(
+            format!("deliverable-card-{path}").into(),
+        ))
+        .role(gpui::Role::Button)
+        .aria_label(if single {
+            format!("在侧边栏打开 {path}")
+        } else {
+            format!("在侧边栏预览 {path}")
+        })
+        .tab_index(0)
+        .cursor_pointer()
+        .when(single, |card| card.w_full())
+        .when(!single, |card| card.flex_1().min_w_0())
+        .h(px(60.))
+        .flex()
+        .items_center()
+        .gap(px(10.))
+        .px(px(10.))
+        .py(px(8.))
+        .rounded(px(12.))
+        .border(px(0.5))
+        .border_color(p.border_l1)
+        .bg(p.stage)
+        .hover(|style| style.bg(p.hover))
+        .child(
+            div()
+                .flex_none()
+                .size(px(40.))
+                .rounded(px(10.))
+                .border(px(0.5))
+                .border_color(p.border_l1)
+                .bg(p.selector)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(icon(Glyph::FileText, 20., p.link)),
+        )
+        .child(
+            column()
+                .flex_1()
+                .min_w_0()
+                .gap(px(2.))
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(13.))
+                        .line_height(px(20.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(p.ink)
+                        .child(name),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(10.))
+                        .line_height(px(16.))
+                        .text_color(p.faint)
+                        .child(detail),
+                ),
+        )
+        .on_click(cx.listener(move |this, _, w, cx| {
+            if !this.right_panel_visible() {
+                this.toggle_right_panel(w, cx);
+            }
+            let pane = this.sidebar.surface.layout.focused();
+            this.open_workspace_document(pane, open_path.clone(), w, cx);
+        }))
+        .into_any_element()
 }
 
 fn render_tool_change(entry: &ChatEntry, expanded: bool, cx: &mut Context<DshApp>) -> gpui::Div {

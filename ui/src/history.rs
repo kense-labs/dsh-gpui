@@ -82,6 +82,11 @@ fn tool_title(name: &str, arguments: &str) -> String {
     {
         return crate::process::todo_summary_text(&summary);
     }
+    // Official PresentRow: the delivery call is titled 交付文件, never the raw
+    // tool name, so the process tree reads like the official one.
+    if name == "present" {
+        return "交付文件".to_owned();
+    }
     if let Ok(value) = serde_json::from_str::<Value>(arguments) {
         if let Some(description) = value.get("description").and_then(Value::as_str) {
             if !description.is_empty() {
@@ -119,6 +124,9 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
     };
     let mut tool_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut seen_turns: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // Files announced through `present` during the open turn; they become the
+    // official turn-tail delivery cards when that turn closes.
+    let mut pending_deliverables: Vec<Value> = Vec::new();
     // Compaction summaries arrive just before the checkpoint message that
     // replaces the shadowed history; keep them keyed so the marker can cite the
     // official counts without rendering an extra row.
@@ -149,6 +157,14 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
             out.entries.push(reply);
         }
         match kind {
+            // Files a closing turn delivered through `present`. The official
+            // DeliverablesTail renders them as file cards at the turn tail, so the
+            // durable projection keeps the validated list instead of dropping it.
+            "deliverables/presented" => {
+                if let Some(files) = data.get("files").and_then(Value::as_array) {
+                    pending_deliverables.extend(files.iter().cloned());
+                }
+            }
             // A compaction summary is evidence for the marker, not a row of its
             // own: the official client folds it into the checkpoint marker.
             "compaction/summary" => {
@@ -722,6 +738,11 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                 }
             }
             "turn/end" => {
+                if !pending_deliverables.is_empty() {
+                    let files = std::mem::take(&mut pending_deliverables);
+                    out.entries
+                        .push(crate::state::deliverable_entry(&files, at_ms));
+                }
                 let reason = data
                     .pointer("/reason/kind")
                     .or_else(|| data.pointer("/reason/reason/kind"))
@@ -806,6 +827,11 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
         }
     }
 
+    if !pending_deliverables.is_empty() {
+        let files = std::mem::take(&mut pending_deliverables);
+        out.entries
+            .push(crate::state::deliverable_entry(&files, None));
+    }
     out.turns = if seen_turns.is_empty() {
         out.entries
             .iter()
@@ -877,6 +903,40 @@ mod tests {
         assert_eq!(projected.entries[0].title, "系统提示词");
         assert!(projected.entries[0].text.contains("DeepSeek Harness"));
         assert_eq!(projected.entries[0].key, "system-prompt-8");
+    }
+
+    #[test]
+    fn presented_files_replay_as_the_official_delivery_cards() {
+        let events = vec![
+            json!({
+                "type": "deliverables/presented", "seq": 1857, "time": 1_794_476_022_609u64,
+                "data": {
+                    "turn": 3, "callId": "call_00_present",
+                    "files": [
+                        {"description": "商品页设计规格", "path": "docs/popmart-pdp-design-spec.md"},
+                        {"path": "src/core/product-detail.ts", "description": "商品页视图模型"},
+                        {"path": ""},
+                    ],
+                },
+            }),
+            // Delivery cards belong to the closing turn tail, so the row is
+            // stamped when the turn ends rather than at the tool result.
+            json!({
+                "type": "turn/end", "seq": 1864, "time": 1_794_476_091_002u64,
+                "data": {"turn": 3, "reason": {"kind": "completed"}},
+            }),
+        ];
+        let projected = project_session_events(&events);
+        assert_eq!(projected.entries.len(), 1);
+        let row = &projected.entries[0];
+        assert_eq!(row.role, EntryRole::Deliverable);
+        assert_eq!(row.title, "交付文件");
+        let files: Vec<serde_json::Value> = serde_json::from_str(&row.input).unwrap();
+        assert_eq!(files.len(), 2, "blank paths are dropped");
+        assert_eq!(files[0]["path"], "docs/popmart-pdp-design-spec.md");
+        assert_eq!(files[0]["description"], "商品页设计规格");
+        assert_eq!(files[1]["path"], "src/core/product-detail.ts");
+        assert_eq!(row.at_ms, Some(1_794_476_091_002f64));
     }
 
     #[test]
@@ -1109,6 +1169,11 @@ mod tests {
         );
         // Unusable args fall back to the tool name, as before.
         assert_eq!(tool_title("todo_write", "{\"todos\": ["), "todo_write");
+        // Official PresentRow titles the delivery call 交付文件, not `present`.
+        assert_eq!(
+            tool_title("present", "{\"files\": [{\"path\": \"README.md\"}]}"),
+            "交付文件"
+        );
     }
 
     #[test]

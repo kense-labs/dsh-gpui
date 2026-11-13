@@ -71,6 +71,8 @@ pub enum EntryRole {
     ToolChange,
     /// 官方 CompactionItem：模型历史被压缩后的标记行。
     Compaction,
+    /// 官方 DeliverablesTail：本轮 `present` 交付的文件卡片。
+    Deliverable,
 }
 
 /// One message, thought, tool invocation, or local status row.
@@ -429,6 +431,9 @@ pub fn apply_update(entries: &mut Vec<ChatEntry>, update: &Value) -> UpdateEffec
         // 起来供紧随其后的 checkpoint 使用；两者都以 compactionId 去重。
         Some("gpui_compaction_summary") => apply_compaction_summary(update),
         Some("gpui_compaction") => apply_compaction_entry(entries, update),
+        // Host/ACP 扩展：`deliverables/presented`（官方 DeliverablesTail）。
+        // 交付卡片属于轮次尾部，由 web 层暂存到回合结束再落行。
+        Some("gpui_deliverables") => {}
         // Host/ACP 扩展：系统提示词折叠行（官方 SystemPromptRow）。系统提示词
         // 是模型可见的完整文本，只作为可展开的一行出现，不参与任何状态判断。
         Some("gpui_system_prompt") => {
@@ -888,6 +893,7 @@ fn role_name(role: EntryRole) -> &'static str {
         EntryRole::Warning => "warning",
         EntryRole::ToolChange => "tool-change",
         EntryRole::Compaction => "compaction",
+        EntryRole::Deliverable => "deliverable",
     }
 }
 
@@ -1124,6 +1130,36 @@ pub fn compaction_entry(
         text: summary.unwrap_or_default().to_owned(),
         input: String::new(),
         status,
+        tool: None,
+        at_ms,
+    }
+}
+
+/// Official `DeliverablesTail`: the files a closing turn announced through
+/// `deliverables/presented`. Cards are self-contained (path + optional
+/// description), so the row keeps the validated file list as JSON in `input`.
+pub fn deliverable_entry(files: &[Value], at_ms: Option<f64>) -> ChatEntry {
+    let files: Vec<Value> = files
+        .iter()
+        .filter_map(|file| {
+            let path = file.get("path").and_then(Value::as_str)?.trim();
+            if path.is_empty() {
+                return None;
+            }
+            Some(serde_json::json!({
+                "path": path,
+                "description": file.get("description").and_then(Value::as_str).unwrap_or_default(),
+            }))
+        })
+        .collect();
+    ChatEntry {
+        key: format!("deliverable-{}", files.len()),
+        external_id: None,
+        role: EntryRole::Deliverable,
+        title: "交付文件".to_owned(),
+        text: String::new(),
+        input: Value::Array(files).to_string(),
+        status: String::new(),
         tool: None,
         at_ms,
     }

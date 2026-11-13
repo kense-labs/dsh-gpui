@@ -3176,6 +3176,19 @@ impl DshApp {
             self.handle_goal_changed(session, update, cx);
             return;
         }
+        if update["sessionUpdate"] == "gpui_deliverables" {
+            if let Some(conversation) = self.conversation_mut(session) {
+                let files = update
+                    .get("files")
+                    .and_then(|files| files.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                if !files.is_empty() {
+                    conversation.pending_deliverables.extend(files);
+                }
+            }
+            return;
+        }
         if update["sessionUpdate"] == "gpui_subagent_catalog" {
             if let (Some(conversation), Some(row)) = (
                 self.conversation_mut(session),

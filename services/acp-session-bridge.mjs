@@ -1966,6 +1966,20 @@ function observeSessionUpdates(ctx) {
       });
       return;
     }
+    // Files delivered by `present` are announced as a durable event; the official
+    // DeliverablesTail turns the validated list into file cards at the turn tail.
+    if (type === 'deliverables/presented') {
+      const files = Array.isArray(data.files) ? data.files : []
+      if (files.length > 0) {
+        notify(session.id, {
+          sessionUpdate: 'gpui_deliverables',
+          callId: data.callId,
+          files,
+          time: event.time,
+        })
+      }
+      return
+    }
     // A compaction summary is evidence for the marker, not a row of its own.
     if (type === 'compaction/summary') {
       const compactionId = data.compactionId

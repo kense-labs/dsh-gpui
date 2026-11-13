@@ -77,6 +77,9 @@ pub(super) struct Conversation {
     pub(super) history_prepend_pending: bool,
     pub(super) history_oldest_seq: Option<u64>,
     pub(super) draft_attachments: Vec<DraftAttachment>,
+    /// Delivery files announced during the running turn; they become the
+    /// official turn-tail cards when the turn settles.
+    pub(super) pending_deliverables: Vec<serde_json::Value>,
 }
 
 impl Conversation {
@@ -85,6 +88,19 @@ impl Conversation {
             follow_tail: true,
             ..Self::default()
         }
+    }
+
+    /// Official DeliverablesTail: delivery cards belong to the closing turn tail,
+    /// not to the tool result's position, so they are held until the turn settles.
+    pub(super) fn flush_pending_deliverables(&mut self) {
+        if self.pending_deliverables.is_empty() {
+            return;
+        }
+        let files = std::mem::take(&mut self.pending_deliverables);
+        self.entries.push(crate::state::deliverable_entry(
+            &files,
+            Some(bridge::now_ms()),
+        ));
     }
 
     pub(super) fn begin_turn(&mut self) {
@@ -117,6 +133,7 @@ impl Conversation {
         self.turn_summary = Some(TurnSummary { end, seconds, used });
         self.running = false;
         self.assistant_stream.clear();
+        self.flush_pending_deliverables();
         self.permission = None;
     }
 
