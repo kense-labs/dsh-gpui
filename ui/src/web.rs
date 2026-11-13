@@ -548,7 +548,9 @@ impl TurnEnd {
             TurnEnd::Completed => "已完成",
             TurnEnd::Stopped => "已停止",
             TurnEnd::Failed => "处理失败",
-            TurnEnd::MaxTokens => "已达到输出 token 上限",
+            // Official shows the normal completed label; the warning row above
+            // carries the output-token-cap message.
+            TurnEnd::MaxTokens => "已完成",
         }
     }
 }
@@ -2648,11 +2650,9 @@ impl DshApp {
         let previous = conversation.running;
         conversation.finish_turn(end);
         if end == TurnEnd::MaxTokens {
-            conversation.push_local(
-                EntryRole::System,
-                "已达到输出 token 上限：回答被截断，已有输出保留在对话中。发送「继续」可让模型接着输出。"
-                    .into(),
-            );
+            if let Some(turn) = conversation.last_turn_number() {
+                conversation.push_turn_notice(crate::state::turn_max_tokens_entry(turn, None));
+            }
         }
         // Pending messages belong to the Host Inbox now: it opens the next turn
         // on its own, so the client must not flush anything here. A failed

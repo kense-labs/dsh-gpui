@@ -645,15 +645,18 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                     .unwrap_or("completed");
                 // A recorded failure becomes the official TurnErrorItem row; the
                 // other endings keep the compact turn-end chip.
-                if let Some(turn) = data.get("turn").and_then(Value::as_u64)
-                    && let Some(entry) =
+                if let Some(turn) = data.get("turn").and_then(Value::as_u64) {
+                    if let Some(entry) =
                         crate::state::turn_failure_entry(turn, &data["reason"], at_ms)
-                {
-                    out.entries.push(entry);
+                    {
+                        out.entries.push(entry);
+                    } else if reason == "max_tokens" {
+                        out.entries
+                            .push(crate::state::turn_max_tokens_entry(turn, at_ms));
+                    }
                 }
                 let text = match reason {
                     "aborted" | "interrupted" | "cancelled" | "user" => "已停止",
-                    "max_tokens" => "输出达到 token 上限",
                     "error" => "",
                     _ => "",
                 };
@@ -771,7 +774,6 @@ mod tests {
 
     #[test]
     #[test]
-    #[test]
     fn a_replayed_system_prompt_is_one_collapsed_row() {
         // Payload shape copied from a real ACP session log: the complete
         // model-visible prompt is recorded once at the turn's first step and the
@@ -791,6 +793,34 @@ mod tests {
         assert_eq!(projected.entries[0].title, "系统提示词");
         assert!(projected.entries[0].text.contains("DeepSeek Harness"));
         assert_eq!(projected.entries[0].key, "system-prompt-8");
+    }
+
+    #[test]
+    fn a_capped_turn_replays_the_official_max_tokens_notice() {
+        // Official TurnMaxTokensItem: warning row with the cap title and the
+        // "send continue" hint, not the compact stopped-style chip.
+        let events = vec![json!({
+            "type": "turn/end", "seq": 9, "time": 1_700_000_000_000u64,
+            "data": {"turn": 7, "reason": {"kind": "max_tokens"}}
+        })];
+        let projected = project_session_events(&events);
+        let notice = projected
+            .entries
+            .iter()
+            .find(|entry| entry.role == EntryRole::Warning)
+            .expect("a capped turn keeps a warning row");
+        assert_eq!(notice.title, "已达到输出 token 上限");
+        assert!(notice.text.contains("回答被截断"));
+        assert!(notice.text.contains("继续"));
+        assert_eq!(notice.at_ms, Some(1_700_000_000_000f64));
+        // The old compact chip would have said 输出达到 token 上限; the notice
+        // replaces it rather than doubling up.
+        assert!(
+            projected
+                .entries
+                .iter()
+                .all(|entry| entry.role != EntryRole::System)
+        );
     }
 
     #[test]

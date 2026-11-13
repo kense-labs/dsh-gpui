@@ -65,6 +65,8 @@ pub enum EntryRole {
     SystemPrompt,
     System,
     Error,
+    /// 官方 TurnMaxTokensItem：本轮撞到输出 token 上限的警告行。
+    Warning,
 }
 
 /// One message, thought, tool invocation, or local status row.
@@ -790,6 +792,7 @@ fn role_name(role: EntryRole) -> &'static str {
         EntryRole::SystemPrompt => "system-prompt",
         EntryRole::System => "system",
         EntryRole::Error => "error",
+        EntryRole::Warning => "warning",
     }
 }
 
@@ -902,6 +905,23 @@ pub fn turn_failure_entry(turn: u64, reason: &Value, at_ms: Option<f64>) -> Opti
         tool: None,
         at_ms,
     })
+}
+
+/// Official `TurnMaxTokensItem`: a persistent warning row where a turn hit the
+/// output-token cap instead of failing. The transcript keeps the truncated
+/// reply; the row tells the reader to send "continue".
+pub fn turn_max_tokens_entry(turn: u64, at_ms: Option<f64>) -> ChatEntry {
+    ChatEntry {
+        key: format!("turn-max-tokens-{turn}"),
+        external_id: Some(turn.to_string()),
+        role: EntryRole::Warning,
+        title: "已达到输出 token 上限".into(),
+        text: "回答被截断，已有输出保留在对话中。发送“继续”可让模型接着输出。".into(),
+        input: String::new(),
+        status: String::new(),
+        tool: None,
+        at_ms,
+    }
 }
 
 /// Localized title of one turn-trigger row (official `turnTriggerDetails`).

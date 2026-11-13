@@ -128,6 +128,27 @@ impl Conversation {
         self.entries.push(entry);
     }
 
+    /// Append a locally built notice row (kept at transcript position like the
+    /// official turn-positioned items) with a fresh local key.
+    pub(super) fn push_turn_notice(&mut self, mut entry: ChatEntry) {
+        entry.key = format!("local-{}", self.next_local_id);
+        self.next_local_id += 1;
+        entry.at_ms = Some(bridge::now_ms());
+        self.entries.push(entry);
+    }
+
+    /// Turn number of the most recent turn already on screen: one turn per
+    /// user-role row, the same rule the turn rail and history replay use.
+    pub(super) fn last_turn_number(&self) -> Option<u64> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.role == EntryRole::User)
+            .count()
+            .try_into()
+            .ok()
+            .filter(|count| *count > 0)
+    }
+
     /// 记下一行刚刚被 Host 接受的待投递消息。
     pub(super) fn push_inbox_row(
         &mut self,
