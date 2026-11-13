@@ -88,6 +88,12 @@ pub(super) struct Conversation {
     /// This session has exposed an incomplete history window at least once, so
     /// the edge keeps showing 已到会话开头 after the last page arrives.
     pub(super) history_was_partial: bool,
+    /// Top-level transcript rows drawn from the end of the conversation.
+    ///
+    /// The transcript has no virtualization; a few thousand rows would rebuild
+    /// the whole element tree on every animation frame. The newest rows render
+    /// first and 更早的记录 unfolds further rows on demand.
+    pub(super) render_window: usize,
     pub(super) draft_attachments: Vec<DraftAttachment>,
     /// Delivery files announced during the running turn; they become the
     /// official turn-tail cards when the turn settles.

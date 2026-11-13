@@ -3073,6 +3073,37 @@ impl DshApp {
         }
     }
 
+    /// One transcript render window step (rows added per unfold).
+    pub(crate) const TRANSCRIPT_WINDOW_STEP: usize = 300;
+
+    /// Top-level rows currently outside the render window.
+    pub(crate) fn transcript_hidden_rows(&self) -> usize {
+        let total = self
+            .conversation
+            .entries
+            .iter()
+            .chain(self.conversation.assistant_stream.entries())
+            .filter(|entry| !entry.is_subcall())
+            .count();
+        let requested = if self.conversation.render_window == 0 {
+            Self::TRANSCRIPT_WINDOW_STEP
+        } else {
+            self.conversation.render_window
+        };
+        total.saturating_sub(requested)
+    }
+
+    /// Unfold the next older render window (top scroll edge / row click).
+    pub(crate) fn expand_transcript_window(&mut self, cx: &mut Context<Self>) {
+        let current = if self.conversation.render_window == 0 {
+            Self::TRANSCRIPT_WINDOW_STEP
+        } else {
+            self.conversation.render_window
+        };
+        self.conversation.render_window = current + Self::TRANSCRIPT_WINDOW_STEP;
+        cx.notify();
+    }
+
     /// 用户发送或点「回到底部」时恢复尾部跟随。
     pub(crate) fn pin_follow_tail(&mut self) {
         self.conversation.follow_tail = true;

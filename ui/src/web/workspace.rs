@@ -2100,11 +2100,41 @@ impl DshApp {
         // Official chat history edge: 加载更早 / 正在加载 / 载入历史… / 重新加载 /
         // 已到会话开头. It stays while this session exposed an incomplete window.
         let history = &self.conversation;
-        let history_edge = history.history_edge().filter(|_| {
-            !history.entries.is_empty()
-                || history.history_loading
-                || history.history_error.is_some()
-        });
+        // Rows outside the render window come first: the transcript rebuilds its
+        // whole tree every frame, so older loaded rows unfold on demand.
+        let hidden_rows = self.transcript_hidden_rows();
+        if hidden_rows > 0 {
+            let label = format!("更早的记录 · 显示更多（还有 {hidden_rows} 条）");
+            content = content.child(
+                row().w_full().mb(px(8.)).justify_center().child(
+                    div()
+                        .id("transcript-unfold")
+                        .role(gpui::Role::Button)
+                        .aria_label(label.clone())
+                        .tab_index(0)
+                        .cursor_pointer()
+                        .px(px(12.))
+                        .py(px(4.))
+                        .rounded(px(8.))
+                        .bg(p.hover)
+                        .text_size(px(12.))
+                        .text_color(p.secondary)
+                        .hover(|style| style.text_color(p.ink))
+                        .child(label)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.expand_transcript_window(cx);
+                        })),
+                ),
+            );
+        }
+        let history_edge = (hidden_rows == 0)
+            .then(|| history.history_edge())
+            .flatten()
+            .filter(|_| {
+                !history.entries.is_empty()
+                    || history.history_loading
+                    || history.history_error.is_some()
+            });
         if let Some(edge) = history_edge {
             let label = edge.label();
             let actionable = edge.actionable();
@@ -2137,13 +2167,21 @@ impl DshApp {
             content = content.child(row().w_full().mb(px(8.)).justify_center().child(edge));
         }
         let tree = crate::tool_calls::ToolTree::new(&self.conversation.entries);
-        let entries: Vec<_> = self
+        let mut entries: Vec<_> = self
             .conversation
             .entries
             .iter()
             .chain(self.conversation.assistant_stream.entries())
             .filter(|entry| !entry.is_subcall())
             .collect();
+        let requested_window = if self.conversation.render_window == 0 {
+            DshApp::TRANSCRIPT_WINDOW_STEP
+        } else {
+            self.conversation.render_window
+        };
+        if entries.len() > requested_window {
+            entries.drain(..entries.len() - requested_window);
+        }
         let layout = self.conversation.turn_process.layout(
             &entries,
             &self.conversation.turn_disclosures,
@@ -2743,12 +2781,15 @@ impl DshApp {
                         // Official auto-load intent: reaching the top edge asks
                         // for the previous page without a click.
                         let scroll_top = -this.conversation.scroll.offset().y.as_f32();
-                        if scroll_top <= 24.
-                            && this.conversation.history_has_more
-                            && !this.conversation.history_loading
-                            && this.conversation.history_error.is_none()
-                        {
-                            this.request_older_history(cx);
+                        if scroll_top <= 24. {
+                            if this.transcript_hidden_rows() > 0 {
+                                this.expand_transcript_window(cx);
+                            } else if this.conversation.history_has_more
+                                && !this.conversation.history_loading
+                                && this.conversation.history_error.is_none()
+                            {
+                                this.request_older_history(cx);
+                            }
                         }
                         cx.notify();
                     },
