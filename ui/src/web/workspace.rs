@@ -3285,6 +3285,11 @@ impl DshApp {
                     .into_themed(cx),
             );
         }
+        // 官方 rc.3 ApprovalCommand：审批卡在标题下显示被审批调用的命令行。
+        let command = crate::approval_command::approval_command(
+            &permission.tool_call,
+            &self.conversation.entries,
+        );
         let width = self.composer_width(w);
         Some(
             column()
@@ -3331,6 +3336,19 @@ impl DshApp {
                                 .child(format!("工具 {title} 请求越权执行")),
                         ),
                 )
+                .when_some(command, |card, command| {
+                    card.child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .font_family("monospace")
+                            .text_size(px(13.))
+                            .line_height(px(20.))
+                            .whitespace_normal()
+                            .text_color(p.label_tertiary)
+                            .child(command),
+                    )
+                })
                 .child(actions),
         )
     }

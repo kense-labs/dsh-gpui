@@ -3,6 +3,8 @@
 #[cfg(any(target_family = "wasm", test))]
 pub mod anim;
 #[cfg(any(target_family = "wasm", test))]
+pub mod approval_command;
+#[cfg(any(target_family = "wasm", test))]
 mod assistant_stream;
 #[cfg(any(target_family = "wasm", test))]
 mod commands;
