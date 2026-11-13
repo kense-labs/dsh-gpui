@@ -103,6 +103,8 @@ impl DshApp {
                     let conversation = self.render_conversation(w, cx);
                     let mut overlay = div()
                         .relative()
+                        .flex()
+                        .flex_col()
                         .flex_1()
                         .min_h_0()
                         .w_full()

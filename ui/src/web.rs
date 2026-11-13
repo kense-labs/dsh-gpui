@@ -2788,6 +2788,59 @@ impl DshApp {
         self.maybe_follow_tail();
     }
 
+    /// Settle a freshly loaded transcript at its latest row.
+    ///
+    /// History is applied before the scroll container has measured the rows, so
+    /// the single `scroll_to_bottom()` in `apply_session_history` sees a
+    /// zero-height content box and does nothing; the reopened session then sat at
+    /// the oldest row. Pin the tail for the first few paints (the official client
+    /// restores its tail anchor after the first paint for the same reason) and
+    /// stop once two consecutive frames already sit at the bottom. Leaving the
+    /// tail, closing the session, or opening another one ends the wait.
+    fn settle_history_scroll(&mut self, session: &str, cx: &mut Context<Self>) {
+        if self.active_session.as_deref() != Some(session) || !self.conversation.follow_tail {
+            return;
+        }
+        let session = session.to_owned();
+        cx.spawn(async move |this, cx| {
+            let mut confirmations = 0;
+            for _ in 0..10 {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(16))
+                    .await;
+                let at_tail = this.update(cx, |app, cx| {
+                    if app.active_session.as_deref() != Some(session.as_str())
+                        || !app.conversation.follow_tail
+                    {
+                        return None;
+                    }
+                    let max = app.conversation.scroll.max_offset().y;
+                    if max <= px(0.) {
+                        // Rows not measured yet: keep waiting.
+                        return Some(false);
+                    }
+                    if app.conversation.scroll.offset().y + max <= px(1.) {
+                        return Some(true);
+                    }
+                    app.conversation.scroll.scroll_to_bottom();
+                    cx.notify();
+                    Some(false)
+                });
+                match at_tail.ok().flatten() {
+                    Some(true) => {
+                        confirmations += 1;
+                        if confirmations >= 2 {
+                            break;
+                        }
+                    }
+                    Some(false) => confirmations = 0,
+                    None => break,
+                }
+            }
+        })
+        .detach();
+    }
+
     /// 流式更新：仅在仍跟随尾部时滚到底。
     pub(crate) fn maybe_follow_tail(&mut self) {
         if self.conversation.follow_tail && !self.conversation.flow_motion.owns_tail() {
@@ -2905,7 +2958,12 @@ impl DshApp {
                 {
                     let prepend = std::mem::take(&mut conversation.history_prepend_pending);
                     match result {
-                        Ok(reply) => self.apply_session_history(session, &reply, prepend),
+                        Ok(reply) => {
+                            self.apply_session_history(session, &reply, prepend);
+                            if !prepend {
+                                self.settle_history_scroll(session, cx);
+                            }
+                        }
                         Err(error) => {
                             conversation.history_loading = false;
                             conversation.error = Some(format!("历史载入失败：{error}"));
