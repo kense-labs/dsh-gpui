@@ -73,6 +73,10 @@ const goalActionMethod = '_dsh/gpui/session/goal-action';
 // injected into model history (official ContextInjectionRow). Only the waking
 // producers get a trigger card; the rest are collapsed context rows, exactly
 // like the official projection distinguishes them.
+// Compaction summaries are logged just before the checkpoint message that
+// replaces the shadowed history; cache them so the live marker can cite the
+// official 已压缩 N 条历史记录 count like a reopened session does.
+const compactionSummaries = new Map()
 const TRIGGER_SOURCES = new Set([
   'goal', 'schedule', 'webhook', 'github', 'agent', 'agent-message', 'team',
   'team-message', 'subagent', 'subagent-settled', 'job', 'tool-jobs', 'tool-goal',
@@ -1884,6 +1888,21 @@ function observeSessionUpdates(ctx) {
         // prompt bubble. Sending these as triggers put a giant
         // "Time sampled while preparing…" bubble into every live step while a
         // reopened session dropped them.
+        if (source === 'compact-checkpoint' && typeof data.source?.compactionId === 'string') {
+          // The checkpoint text is hidden model context; the official transcript
+          // shows the compaction marker at this seq instead.
+          const compactionId = data.source.compactionId
+          const cached = compactionSummaries.get(compactionId) ?? {}
+          notify(session.id, {
+            sessionUpdate: 'gpui_compaction',
+            compactionId,
+            summary: cached.summary ?? '',
+            items: cached.items ?? null,
+            tokens: cached.tokens ?? null,
+            time: event.time,
+          })
+          return
+        }
         if (!TRIGGER_SOURCES.has(source)) {
           notify(session.id, {
             sessionUpdate: 'context_injection',
@@ -1946,6 +1965,25 @@ function observeSessionUpdates(ctx) {
         time: event.time,
       });
       return;
+    }
+    // A compaction summary is evidence for the marker, not a row of its own.
+    if (type === 'compaction/summary') {
+      const compactionId = data.compactionId
+      const text = contentBlocks(data.summary)
+      const items = Array.isArray(data.shadowedSeqs) ? data.shadowedSeqs.length : null
+      const tokens = Number.isSafeInteger(data.shadowedTokenCount) ? data.shadowedTokenCount : null
+      if (typeof compactionId === 'string' && compactionId !== '') {
+        compactionSummaries.set(compactionId, { summary: text, items, tokens })
+        notify(session.id, {
+          sessionUpdate: 'gpui_compaction_summary',
+          compactionId,
+          summary: text,
+          items,
+          tokens,
+          time: event.time,
+        })
+      }
+      return
     }
     // Tool-registry notices are `developer/message` events whose content is a
     // list of tool additions/removals. The official transcript renders them as

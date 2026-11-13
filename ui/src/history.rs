@@ -119,6 +119,13 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
     };
     let mut tool_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut seen_turns: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // Compaction summaries arrive just before the checkpoint message that
+    // replaces the shadowed history; keep them keyed so the marker can cite the
+    // official counts without rendering an extra row.
+    let mut compaction_summaries: std::collections::HashMap<
+        String,
+        (Option<String>, Option<usize>, Option<u64>),
+    > = std::collections::HashMap::new();
 
     for event in events {
         if let Some(seq) = event.get("seq").and_then(Value::as_u64) {
@@ -142,6 +149,23 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
             out.entries.push(reply);
         }
         match kind {
+            // A compaction summary is evidence for the marker, not a row of its
+            // own: the official client folds it into the checkpoint marker.
+            "compaction/summary" => {
+                if let Some(compaction_id) = data.get("compactionId").and_then(Value::as_str) {
+                    let text = data
+                        .get("summary")
+                        .and_then(Value::as_array)
+                        .map(|blocks| content_texts(blocks))
+                        .filter(|text| !text.trim().is_empty());
+                    let items = data
+                        .get("shadowedSeqs")
+                        .and_then(Value::as_array)
+                        .map(Vec::len);
+                    let tokens = data.get("shadowedTokenCount").and_then(Value::as_u64);
+                    compaction_summaries.insert(compaction_id.to_owned(), (text, items, tokens));
+                }
+            }
             // Tool-registry notices: a developer message whose content blocks add
             // or remove tools. The official transcript shows the
             // ContextInjectionRow tool variant, so a reopened session must too.
@@ -182,6 +206,27 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                 }
             }
             "user/message" => {
+                // The compaction checkpoint message is hidden model context; the
+                // official transcript replaces it with an expandable marker that
+                // cites the shadowed counts from compaction/summary.
+                if data.pointer("/source/kind").and_then(Value::as_str)
+                    == Some("compact-checkpoint")
+                    && let Some(compaction_id) =
+                        data.pointer("/source/compactionId").and_then(Value::as_str)
+                {
+                    let (summary, items, tokens) = compaction_summaries
+                        .get(compaction_id)
+                        .cloned()
+                        .unwrap_or((None, None, None));
+                    out.entries.push(crate::state::compaction_entry(
+                        compaction_id,
+                        summary.as_deref(),
+                        items,
+                        tokens,
+                        at_ms,
+                    ));
+                    continue;
+                }
                 if data.pointer("/source/kind").and_then(Value::as_str) == Some("user")
                     && let Some(time) = event["time"].as_u64()
                 {
@@ -832,6 +877,66 @@ mod tests {
         assert_eq!(projected.entries[0].title, "系统提示词");
         assert!(projected.entries[0].text.contains("DeepSeek Harness"));
         assert_eq!(projected.entries[0].key, "system-prompt-8");
+    }
+
+    #[test]
+    fn a_compaction_checkpoint_becomes_the_official_marker() {
+        // Shapes copied from a real log: the summary event carries the model
+        // summary blocks plus the shadowed counts, the checkpoint message is the
+        // replacement surface that must not render as a context row.
+        let events = vec![
+            json!({
+                "type": "compaction/start", "seq": 7673, "time": 1_794_566_867_387u64,
+                "data": {"compactionId": "aa96b315", "turn": 15},
+            }),
+            json!({
+                "type": "compaction/summary", "seq": 7675, "time": 1_794_566_897_388u64,
+                "data": {
+                    "compactionId": "aa96b315",
+                    "summary": [{"type": "text", "text": "## Primary Request\n- keep going"}],
+                    "shadowedSeqs": [148, 401, 500],
+                    "shadowedTokenCount": 12_491,
+                },
+            }),
+            json!({
+                "type": "user/message", "seq": 7676, "time": 1_794_566_897_389u64,
+                "surfaceOp": {"op": "replace", "startSeq": 8, "endSeq": 7654},
+                "data": {
+                    "content": [{"type": "text", "text": "This is an automatically generated checkpoint"}],
+                    "source": {"kind": "compact-checkpoint", "compactionId": "aa96b315"},
+                },
+            }),
+            json!({
+                "type": "compaction/end", "seq": 7677, "time": 1_794_566_897_390u64,
+                "data": {"compactionId": "aa96b315", "turn": 15},
+            }),
+        ];
+        let projected = project_session_events(&events);
+        assert_eq!(projected.entries.len(), 1);
+        let marker = &projected.entries[0];
+        assert_eq!(marker.role, EntryRole::Compaction);
+        assert_eq!(marker.title, "上下文已压缩");
+        assert_eq!(marker.status, "已压缩 3 条历史记录（约 12491 tokens）");
+        assert!(marker.text.contains("Primary Request"));
+        assert_eq!(marker.at_ms, Some(1_794_566_897_389f64));
+    }
+
+    #[test]
+    fn a_checkpoint_without_a_loaded_summary_still_marks_the_compaction() {
+        let events = vec![json!({
+            "type": "user/message", "seq": 9, "time": 1_700_000_000_000u64,
+            "surfaceOp": {"op": "replace", "startSeq": 2, "endSeq": 8},
+            "data": {
+                "content": [{"type": "text", "text": "checkpoint"}],
+                "source": {"kind": "compact-checkpoint", "compactionId": "missing-summary"},
+            },
+        })];
+        let projected = project_session_events(&events);
+        assert_eq!(projected.entries.len(), 1);
+        let marker = &projected.entries[0];
+        assert_eq!(marker.role, EntryRole::Compaction);
+        assert_eq!(marker.status, "压缩摘要不可用");
+        assert!(marker.text.is_empty());
     }
 
     #[test]

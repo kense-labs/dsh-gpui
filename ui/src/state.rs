@@ -69,6 +69,8 @@ pub enum EntryRole {
     Warning,
     /// 官方 ContextInjectionRow 的工具变更变体：`developer/message` 的工具增删通知。
     ToolChange,
+    /// 官方 CompactionItem：模型历史被压缩后的标记行。
+    Compaction,
 }
 
 /// One message, thought, tool invocation, or local status row.
@@ -423,6 +425,10 @@ pub fn apply_update(entries: &mut Vec<ChatEntry>, update: &Value) -> UpdateEffec
         // 技能目录是常驻的一类；`entries` 是该行展开后的内容，`update`
         // 表示这是替换目录而不是首次发布。
         Some("context_injection") => apply_context_injection(entries, update),
+        // Host/ACP 扩展：压缩标记行（官方 CompactionItem）。摘要事件先到，缓存
+        // 起来供紧随其后的 checkpoint 使用；两者都以 compactionId 去重。
+        Some("gpui_compaction_summary") => apply_compaction_summary(update),
+        Some("gpui_compaction") => apply_compaction_entry(entries, update),
         // Host/ACP 扩展：系统提示词折叠行（官方 SystemPromptRow）。系统提示词
         // 是模型可见的完整文本，只作为可展开的一行出现，不参与任何状态判断。
         Some("gpui_system_prompt") => {
@@ -743,6 +749,79 @@ fn content_snapshot_text(value: &Value) -> Vec<String> {
 ///
 /// A live ACP update and a replayed durable event describe the same message id,
 /// so both paths share this so a session shows one row per injection.
+/// Latest compaction summaries keyed by compactionId (live evidence cache).
+fn compaction_summary_cache() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, (String, Option<usize>, Option<u64>)>,
+> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (String, Option<usize>, Option<u64>)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Remember one live `compaction/summary` so the marker that follows can cite it.
+fn apply_compaction_summary(update: &Value) {
+    let Some(compaction_id) = update.get("compactionId").and_then(Value::as_str) else {
+        return;
+    };
+    let summary = update
+        .get("summary")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let items = update
+        .get("items")
+        .and_then(Value::as_u64)
+        .map(|items| items as usize);
+    let tokens = update.get("tokens").and_then(Value::as_u64);
+    if let Ok(mut cache) = compaction_summary_cache().lock() {
+        cache.insert(compaction_id.to_owned(), (summary, items, tokens));
+    }
+}
+
+/// Insert (or refresh) one live compaction marker row at its stream position.
+fn apply_compaction_entry(entries: &mut Vec<ChatEntry>, update: &Value) {
+    let Some(compaction_id) = update.get("compactionId").and_then(Value::as_str) else {
+        return;
+    };
+    let cached = compaction_summary_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(compaction_id).cloned());
+    let summary = update
+        .get("summary")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .filter(|text| !text.trim().is_empty())
+        .or_else(|| cached.as_ref().map(|(summary, _, _)| summary.clone()))
+        .filter(|text| !text.trim().is_empty());
+    let items = update
+        .get("items")
+        .and_then(Value::as_u64)
+        .map(|items| items as usize)
+        .or_else(|| cached.as_ref().and_then(|(_, items, _)| *items));
+    let tokens = update
+        .get("tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| cached.as_ref().and_then(|(_, _, tokens)| *tokens));
+    let entry = compaction_entry(
+        compaction_id,
+        summary.as_deref(),
+        items,
+        tokens,
+        update.get("time").and_then(Value::as_f64),
+    );
+    if let Some(existing) = entries
+        .iter_mut()
+        .find(|existing| existing.role == EntryRole::Compaction && existing.key == entry.key)
+    {
+        *existing = entry;
+    } else {
+        entries.push(entry);
+    }
+}
+
 fn apply_context_injection(entries: &mut Vec<ChatEntry>, update: &Value) {
     let id = string_field(update, "messageId");
     if id.is_empty() {
@@ -808,6 +887,7 @@ fn role_name(role: EntryRole) -> &'static str {
         EntryRole::Error => "error",
         EntryRole::Warning => "warning",
         EntryRole::ToolChange => "tool-change",
+        EntryRole::Compaction => "compaction",
     }
 }
 
@@ -1012,6 +1092,36 @@ pub fn tool_change_entry(id: &str, changes: &[ToolChange], at_ms: Option<f64>) -
         role: EntryRole::ToolChange,
         title,
         text,
+        input: String::new(),
+        status,
+        tool: None,
+        at_ms,
+    }
+}
+
+/// Official `CompactionItem`: the marker left where the model history was
+/// compacted. `items`/`tokens` are the shadowed counts from `compaction/summary`;
+/// the summary text is markdown and only present when the log still carries it.
+pub fn compaction_entry(
+    compaction_id: &str,
+    summary: Option<&str>,
+    items: Option<usize>,
+    tokens: Option<u64>,
+    at_ms: Option<f64>,
+) -> ChatEntry {
+    let summary = summary.map(str::trim).filter(|text| !text.is_empty());
+    let expandable = summary.is_some();
+    let status = match (items, tokens) {
+        (Some(items), Some(tokens)) => format!("已压缩 {items} 条历史记录（约 {tokens} tokens）"),
+        _ if expandable => "点击查看压缩摘要".to_owned(),
+        _ => "压缩摘要不可用".to_owned(),
+    };
+    ChatEntry {
+        key: format!("compaction-{compaction_id}"),
+        external_id: Some(compaction_id.to_owned()),
+        role: EntryRole::Compaction,
+        title: "上下文已压缩".to_owned(),
+        text: summary.unwrap_or_default().to_owned(),
         input: String::new(),
         status,
         tool: None,
