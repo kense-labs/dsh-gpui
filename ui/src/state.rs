@@ -57,6 +57,8 @@ pub enum EntryRole {
     Retry,
     /// 官方 GenericCommandCard：斜杠指令的结果行（`command/run` + `command/done`）。
     Command,
+    /// 官方 ContextInjectionRow：上下文注入行（技能目录等）。
+    Context,
     System,
     Error,
 }
@@ -342,6 +344,50 @@ pub fn apply_update(entries: &mut Vec<ChatEntry>, update: &Value) -> UpdateEffec
                 });
             }
         }
+        // Host/ACP 扩展：上下文注入行（官方 ContextInjectionRow）。
+        // 技能目录是常驻的一类；`entries` 是该行展开后的内容，`update`
+        // 表示这是替换目录而不是首次发布。
+        Some("context_injection") => {
+            let id = string_field(update, "messageId");
+            if id.is_empty() {
+                return effect;
+            }
+            let source = string_field(update, "sourceKind");
+            let text = context_entries_text(update);
+            let title = if source.is_empty() {
+                "skill-catalog".to_owned()
+            } else {
+                source
+            };
+            if let Some(entry) = entries.iter_mut().find(|entry| {
+                entry.role == EntryRole::Context
+                    && entry.external_id.as_deref() == Some(id.as_str())
+            }) {
+                entry.title = title;
+                entry.text = text;
+                entry.status = if update["update"] == true {
+                    "update".to_owned()
+                } else {
+                    String::new()
+                };
+            } else {
+                entries.push(ChatEntry {
+                    key: format!("context-{id}"),
+                    external_id: Some(id),
+                    role: EntryRole::Context,
+                    title,
+                    text,
+                    input: String::new(),
+                    status: if update["update"] == true {
+                        "update".to_owned()
+                    } else {
+                        String::new()
+                    },
+                    tool: None,
+                    at_ms: update.get("time").and_then(Value::as_f64),
+                });
+            }
+        }
         // Host/ACP 扩展：斜杠指令结果行（官方 GenericCommandCard）。
         // `command/run` 建立行，`command/done` 回填结果；用 commandId 配对。
         Some("gpui_command_run" | "gpui_command_done") => {
@@ -493,6 +539,32 @@ fn pretty_value(value: &Value) -> String {
     }
 }
 
+/// 上下文注入行展开后的正文：官方 `SkillCatalogSource.entries` 的逐条呈现。
+///
+/// 实时事件把 `entries` 放在顶层，历史回放则嵌在 `data.source.entries`；两种来源
+/// 共用这一个函数，避免同一行在两处渲染出不同内容。
+pub fn context_entries_text(value: &Value) -> String {
+    let source = value.get("source").unwrap_or(value);
+    let mut lines: Vec<String> = source["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry["name"].as_str()?;
+            Some(match entry["description"].as_str() {
+                Some(description) if !description.is_empty() => {
+                    format!("{name} — {description}")
+                }
+                _ => name.to_owned(),
+            })
+        })
+        .collect();
+    if source["incomplete"] == true {
+        lines.push("（本次发现的目录不完整）".to_owned());
+    }
+    lines.join("\n")
+}
+
 fn role_name(role: EntryRole) -> &'static str {
     match role {
         EntryRole::User => "user",
@@ -503,6 +575,7 @@ fn role_name(role: EntryRole) -> &'static str {
         EntryRole::Plan => "plan",
         EntryRole::Retry => "retry",
         EntryRole::Command => "command",
+        EntryRole::Context => "context",
         EntryRole::System => "system",
         EntryRole::Error => "error",
     }
@@ -511,9 +584,88 @@ fn role_name(role: EntryRole) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        EntryRole, apply_update, is_auth_failure, prompt_failure_message, validate_api_key,
+        EntryRole, apply_update, context_entries_text, is_auth_failure, prompt_failure_message,
+        validate_api_key,
     };
     use serde_json::json;
+
+    #[test]
+    fn a_skill_catalog_becomes_one_collapsible_context_row() {
+        let mut entries = Vec::new();
+        let effect = apply_update(
+            &mut entries,
+            &json!({
+                "sessionUpdate": "context_injection",
+                "messageId": "ctx-1",
+                "sourceKind": "skill-catalog",
+                "form": "catalog",
+                "entries": [
+                    {"name": "ppt-generation", "description": "生成演示文稿"},
+                    {"name": "ask-form", "description": "表单提问"},
+                ],
+                "time": 1.0
+            }),
+        );
+        // An injection is not a turn trigger: it must not start a reply.
+        assert!(!effect.turn_triggered);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].role, EntryRole::Context);
+        assert_eq!(entries[0].title, "skill-catalog");
+        assert_eq!(
+            entries[0].text,
+            "ppt-generation — 生成演示文稿\nask-form — 表单提问"
+        );
+        // The row is expandable because it has a body.
+        assert!(!entries[0].text.trim().is_empty());
+
+        // A replacement catalog updates the same row instead of adding another.
+        apply_update(
+            &mut entries,
+            &json!({
+                "sessionUpdate": "context_injection",
+                "messageId": "ctx-1",
+                "sourceKind": "skill-catalog",
+                "update": true,
+                "entries": [{"name": "only-one", "description": "唯一"}]
+            }),
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text, "only-one — 唯一");
+        assert_eq!(entries[0].status, "update");
+    }
+
+    #[test]
+    fn context_entry_text_reads_live_and_replayed_payloads() {
+        // Live event: entries sit at the top level.
+        assert_eq!(
+            context_entries_text(&json!({
+                "entries": [{"name": "a", "description": "A"}]
+            })),
+            "a — A"
+        );
+        // Replayed event: they sit under `source`.
+        assert_eq!(
+            context_entries_text(&json!({
+                "source": {"kind": "skill-catalog", "entries": [{"name": "b", "description": "B"}]}
+            })),
+            "b — B"
+        );
+        // A name without a description still renders.
+        assert_eq!(
+            context_entries_text(&json!({"entries": [{"name": "c"}]})),
+            "c"
+        );
+        // An incomplete discovery says so rather than looking authoritative.
+        assert_eq!(
+            context_entries_text(&json!({
+                "entries": [{"name": "d", "description": "D"}], "incomplete": true
+            })),
+            "d — D\n（本次发现的目录不完整）"
+        );
+        // An empty catalog yields no body at all.
+        assert_eq!(context_entries_text(&json!({"entries": []})), "");
+        assert_eq!(context_entries_text(&json!({})), "");
+    }
 
     #[test]
     fn auth_failures_get_an_actionable_message_instead_of_a_retry_hint() {

@@ -132,6 +132,31 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                     .pointer("/source/kind")
                     .and_then(Value::as_str)
                     .unwrap_or("user");
+                // Context injections (official ContextInjectionRow) are logged
+                // non-user messages. The durable source carries the entries, so
+                // a reopened session rebuilds the same collapsible row instead
+                // of dropping it.
+                if source == "skill-catalog" {
+                    let id = data.get("id").and_then(Value::as_str).map(str::to_string);
+                    out.entries.push(ChatEntry {
+                        key: id
+                            .clone()
+                            .unwrap_or_else(|| format!("hist-context-{}", out.entries.len())),
+                        external_id: id,
+                        role: EntryRole::Context,
+                        title: source.to_owned(),
+                        text: crate::state::context_entries_text(&data),
+                        input: String::new(),
+                        status: if data.pointer("/source/update") == Some(&Value::Bool(true)) {
+                            "update".to_owned()
+                        } else {
+                            String::new()
+                        },
+                        tool: None,
+                        at_ms,
+                    });
+                    continue;
+                }
                 let Some(title) = user_visible_source(source) else {
                     continue;
                 };

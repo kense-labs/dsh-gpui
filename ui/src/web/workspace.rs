@@ -5638,6 +5638,7 @@ fn render_entry(
         }
         EntryRole::Retry => render_model_retry(entry, expanded, cx),
         EntryRole::Command => render_command_card(entry, expanded, cx),
+        EntryRole::Context => render_context_injection(entry, expanded, cx),
         EntryRole::System if entry.title == "turn-end" => row().w_full().justify_start().child(
             div()
                 .px(px(6.))
@@ -5658,6 +5659,95 @@ fn render_entry(
             .child(icon(Glyph::Alert, 16., p.danger))
             .child(div().text_color(p.danger).child(entry.text.clone())),
     }
+}
+
+/// 官方 ContextInjectionRow：折叠行，标题说明这段上下文的角色，展开看正文。
+///
+/// 技能目录是常驻的一类（`skill-catalog`）；它不显示为聊天气泡，也不触发一轮
+/// 回复，只作为可展开的注入记录留在对话流里。
+fn render_context_injection(
+    entry: &ChatEntry,
+    expanded: bool,
+    cx: &mut Context<DshApp>,
+) -> gpui::Div {
+    let p = dsh(cx);
+    let key = entry.key.clone();
+    let title = "上下文注入";
+    let source = entry.title.clone();
+    let body = entry.text.clone();
+    let expandable = !body.trim().is_empty();
+    let open = expanded && expandable;
+    let toggle_key = key.clone();
+    let mut row = row()
+        .id(gpui::ElementId::Name(format!("context-{key}").into()))
+        .role(gpui::Role::Button)
+        .aria_label(format!("{title} {source}"))
+        .aria_expanded(open)
+        .tab_index(0)
+        .tab_stop(expandable)
+        .w_full()
+        .gap(px(7.))
+        .items_center()
+        .rounded(px(8.))
+        .h(px(24.))
+        .px(px(2.))
+        .when(expandable, |row| {
+            row.cursor_pointer().hover(|style| style.bg(p.hover))
+        })
+        .text_color(p.faint)
+        .child(
+            gpui::svg()
+                .data(include_bytes!("../../assets/context-injection.svg") as &[u8])
+                .size(px(14.))
+                .flex_none()
+                .text_color(p.faint),
+        )
+        .child(
+            div()
+                .flex_none()
+                .text_size(px(13.))
+                .line_height(px(20.))
+                .child(title),
+        )
+        .child(div().flex_none().size(px(2.)).rounded_full().bg(p.faint))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(px(13.))
+                .line_height(px(20.))
+                .child(source),
+        );
+    if expandable {
+        row = row
+            .child(icon(
+                if open { Glyph::Up } else { Glyph::Down },
+                12.,
+                p.faint,
+            ))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                toggle_entry(&mut this.conversation.expanded_entries, &toggle_key);
+                cx.notify();
+            }));
+    }
+    let mut card = column().w_full().child(row);
+    if open {
+        card = card.child(
+            div()
+                .id(gpui::ElementId::Name(format!("context-body-{key}").into()))
+                .w_full()
+                .max_h(px(260.))
+                .overflow_y_scroll()
+                .pl(px(21.))
+                .pt(px(4.))
+                .text_size(px(12.))
+                .line_height(px(18.))
+                .text_color(p.secondary)
+                .child(body),
+        );
+    }
+    card
 }
 
 /// 官方 GenericCommandCard：指令名 + 分隔点 + 折叠摘要，多行正文可展开。

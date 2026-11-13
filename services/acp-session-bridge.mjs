@@ -1628,7 +1628,25 @@ function observeSessionUpdates(ctx) {
       // only the tail left a live goal round with no card at all: it appeared
       // afterwards, from history replay, but never while it was running.
       const human = source === 'user' || source === 'user-question-reply';
-      const internal = source === 'runtime-context' || source === 'skill-catalog'
+      // Context injections (official ContextInjectionRow): logged, never spoken
+      // by a human, and shown as a collapsed row rather than a trigger card.
+      // The skill catalog is the one that is always present, and its durable
+      // `entries` are what a reader expands to.
+      if (!human && source === 'skill-catalog') {
+        notify(session.id, {
+          sessionUpdate: 'context_injection',
+          messageId: data.id,
+          sourceKind: source,
+          form: data.source?.form,
+          entries: data.source?.entries,
+          update: data.source?.update === true,
+          incomplete: data.source?.incomplete === true,
+          content: contentBlocks(data.content),
+          time: event.time,
+        });
+        return;
+      }
+      const internal = source === 'runtime-context'
         || source === 'compact-checkpoint';
       if (!human && !internal) {
         notify(session.id, {
