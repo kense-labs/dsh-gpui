@@ -77,4 +77,31 @@ KWork 是 Rust/GPUI 客户端，通过 ACP 与 Host 通信；官方客户端是 
   - 窗口级截图 + OCR 坐标自动化（`/tmp/kwork-att/*` 工具，非仓库内容）。
 - **CI**：GitHub Actions `windows.yml` 在每次 push 到 main 后构建 Windows 安装包。
 
-最后更新：与 rc.3 对齐验证进行中（本轮为第 20 轮），新增差异会补充到对应表格。
+## 验收快照（第 28 轮，macOS 真机 debug 构建）
+
+- **冷启动/欢迎页**：侧栏、工作区、输入区正常，无 panic（原生日志仅启动行）；
+- **真实回放会话**：1877 事件会话打开后正常渲染、可滚动，WebContent CPU ~1%（渲染窗口化生效，第 15 轮修复）；
+- **实时发送**：新建会话发送提示词，1 秒完成并渲染回复，CPU ~2%；
+- **归档/撤销**：归档提示含「撤销 / 筛选已归档会话」（第 26 轮），撤销后侧栏行即时恢复、随后出现「已取消归档」（第 27 轮）；
+- **主题**：浅色 / 深色 / 跟随系统三档，OS 切换后 ≤2s 跟随（第 21 轮）；
+- **渲染卡片**：数学围栏、类型化工具卡（shell/read/grep/web）、交付物、已编辑文件、统计弹窗、web 卡 URL 打开（第 17–20 轮）；
+- **插话回显**：运行中插话以「插话 · 待回应」气泡出现在转录区末尾（第 23 轮）；
+- **API Key 显隐**、**文件/页签扩展名图标**（第 22、24 轮）。
+
+自动化：`cargo test --workspace`（56 宿主 + 229 UI）、`bun test scripts/*.test.mjs`（12）、
+`cargo clippy --workspace --all-targets`（0 error）、`cargo fmt --all --check`、
+`cargo check -p dsh-gpui-ui --target wasm32-unknown-unknown`（0 warning）；
+GitHub Actions `windows.yml` 对 main 每次 push 构建 Windows 安装包。
+
+### 尚未真机覆盖的细节
+
+- 图片类型文件图标的真机点击（分类器有单测，Markdown 图标已实测）；
+- QueueDock 的 next-turn 排队卡路径未能端到端触发（当前 Host 把普通 Enter 也投递到 next-step）；
+- 深浅主题按像素采样判断，未做逐表面自动化对比度校验。
+
+### 结论
+
+在 ACP 协议与 GPUI/WKWebView 的能力边界内，官方 rc.3 客户端中可对齐的交互与渲染已逐项实现并验证；
+剩余项为「不可达（见上表）」或需要新增大块能力的独立功能（工作区树拖拽重排、轨迹视图、网络搜索计费、终端徽标、插件卡片徽标）。
+
+最后更新：第 28 轮，基准标签 `dsh-v0.2.2-rc.3`（commit `38a6a5c`）。
