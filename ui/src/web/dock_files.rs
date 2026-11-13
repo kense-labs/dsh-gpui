@@ -504,13 +504,10 @@ impl DshApp {
                     })
                     .hover(|style| style.bg(p.hover))
                     .child(icon(Glyph::Settings, 15., p.faint))
-                    .on_mouse_down(
-                        gpui::MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.files_search_settings_open = !this.files_search_settings_open;
-                            cx.notify();
-                        }),
-                    ),
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.files_search_settings_open = !this.files_search_settings_open;
+                        cx.notify();
+                    })),
             );
         let page = page.child(header).child(search_bar).child(
             if self.files_search.query.trim().is_empty() {
