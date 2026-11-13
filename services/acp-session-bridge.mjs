@@ -1680,6 +1680,23 @@ function observeSessionUpdates(ctx) {
       });
       return;
     }
+    // Background job lifecycle. `job/registered` opens a row and `job/settled`
+    // closes the same one, keyed by jobId; the durable events carry the kind,
+    // label and terminal status the transcript needs.
+    if (type === 'job/registered' || type === 'job/settled') {
+      notify(session.id, {
+        sessionUpdate: type === 'job/registered' ? 'gpui_job_registered' : 'gpui_job_settled',
+        jobId: data.jobId,
+        kind: data.kind,
+        label: data.label,
+        startedAt: data.startedAt,
+        finishedAt: data.finishedAt,
+        status: data.status,
+        detail: data.detail,
+        time: event.time,
+      });
+      return;
+    }
     const relevant = ['session/title', 'turn/start', 'step/start', 'turn/end', 'llm/retry', 'tool/call'].includes(type)
       || ((type === 'assistant/message' || type === 'tool/result') && surfaceOp === 'append');
     if (!relevant) return;

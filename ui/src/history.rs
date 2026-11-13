@@ -454,6 +454,52 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                     at_ms,
                 });
             }
+            // Background jobs settle in the same durable log: a reopened session
+            // rebuilds the row rather than losing the record of what ran.
+            "job/registered" | "job/settled" => {
+                let settled = kind == "job/settled";
+                let Some(id) = data.get("jobId").and_then(Value::as_str) else {
+                    continue;
+                };
+                if let Some(entry) = out.entries.iter_mut().find(|entry| {
+                    entry.role == EntryRole::Job && entry.external_id.as_deref() == Some(id)
+                }) {
+                    if settled {
+                        entry.status = crate::state::job_status_label(&data).to_owned();
+                        entry.text = crate::state::job_detail_text(&data);
+                        entry.input = crate::state::job_finished_at(&data);
+                    }
+                } else {
+                    out.entries.push(ChatEntry {
+                        key: format!("hist-job-{id}"),
+                        external_id: Some(id.to_owned()),
+                        role: EntryRole::Job,
+                        title: data
+                            .get("label")
+                            .and_then(Value::as_str)
+                            .filter(|label| !label.is_empty())
+                            .or_else(|| data.get("kind").and_then(Value::as_str))
+                            .unwrap_or("")
+                            .to_owned(),
+                        text: crate::state::job_detail_text(&data),
+                        input: if settled {
+                            crate::state::job_finished_at(&data)
+                        } else {
+                            String::new()
+                        },
+                        status: if settled {
+                            crate::state::job_status_label(&data).to_owned()
+                        } else {
+                            "running".to_owned()
+                        },
+                        tool: None,
+                        at_ms: data
+                            .get("startedAt")
+                            .and_then(Value::as_f64)
+                            .or_else(|| event.get("time").and_then(Value::as_f64)),
+                    });
+                }
+            }
             // Slash-command results are log-only events; replay rebuilds the
             // command card so a reopened session keeps showing it.
             "command/run" | "command/done" => {
@@ -651,6 +697,39 @@ mod tests {
         );
         // Unusable args fall back to the tool name, as before.
         assert_eq!(tool_title("todo_write", "{\"todos\": ["), "todo_write");
+    }
+
+    #[test]
+    fn a_replayed_job_pair_rebuilds_one_row() {
+        let projection = project_session_events(&[
+            json!({
+                "type": "job/registered", "seq": 10, "time": 1794453670976f64,
+                "data": {
+                    "jobId": "bash-09d5", "owner": "s1", "kind": "bash",
+                    "label": "uname -a", "startedAt": 1794453670976f64
+                }
+            }),
+            json!({
+                "type": "job/settled", "seq": 12, "time": 1794453671009f64,
+                "data": {
+                    "jobId": "bash-09d5", "owner": "s1", "kind": "bash",
+                    "label": "uname -a", "startedAt": 1794453670976f64,
+                    "finishedAt": 1794453671009f64, "status": "completed",
+                    "detail": "exit code: 127"
+                }
+            }),
+        ]);
+        let jobs: Vec<_> = projection
+            .entries
+            .iter()
+            .filter(|entry| entry.role == EntryRole::Job)
+            .collect();
+        assert_eq!(jobs.len(), 1, "the pair must rebuild exactly one row");
+        assert_eq!(jobs[0].title, "uname -a");
+        assert_eq!(jobs[0].status, "completed");
+        assert_eq!(jobs[0].text, "exit code: 127");
+        // The duration needs the numeric finish time preserved.
+        assert_eq!(jobs[0].input, "1794453671009");
     }
 
     #[test]

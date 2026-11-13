@@ -59,6 +59,8 @@ pub enum EntryRole {
     Command,
     /// 官方 ContextInjectionRow：上下文注入行（技能目录等）。
     Context,
+    /// 官方后台任务行：`job/registered` 建立，`job/settled` 结算。
+    Job,
     System,
     Error,
 }
@@ -344,6 +346,50 @@ pub fn apply_update(entries: &mut Vec<ChatEntry>, update: &Value) -> UpdateEffec
                 });
             }
         }
+        // Host/ACP 扩展：后台任务行。
+        // `job/registered` 按 jobId 建立，`job/settled` 结算同一行；
+        // 状态语义与文案对齐官方 ui-jobs 的 statusLabel。
+        Some("gpui_job_registered" | "gpui_job_settled") => {
+            let settled = update["sessionUpdate"] == "gpui_job_settled";
+            let id = string_field(update, "jobId");
+            if id.is_empty() {
+                return effect;
+            }
+            let label = string_field(update, "label");
+            let kind = string_field(update, "kind");
+            if let Some(entry) = entries.iter_mut().find(|entry| {
+                entry.role == EntryRole::Job && entry.external_id.as_deref() == Some(id.as_str())
+            }) {
+                if settled {
+                    entry.status = job_status_label(&update).to_owned();
+                    entry.text = job_detail_text(&update);
+                    entry.input = job_finished_at(&update);
+                }
+            } else {
+                let at_ms = update["startedAt"]
+                    .as_f64()
+                    .or_else(|| update.get("time").and_then(Value::as_f64));
+                entries.push(ChatEntry {
+                    key: format!("job-{id}"),
+                    external_id: Some(id),
+                    role: EntryRole::Job,
+                    title: if label.is_empty() { kind } else { label },
+                    text: job_detail_text(&update),
+                    input: if settled {
+                        job_finished_at(&update)
+                    } else {
+                        String::new()
+                    },
+                    status: if settled {
+                        job_status_label(&update).to_owned()
+                    } else {
+                        "running".to_owned()
+                    },
+                    tool: None,
+                    at_ms,
+                });
+            }
+        }
         // Host/ACP 扩展：上下文注入行（官方 ContextInjectionRow）。
         // 技能目录是常驻的一类；`entries` 是该行展开后的内容，`update`
         // 表示这是替换目录而不是首次发布。
@@ -539,6 +585,46 @@ fn pretty_value(value: &Value) -> String {
     }
 }
 
+/// 后台任务的结束时间戳（毫秒）。它以 JSON 数字到达，`string_field` 只读字符串，
+/// 因此单独提取；解析不出时留空表示「仍在运行」。
+///
+/// 存成整数毫秒而不是数字的 Display 形式：serde_json 会把整数型 f64 渲染成
+/// `...1009.0`，而时长只关心毫秒值。
+pub fn job_finished_at(update: &Value) -> String {
+    let millis = match update.get("finishedAt") {
+        Some(Value::Number(number)) => number.as_f64(),
+        Some(Value::String(text)) => text.parse::<f64>().ok(),
+        _ => None,
+    };
+    match millis {
+        Some(millis) => format!("{}", millis as i64),
+        None => String::new(),
+    }
+}
+
+/// 后台任务的终态。缺省按官方 wire 联合类型里的 `completed` 处理。
+pub fn job_status_label(update: &Value) -> &'static str {
+    match update["status"].as_str() {
+        Some("running") => "running",
+        Some("stopping") => "stopping",
+        Some("killed") => "killed",
+        Some("failed") => "failed",
+        _ => "completed",
+    }
+}
+
+/// 后台任务行的副标题：官方 `jobDetail` = 进行中的 `progress`，否则 `detail`。
+pub fn job_detail_text(update: &Value) -> String {
+    for key in ["progress", "detail"] {
+        if let Some(text) = update[key].as_str()
+            && !text.is_empty()
+        {
+            return text.to_owned();
+        }
+    }
+    String::new()
+}
+
 /// 上下文注入行展开后的正文：官方 `SkillCatalogSource.entries` 的逐条呈现。
 ///
 /// 实时事件把 `entries` 放在顶层，历史回放则嵌在 `data.source.entries`；两种来源
@@ -576,6 +662,7 @@ fn role_name(role: EntryRole) -> &'static str {
         EntryRole::Retry => "retry",
         EntryRole::Command => "command",
         EntryRole::Context => "context",
+        EntryRole::Job => "job",
         EntryRole::System => "system",
         EntryRole::Error => "error",
     }
@@ -584,10 +671,99 @@ fn role_name(role: EntryRole) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        EntryRole, apply_update, context_entries_text, is_auth_failure, prompt_failure_message,
-        validate_api_key,
+        EntryRole, apply_update, context_entries_text, is_auth_failure, job_detail_text,
+        job_status_label, prompt_failure_message, validate_api_key,
     };
     use serde_json::json;
+
+    #[test]
+    #[test]
+    fn a_background_job_registers_and_settles_on_one_row() {
+        // Payloads copied from a real `job/registered` / `job/settled` pair in
+        // ~/.dsh so the row stays pinned to what the host writes.
+        let mut entries = Vec::new();
+        apply_update(
+            &mut entries,
+            &json!({
+                "sessionUpdate": "gpui_job_registered",
+                "jobId": "bash-09d541eae396400a",
+                "kind": "bash",
+                "label": "echo \"=== OS ===\"; uname -a",
+                "startedAt": 1794453670976f64,
+                "time": 1794453670976f64
+            }),
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].role, EntryRole::Job);
+        assert_eq!(entries[0].status, "running");
+        assert_eq!(entries[0].title, "echo \"=== OS ===\"; uname -a");
+        assert_eq!(entries[0].at_ms, Some(1794453670976.0));
+
+        apply_update(
+            &mut entries,
+            &json!({
+                "sessionUpdate": "gpui_job_settled",
+                "jobId": "bash-09d541eae396400a",
+                "kind": "bash",
+                "label": "echo \"=== OS ===\"; uname -a",
+                "startedAt": 1794453670976f64,
+                "finishedAt": 1794453671009f64,
+                "status": "completed",
+                "cause": "producer",
+                "detail": "exit code: 127"
+            }),
+        );
+        // Settling updates the same row rather than appending another.
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, "completed");
+        assert_eq!(entries[0].text, "exit code: 127");
+        assert_eq!(entries[0].input, "1794453671009");
+    }
+
+    #[test]
+    fn a_job_falls_back_to_its_kind_when_the_label_is_missing() {
+        let mut entries = Vec::new();
+        apply_update(
+            &mut entries,
+            &json!({
+                "sessionUpdate": "gpui_job_registered",
+                "jobId": "j1",
+                "kind": "bash"
+            }),
+        );
+        assert_eq!(entries[0].title, "bash");
+        // A settled event with no status is the wire union's default.
+        let mut entries = Vec::new();
+        apply_update(
+            &mut entries,
+            &json!({"sessionUpdate": "gpui_job_settled", "jobId": "j2", "kind": "bash"}),
+        );
+        assert_eq!(entries[0].status, "completed");
+    }
+
+    #[test]
+    fn job_status_and_detail_cover_the_official_wire_union() {
+        assert_eq!(job_status_label(&json!({"status": "running"})), "running");
+        assert_eq!(job_status_label(&json!({"status": "stopping"})), "stopping");
+        assert_eq!(job_status_label(&json!({"status": "killed"})), "killed");
+        assert_eq!(job_status_label(&json!({"status": "failed"})), "failed");
+        assert_eq!(
+            job_status_label(&json!({"status": "completed"})),
+            "completed"
+        );
+        assert_eq!(job_status_label(&json!({})), "completed");
+        // `jobDetail` prefers progress while running, then detail.
+        assert_eq!(job_detail_text(&json!({"progress": "3/10"})), "3/10");
+        assert_eq!(
+            job_detail_text(&json!({"detail": "exit code: 127"})),
+            "exit code: 127"
+        );
+        assert_eq!(
+            job_detail_text(&json!({"progress": "a", "detail": "b"})),
+            "a"
+        );
+        assert_eq!(job_detail_text(&json!({})), "");
+    }
 
     #[test]
     fn a_skill_catalog_becomes_one_collapsible_context_row() {

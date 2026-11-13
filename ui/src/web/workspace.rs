@@ -5639,6 +5639,7 @@ fn render_entry(
         EntryRole::Retry => render_model_retry(entry, expanded, cx),
         EntryRole::Command => render_command_card(entry, expanded, cx),
         EntryRole::Context => render_context_injection(entry, expanded, cx),
+        EntryRole::Job => render_job_row(entry, expanded, cx),
         EntryRole::System if entry.title == "turn-end" => row().w_full().justify_start().child(
             div()
                 .px(px(6.))
@@ -5659,6 +5660,138 @@ fn render_entry(
             .child(icon(Glyph::Alert, 16., p.danger))
             .child(div().text_color(p.danger).child(entry.text.clone())),
     }
+}
+
+/// 官方 ui-jobs 行：状态点 + 类型 + 标签 +（详情或状态）+ 时长。
+///
+/// 官方那个组件是挂在会话头上的实时浮层（依赖 job controller 的流式 RPC）；
+/// 这里渲染的是同一份数据在**对话流里的存档行**——来自持久化的
+/// `job/registered` / `job/settled` 事件，所以重开旧会话也能看到。
+fn render_job_row(entry: &ChatEntry, expanded: bool, cx: &mut Context<DshApp>) -> gpui::Div {
+    let p = dsh(cx);
+    let key = entry.key.clone();
+    let live = matches!(entry.status.as_str(), "running" | "stopping");
+    let status_label = match entry.status.as_str() {
+        "running" => "运行中",
+        "stopping" => "正在停止",
+        "killed" => "已取消",
+        "failed" => "已失败",
+        _ => "已完成",
+    };
+    let tone = match entry.status.as_str() {
+        "running" | "stopping" => p.state_business_primary,
+        "failed" => p.danger,
+        "killed" => p.state_warn_primary,
+        _ => p.state_success_primary,
+    };
+    // 官方 `jobDetail`：进行中看 progress，结算后看 detail；没有就显示状态本身。
+    let detail = if entry.text.is_empty() {
+        status_label.to_owned()
+    } else {
+        format!("{status_label} · {}", entry.text)
+    };
+    let elapsed = job_elapsed_label(entry);
+    let body = entry.title.clone();
+    let body_id = format!("job-body-{key}");
+    let toggle_key = key.clone();
+    column()
+        .w_full()
+        .gap(px(2.))
+        .child(
+            row()
+                .id(gpui::ElementId::Name(format!("job-{key}").into()))
+                .role(gpui::Role::Button)
+                .aria_label(detail.clone())
+                .aria_expanded(expanded)
+                .tab_index(0)
+                .w_full()
+                .gap(px(7.))
+                .items_center()
+                .rounded(px(8.))
+                .px(px(2.))
+                .cursor_pointer()
+                .hover(|style| style.bg(p.hover))
+                .text_color(p.faint)
+                .child(div().flex_none().size(px(6.)).rounded_full().bg(tone))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(13.))
+                        .line_height(px(20.))
+                        .child(status_label),
+                )
+                .child(div().flex_none().size(px(2.)).rounded_full().bg(p.faint))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(13.))
+                        .line_height(px(20.))
+                        .child(body.clone()),
+                )
+                .when_some(elapsed, |row, elapsed| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(12.))
+                            .line_height(px(18.))
+                            .child(elapsed),
+                    )
+                })
+                .child(icon(
+                    if expanded { Glyph::Up } else { Glyph::Down },
+                    12.,
+                    p.faint,
+                ))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    toggle_entry(&mut this.conversation.expanded_entries, &toggle_key);
+                    cx.notify();
+                })),
+        )
+        .child(
+            div()
+                .id(gpui::ElementId::Name(body_id.into()))
+                .pl(px(21.))
+                .text_size(px(12.))
+                .line_height(px(18.))
+                .text_color(p.faint)
+                .when(!expanded, |element| {
+                    element.max_h(px(18.)).overflow_hidden()
+                })
+                .child(if live {
+                    // A running job's label is its command line; show it in full
+                    // only when the reader asks for it.
+                    body
+                } else if entry.text.is_empty() {
+                    detail
+                } else {
+                    entry.text.clone()
+                }),
+        )
+}
+
+/// 后台任务时长，对齐官方 `formatDuration`：最多两个相邻单位。
+///
+/// 需要在 `anim` 里算成文本，因为行本身只有起止时间戳。
+fn job_elapsed_label(entry: &ChatEntry) -> Option<String> {
+    let started = entry.at_ms?;
+    let finished = entry
+        .input
+        .parse::<f64>()
+        .ok()
+        .unwrap_or_else(bridge::monotonic_ms);
+    let total = (((finished - started).max(0.)) / 1000.).floor() as u64;
+    let seconds = total % 60;
+    let minutes = (total / 60) % 60;
+    let hours = total / 3600;
+    Some(if hours > 0 {
+        format!("{hours}小时{minutes}分")
+    } else if minutes > 0 {
+        format!("{minutes}分{seconds}秒")
+    } else {
+        format!("{seconds}秒")
+    })
 }
 
 /// 官方 ContextInjectionRow：折叠行，标题说明这段上下文的角色，展开看正文。
