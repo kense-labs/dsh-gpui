@@ -692,6 +692,56 @@ pub async fn read_attachment(attachment_id: String, media_type: String) -> Resul
     }))
 }
 
+/// Read an absolute workspace image path for a Markdown picture.
+///
+/// Official `MarkdownPathImages` rewrites only absolute POSIX / drive paths to
+/// the Host file API; this is the native equivalent, capped so a stray huge file
+/// cannot be pulled into the transcript.
+#[tauri::command]
+pub async fn read_image_file(path: String) -> Result<Value, String> {
+    let trimmed = path.trim().to_owned();
+    if trimmed.is_empty() {
+        return Err("缺少图片路径".to_string());
+    }
+    let file = PathBuf::from(&trimmed);
+    if !file.is_absolute() {
+        return Err(format!("图片路径必须是绝对路径：{trimmed}"));
+    }
+    let media_type = image_media_type(&file);
+    if media_type.is_none() {
+        return Err(format!("不是支持的图片格式：{trimmed}"));
+    }
+    let read_path = file.clone();
+    let bytes = tokio::task::spawn_blocking(move || std::fs::read(&read_path))
+        .await
+        .map_err(|error| format!("读取图片失败：{error}"))?
+        .map_err(|error| format!("读取图片失败：{error}"))?;
+    const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return Err(format!("图片过大（{} 字节）", bytes.len()));
+    }
+    let media_type = media_type.unwrap_or("image/png");
+    Ok(json!({
+        "path": trimmed,
+        "mediaType": media_type,
+        "dataUrl": format!("data:{media_type};base64,{}", base64_encode(&bytes)),
+    }))
+}
+
+fn image_media_type(path: &std::path::Path) -> Option<&'static str> {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase());
+    match extension.as_deref() {
+        Some("png") => Some("image/png"),
+        Some("jpg" | "jpeg") => Some("image/jpeg"),
+        Some("webp") => Some("image/webp"),
+        Some("gif") => Some("image/gif"),
+        _ => None,
+    }
+}
+
 /// Minimal standard base64 encoder (no padding-free variant needed here).
 fn base64_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -866,7 +916,24 @@ mod local_scan_tests {
 
 #[cfg(test)]
 mod attachment_tests {
-    use super::base64_encode;
+    use super::{base64_encode, image_media_type};
+    use std::path::Path;
+
+    #[test]
+    fn image_media_types_follow_the_extension() {
+        assert_eq!(image_media_type(Path::new("/tmp/a.png")), Some("image/png"));
+        assert_eq!(
+            image_media_type(Path::new("/tmp/a.JPG")),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            image_media_type(Path::new("/tmp/a.webp")),
+            Some("image/webp")
+        );
+        assert_eq!(image_media_type(Path::new("/tmp/a.gif")), Some("image/gif"));
+        assert_eq!(image_media_type(Path::new("/tmp/a.txt")), None);
+        assert_eq!(image_media_type(Path::new("/tmp/a")), None);
+    }
 
     #[test]
     fn base64_matches_rfc4648_vectors() {

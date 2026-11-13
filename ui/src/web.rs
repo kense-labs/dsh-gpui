@@ -569,7 +569,6 @@ pub(crate) struct TurnSummary {
 #[derive(Clone)]
 pub(crate) struct ImageViewer {
     pub(crate) data_url: String,
-    pub(crate) media_type: String,
     pub(crate) name: String,
 }
 
@@ -1987,6 +1986,27 @@ impl DshApp {
         }
     }
 
+    /// Request every absolute workspace picture referenced by Markdown prose.
+    ///
+    /// Official `MarkdownPathImages` resolves absolute image destinations through
+    /// the Host file API; here each new path is read once and cached, so the
+    /// renderer can show the picture without side effects during paint.
+    fn preload_markdown_images(&mut self) {
+        for entry in &self.conversation.entries {
+            if entry.text.is_empty() || !entry.text.contains("![") {
+                continue;
+            }
+            for destination in crate::markdown::image_destinations(&entry.text) {
+                let Some(path) = crate::media::absolute_image_path(&destination) else {
+                    continue;
+                };
+                if crate::media::request_local_image(&path) {
+                    invoke("read_image_file", json!({ "path": path }));
+                }
+            }
+        }
+    }
+
     fn request_session_history(&mut self) {
         let Some(session_id) = self.active_session.clone() else {
             return;
@@ -3005,6 +3025,7 @@ impl DshApp {
                         Ok(reply) => {
                             self.apply_session_history(session, &reply, prepend);
                             self.request_user_images();
+                            self.preload_markdown_images();
                             if !prepend {
                                 self.settle_history_scroll(session, cx);
                             }
@@ -3033,6 +3054,24 @@ impl DshApp {
                     }
                 }
                 Err(_) => {}
+            },
+            // One Markdown workspace picture finished reading: cache it for the
+            // renderer (failure keeps 图片无法预览 without a retry loop).
+            "read_image_file" => match result {
+                Ok(reply) => {
+                    if let (Some(path), Some(media_type), Some(data_url)) = (
+                        reply.get("path").and_then(Value::as_str),
+                        reply.get("mediaType").and_then(Value::as_str),
+                        reply.get("dataUrl").and_then(Value::as_str),
+                    ) {
+                        crate::media::store_local_image(path, media_type, data_url);
+                        cx.notify();
+                    }
+                }
+                Err(_) => {
+                    crate::media::fail_pending_local_images();
+                    cx.notify();
+                }
             },
             "list_sessions" => match result {
                 Ok(reply) => self.apply_session_page(&reply),
@@ -3432,6 +3471,9 @@ impl DshApp {
         {
             summary.blank = false;
         }
+        // Markdown pictures inside streamed or finalized prose are Host files:
+        // read each new absolute destination once so the next paint can show it.
+        self.preload_markdown_images();
         if selected {
             if options_changed {
                 self.rebuild_selectors(w, cx);

@@ -92,6 +92,7 @@ fn main() {
             history::peek_session_titles,
             history::list_local_sessions,
             history::read_attachment,
+            history::read_image_file,
             acp::close_session,
             acp::set_session_archived,
             acp::prompt,

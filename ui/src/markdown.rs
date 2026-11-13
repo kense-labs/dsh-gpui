@@ -60,6 +60,30 @@ pub(crate) enum Block {
     },
 }
 
+/// Destinations of every block-level image in the document, in order.
+///
+/// The transcript preloads absolute workspace paths before rendering, so a
+/// reopened session never flashes an empty picture box.
+pub(crate) fn image_destinations(source: &str) -> Vec<String> {
+    parse_markdown(source)
+        .into_iter()
+        .filter_map(|block| match block {
+            Block::Image { url, .. } => {
+                let trimmed = url.trim();
+                if let Some(inner) = trimmed
+                    .strip_prefix('<')
+                    .and_then(|rest| rest.strip_suffix('>'))
+                {
+                    Some(inner.to_owned())
+                } else {
+                    Some(trimmed.to_owned())
+                }
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// 行内片段：普通文本（可粗体/代码）或链接。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum InlinePart {
@@ -602,7 +626,8 @@ pub(crate) fn code_spans(code: &str, lang: &str) -> Vec<CodeSpan> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Block, CodeToken, InlinePart, code_spans, frontmatter_bounds, inline_parts, parse_markdown,
+        Block, CodeToken, InlinePart, code_spans, frontmatter_bounds, image_destinations,
+        inline_parts, parse_markdown,
     };
 
     #[test]
@@ -686,6 +711,18 @@ mod tests {
         };
         assert_eq!(label, "文档");
         assert_eq!(url, "https://example.com");
+    }
+
+    #[test]
+    fn image_destinations_collect_block_images() {
+        let blocks = image_destinations(
+            "intro\n\n![a](/tmp/a.png)\n\n![b](<relative.png>)\n\n![c](/tmp/c.png?raw=1)\n",
+        );
+        assert_eq!(
+            blocks,
+            vec!["/tmp/a.png", "relative.png", "/tmp/c.png?raw=1"]
+        );
+        assert!(image_destinations("no images here").is_empty());
     }
 
     #[test]

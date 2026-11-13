@@ -4137,7 +4137,7 @@ impl DshApp {
                         .as_deref()
                         .filter(|data| data.starts_with("data:image/"))
                     {
-                        match user_image_source(preview, &item.mime) {
+                        match crate::media::image_source(preview) {
                             Some(source) => gpui::img(source)
                                 .size_full()
                                 .object_fit(gpui::ObjectFit::Cover)
@@ -6717,40 +6717,6 @@ fn render_deliverable_card(
         .into_any_element()
 }
 
-/// Decoded pictures keyed by their data URL, so a later frame reuses the decode
-/// instead of rebuilding an 80KB image on every paint.
-fn user_image_cache()
--> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<gpui::Image>>> {
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<gpui::Image>>>,
-    > = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-/// Build the image source for a decoded attachment picture.
-///
-/// The web host cannot fetch `data:` URLs through its HTTP client, so the bytes
-/// are decoded here and given to the element as an in-memory image.
-fn user_image_source(data_url: &str, media_type: &str) -> Option<gpui::ImageSource> {
-    if let Ok(cache) = user_image_cache().lock()
-        && let Some(image) = cache.get(data_url)
-    {
-        return Some(image.clone().into());
-    }
-    let bytes = crate::data_url::decode_base64_data_url(data_url)?;
-    let format = match media_type {
-        "image/jpeg" | "image/jpg" => gpui::ImageFormat::Jpeg,
-        "image/webp" => gpui::ImageFormat::Webp,
-        "image/gif" => gpui::ImageFormat::Gif,
-        _ => gpui::ImageFormat::Png,
-    };
-    let image = std::sync::Arc::new(gpui::Image::from_bytes(format, bytes));
-    if let Ok(mut cache) = user_image_cache().lock() {
-        cache.insert(data_url.to_owned(), image.clone());
-    }
-    Some(image.into())
-}
-
 /// User-message pictures (official UserContent): a row of rounded thumbnails
 /// that open the full-screen viewer. Attachment objects are read lazily, so a
 /// thumbnail falls back to 加载图片… until its data URL arrives.
@@ -6764,7 +6730,6 @@ fn render_user_images(entry: &ChatEntry, cx: &mut Context<DshApp>) -> Option<gpu
     for (index, image) in images.into_iter().enumerate() {
         let key = format!("{}-{index}", entry.key);
         let name = image.name.clone();
-        let media_type = image.media_type.clone();
         rail = rail.child(match image.data_url {
             Some(data_url) => div()
                 .id(gpui::ElementId::Name(format!("user-image-{key}").into()))
@@ -6776,7 +6741,7 @@ fn render_user_images(entry: &ChatEntry, cx: &mut Context<DshApp>) -> Option<gpu
                 .rounded(px(12.))
                 .overflow_hidden()
                 .cursor_pointer()
-                .child(match user_image_source(&data_url, &media_type) {
+                .child(match crate::media::image_source(&data_url) {
                     Some(source) => gpui::img(source)
                         .size_full()
                         .object_fit(gpui::ObjectFit::Cover)
@@ -6794,7 +6759,6 @@ fn render_user_images(entry: &ChatEntry, cx: &mut Context<DshApp>) -> Option<gpu
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.image_viewer = Some(crate::web::ImageViewer {
                         data_url: data_url.clone(),
-                        media_type: media_type.clone(),
                         name: name.clone(),
                     });
                     cx.notify();
@@ -6843,7 +6807,7 @@ impl DshApp {
                         .items_center()
                         .child(
                             div().rounded(px(12.)).overflow_hidden().bg(p.stage).child(
-                                match user_image_source(&viewer.data_url, &viewer.media_type) {
+                                match crate::media::image_source(&viewer.data_url) {
                                     Some(source) => gpui::img(source)
                                         .w(px(760.))
                                         .max_h(px(560.))
@@ -7500,6 +7464,103 @@ fn render_turn_trigger(entry: &ChatEntry, expanded: bool, cx: &mut Context<DshAp
 }
 
 /// 官方助手消息：全宽 Markdown（14/24），标题/列表/表格/引用/代码块 banner（复制+换行）。
+/// Render a Markdown picture whose destination is an absolute local path.
+///
+/// Official `MarkdownPathImages` rewrites those destinations to the Host file
+/// API; here the bytes are preloaded by `read_image_file` and shown with the same
+/// local-decoding path as user attachments. `None` keeps the ordinary placeholder
+/// card (loading, unsupported, or a relative/remote destination).
+fn render_markdown_image(
+    alt: &str,
+    url: &str,
+    cx: &mut Context<DshApp>,
+) -> Option<gpui::AnyElement> {
+    let p = dsh(cx);
+    let path = crate::media::absolute_image_path(url)?;
+    match crate::media::cached_local_image(&path)? {
+        crate::media::LocalImageState::Pending => None,
+        crate::media::LocalImageState::Failed => Some(
+            column()
+                .w_full()
+                .gap(px(4.))
+                .rounded(px(crate::tokens::Tokens::RADIUS_LG))
+                .border(px(0.5))
+                .border_color(p.line)
+                .bg(p.md_code_block)
+                .px(px(12.))
+                .py(px(10.))
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .line_height(px(20.))
+                        .text_color(p.faint)
+                        .child("图片无法预览"),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(12.))
+                        .line_height(px(18.))
+                        .text_color(p.faint)
+                        .child(path),
+                )
+                .into_any_element(),
+        ),
+        crate::media::LocalImageState::Ready(local) => {
+            let source = crate::media::image_source(&local.data_url)?;
+            let width = local.width;
+            let height = local.height;
+            let name = if alt.trim().is_empty() {
+                path.clone()
+            } else {
+                alt.trim().to_owned()
+            };
+            let viewer = crate::web::ImageViewer {
+                data_url: local.data_url.clone(),
+                name: name.clone(),
+            };
+            Some(
+                column()
+                    .w_full()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .id(gpui::ElementId::Name(
+                                format!("md-image-{}", path.len()).into(),
+                            ))
+                            .role(gpui::Role::Button)
+                            .aria_label(format!("查看大图 {name}"))
+                            .tab_index(0)
+                            .w(px(width))
+                            .h(px(height))
+                            .rounded(px(crate::tokens::Tokens::RADIUS_LG))
+                            .overflow_hidden()
+                            .cursor_pointer()
+                            .child(
+                                gpui::img(source)
+                                    .size_full()
+                                    .object_fit(gpui::ObjectFit::Contain),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.image_viewer = Some(viewer.clone());
+                                cx.notify();
+                            })),
+                    )
+                    .when(!alt.trim().is_empty(), |element| {
+                        element.child(
+                            div()
+                                .text_size(px(12.))
+                                .line_height(px(18.))
+                                .text_color(p.faint)
+                                .child(alt.trim().to_owned()),
+                        )
+                    })
+                    .into_any_element(),
+            )
+        }
+    }
+}
+
 pub(super) fn render_markdown(
     source: &str,
     block_id: &str,
@@ -7641,53 +7702,61 @@ pub(super) fn render_markdown(
                 }
                 list.child(table)
             }
-            Block::Image { alt, url } => list.child(
-                column()
-                    .w_full()
-                    .gap(px(4.))
-                    .rounded(px(crate::tokens::Tokens::RADIUS_LG))
-                    .border(px(0.5))
-                    .border_color(p.line)
-                    .bg(p.md_code_block)
-                    .px(px(12.))
-                    .py(px(10.))
-                    .child(
-                        div()
-                            .text_size(px(13.))
-                            .line_height(px(20.))
-                            .text_color(p.ink)
-                            .child(markdown_leaf(
-                                if alt.is_empty() {
-                                    "图片".to_owned()
-                                } else {
-                                    alt.clone()
-                                },
-                                selected,
-                            )),
-                    )
-                    .child({
-                        let open = url.clone();
-                        div()
-                            .id(gpui::ElementId::Name(format!("img-link-{code_id}").into()))
-                            .role(gpui::Role::Link)
-                            .cursor_pointer()
-                            .text_size(px(12.))
-                            .line_height(px(18.))
-                            .text_color(p.link)
-                            .child(markdown_leaf(url, selection.map(|layout| (layout, "\n"))))
-                            .on_click(cx.listener({
-                                let selection = selection.cloned();
-                                move |_, event, _, _| {
-                                    if selection
-                                        .as_ref()
-                                        .is_none_or(|layout| layout.clicked_link(event))
-                                    {
-                                        bridge::open_url(&open);
-                                    }
-                                }
-                            }))
-                    }),
-            ),
+            Block::Image { alt, url } => {
+                match render_markdown_image(alt.as_str(), url.as_str(), cx) {
+                    Some(image) => list.child(image),
+                    None => list.child(
+                        column()
+                            .w_full()
+                            .gap(px(4.))
+                            .rounded(px(crate::tokens::Tokens::RADIUS_LG))
+                            .border(px(0.5))
+                            .border_color(p.line)
+                            .bg(p.md_code_block)
+                            .px(px(12.))
+                            .py(px(10.))
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .line_height(px(20.))
+                                    .text_color(p.ink)
+                                    .child(markdown_leaf(
+                                        if alt.is_empty() {
+                                            "图片".to_owned()
+                                        } else {
+                                            alt.clone()
+                                        },
+                                        selected,
+                                    )),
+                            )
+                            .child({
+                                let open = url.clone();
+                                div()
+                                    .id(gpui::ElementId::Name(format!("img-link-{code_id}").into()))
+                                    .role(gpui::Role::Link)
+                                    .cursor_pointer()
+                                    .text_size(px(12.))
+                                    .line_height(px(18.))
+                                    .text_color(p.link)
+                                    .child(markdown_leaf(
+                                        url,
+                                        selection.map(|layout| (layout, "\n")),
+                                    ))
+                                    .on_click(cx.listener({
+                                        let selection = selection.cloned();
+                                        move |_, event, _, _| {
+                                            if selection
+                                                .as_ref()
+                                                .is_none_or(|layout| layout.clicked_link(event))
+                                            {
+                                                bridge::open_url(&open);
+                                            }
+                                        }
+                                    }))
+                            }),
+                    ),
+                }
+            }
             Block::Code { lang, text } => {
                 // 官方：diff / patch 围栏以统一 diff 行代替普通代码内容。
                 let is_diff = matches!(lang.to_lowercase().as_str(), "diff" | "patch");
