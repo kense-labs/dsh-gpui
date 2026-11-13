@@ -342,16 +342,22 @@ pub fn apply_update(entries: &mut Vec<ChatEntry>, update: &Value) -> UpdateEffec
                     format!("{retry}/{maximum}")
                 });
             let status = string_field(update, "retryState");
-            let seconds = update
-                .get("delaySeconds")
-                .and_then(Value::as_u64)
+            // Official retry details show the scheduled delay in milliseconds; the
+            // summary's countdown seconds derive from the same number.
+            let delay_ms = update
+                .get("delayMs")
+                .and_then(|value| {
+                    value
+                        .as_u64()
+                        .or_else(|| value.as_f64().map(|ms| ms.round() as u64))
+                })
                 .or_else(|| {
                     update
-                        .get("delayMs")
+                        .get("delaySeconds")
                         .and_then(Value::as_u64)
-                        .map(|ms| (ms + 999) / 1000)
+                        .map(|seconds| seconds.saturating_mul(1000))
                 })
-                .unwrap_or(1);
+                .unwrap_or(1000);
             let text = update
                 .get("failure")
                 .and_then(|failure| failure.get("message"))
@@ -363,7 +369,7 @@ pub fn apply_update(entries: &mut Vec<ChatEntry>, update: &Value) -> UpdateEffec
             }) {
                 entry.title = title;
                 entry.status = status;
-                entry.input = seconds.to_string();
+                entry.input = delay_ms.to_string();
                 entry.text = text;
             } else {
                 entries.push(ChatEntry {
@@ -372,7 +378,7 @@ pub fn apply_update(entries: &mut Vec<ChatEntry>, update: &Value) -> UpdateEffec
                     role: EntryRole::Retry,
                     title,
                     text,
-                    input: seconds.to_string(),
+                    input: delay_ms.to_string(),
                     status,
                     tool: None,
                     at_ms: None,
@@ -2091,7 +2097,7 @@ mod tests {
         assert_eq!(entries[0].role, EntryRole::Retry);
         assert_eq!(entries[0].title, "1/5");
         assert_eq!(entries[0].status, "started");
-        assert_eq!(entries[0].input, "1");
+        assert_eq!(entries[0].input, "1000");
         assert_eq!(entries[0].text, "timeout");
         apply_update(
             &mut entries,
@@ -2108,7 +2114,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].title, "2/5");
         assert_eq!(entries[0].status, "active");
-        assert_eq!(entries[0].input, "3");
+        assert_eq!(entries[0].input, "3000");
     }
 
     #[test]

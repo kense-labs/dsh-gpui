@@ -2074,7 +2074,20 @@ function observeSessionUpdates(ctx) {
       };
     }
     if (type === 'tool/result') update.callId = data.message.source?.callId ?? data.message.toolCallId;
-    if (type === 'llm/retry') update.retryId = data.retryId;
+    if (type === 'llm/retry' || type === 'llm/retry-started') {
+      // The retry row shows the attempt, the countdown and (expanded) the delay
+      // and failure, so the facts travel with the update instead of only the id.
+      notify(session.id, {
+        sessionUpdate: 'model_retry',
+        retryId: data.retryId,
+        retry: data.retry,
+        maximum: data.maxRetries,
+        retryState: type === 'llm/retry-started' ? 'started' : 'scheduled',
+        delayMs: data.delayMs,
+        failure: data.failure,
+      });
+      return;
+    }
     if (type === 'turn/end') {
       update.reason = data.reason?.kind;
       // The client renders the terminal failure row (official TurnErrorItem),

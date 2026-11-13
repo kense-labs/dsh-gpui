@@ -661,13 +661,31 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                         _ => "5".to_string(),
                     })
                     .unwrap_or_else(|| "5".to_string());
+                let delay_ms = data
+                    .get("delayMs")
+                    .and_then(|value| {
+                        value
+                            .as_u64()
+                            .or_else(|| value.as_f64().map(|ms| ms.round() as u64))
+                    })
+                    .or_else(|| {
+                        data.get("delaySeconds")
+                            .and_then(Value::as_u64)
+                            .map(|seconds| seconds.saturating_mul(1000))
+                    })
+                    .unwrap_or(0);
+                let failure = data
+                    .pointer("/failure/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
                 out.entries.push(ChatEntry {
                     key: format!("hist-retry-{retry_id}"),
                     external_id: Some(retry_id),
                     role: EntryRole::Retry,
                     title: format!("{retry}/{maximum}"),
-                    text: String::new(),
-                    input: String::new(),
+                    text: failure,
+                    input: delay_ms.to_string(),
                     status: if kind == "llm/retry-started" {
                         "started".to_string()
                     } else {
@@ -1044,6 +1062,26 @@ mod tests {
         assert_eq!(marker.role, EntryRole::Compaction);
         assert_eq!(marker.status, "压缩摘要不可用");
         assert!(marker.text.is_empty());
+    }
+
+    #[test]
+    fn a_replayed_retry_keeps_its_attempt_delay_and_failure() {
+        let events = vec![json!({
+            "type": "llm/retry", "seq": 1101, "time": 1_794_470_385_595u64,
+            "data": {
+                "retryId": "bac9e992", "turn": 3, "step": 60,
+                "provider": "deepseek-official", "retry": 1, "maxRetries": 5,
+                "delayMs": 466.2,
+                "failure": {"message": "DeepSeek Messages transport failed", "code": "TRANSPORT"},
+            },
+        })];
+        let projected = project_session_events(&events);
+        let row = &projected.entries[0];
+        assert_eq!(row.role, EntryRole::Retry);
+        assert_eq!(row.title, "1/5");
+        assert_eq!(row.status, "scheduled");
+        assert_eq!(row.input, "466", "delay milliseconds for the details row");
+        assert_eq!(row.text, "DeepSeek Messages transport failed");
     }
 
     #[test]

@@ -7031,13 +7031,9 @@ fn render_command_card(entry: &ChatEntry, expanded: bool, cx: &mut Context<DshAp
     let expandable = body.as_deref().is_some_and(|text| text.contains('\n'));
     let open = expanded && expandable;
     let summary = match (running, failed) {
-        (true, _) => "正在执行指令".to_string(),
-        (false, true) => "指令执行失败".to_string(),
-        (false, false) => body
-            .as_deref()
-            .map(|text| text.lines().next().unwrap_or_default().trim().to_string())
-            .filter(|line| !line.is_empty())
-            .unwrap_or_else(|| "指令已执行".to_string()),
+        (true, _) => "执行中…".to_string(),
+        (false, true) => body.clone().unwrap_or_else(|| "指令失败".to_string()),
+        (false, false) => body.clone().unwrap_or_else(|| "已完成".to_string()),
     };
     let title = if entry.title.is_empty() {
         "指令".to_string()
@@ -7210,14 +7206,12 @@ fn render_model_retry(entry: &ChatEntry, expanded: bool, cx: &mut Context<DshApp
         "scheduled" => "等待重试模型请求",
         _ => "已重试模型请求",
     };
+    let delay_ms = entry.input.parse::<u64>().unwrap_or(0);
+    let seconds = delay_ms.div_ceil(1000).max(1);
     let attempt = if entry.title.is_empty() {
         label.to_string()
     } else {
-        format!(
-            "{label}（{}） · {}s",
-            entry.title,
-            entry.input.parse::<u32>().unwrap_or(1)
-        )
+        format!("{label}（{}） · {seconds}s", entry.title)
     };
     column()
         .w_full()
@@ -7256,18 +7250,26 @@ fn render_model_retry(entry: &ChatEntry, expanded: bool, cx: &mut Context<DshApp
                     cx.notify();
                 })),
         )
-        .when(expanded && !entry.text.is_empty(), |element| {
-            element.child(
-                column()
-                    .w_full()
-                    .pl(px(14.))
-                    .gap(px(2.))
-                    .text_size(px(12.))
-                    .line_height(px(18.))
-                    .text_color(p.secondary)
-                    .child(format!("失败原因：{}", entry.text)),
-            )
-        })
+        .when(
+            expanded && (delay_ms > 0 || !entry.text.is_empty()),
+            |element| {
+                element.child(
+                    column()
+                        .w_full()
+                        .pl(px(14.))
+                        .gap(px(2.))
+                        .text_size(px(12.))
+                        .line_height(px(18.))
+                        .text_color(p.secondary)
+                        .when(delay_ms > 0, |column| {
+                            column.child(format!("重试延迟：{delay_ms} 毫秒"))
+                        })
+                        .when(!entry.text.is_empty(), |column| {
+                            column.child(format!("失败原因：{}", entry.text))
+                        }),
+                )
+            },
+        )
 }
 
 pub(super) fn toggle_entry(expanded: &mut std::collections::HashSet<String>, key: &str) {
