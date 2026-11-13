@@ -3243,11 +3243,12 @@ impl DshApp {
     ) -> Option<gpui::Stateful<gpui::Div>> {
         let permission = self.conversation.permission.as_ref()?;
         let p = dsh(cx);
-        let title = permission
-            .tool_call
-            .get("title")
-            .and_then(Value::as_str)
-            .unwrap_or("工具调用");
+        // 官方 escalation 文案里的工具名：ACP 权限请求可能只带 toolCallId，
+        // 名字从会话里的工具行取（映射为官方中文工具名）。
+        let subject = crate::approval_command::approval_tool_label(
+            &permission.tool_call,
+            &self.conversation.entries,
+        );
         let mut actions = row().w_full().justify_end().gap(px(8.));
         // 官方：拒绝 → 允许 → 始终允许；有「始终允许」时只有它是主按钮。
         let mut options = permission.options.clone();
@@ -3266,6 +3267,7 @@ impl DshApp {
             .any(|(id, _)| id.to_lowercase().contains("always"));
         for (id, name) in &options {
             let option_id = id.clone();
+            let label = crate::approval_command::approval_option_label(id, name);
             let primary = if has_always {
                 id.to_lowercase().contains("always")
             } else {
@@ -3278,7 +3280,7 @@ impl DshApp {
             };
             actions = actions.child(
                 button
-                    .label(name.clone())
+                    .label(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.respond_permission(option_id.clone(), cx);
                     }))
@@ -3333,7 +3335,12 @@ impl DshApp {
                                 .text_size(px(12.))
                                 .line_height(px(18.))
                                 .text_color(p.secondary)
-                                .child(format!("工具 {title} 请求越权执行")),
+                                .child(match &subject {
+                                    Some(subject) => {
+                                        format!("工具 {subject} 请求越权执行")
+                                    }
+                                    None => "工具请求越权执行".to_owned(),
+                                }),
                         ),
                 )
                 .when_some(command, |card, command| {

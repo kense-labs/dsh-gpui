@@ -43,6 +43,63 @@ pub(crate) fn approval_command(tool_call: &Value, entries: &[ChatEntry]) -> Opti
     (!command.is_empty()).then(|| command.to_owned())
 }
 
+/// Official `approval.escalation` subject: the display name of the tool that
+/// asks for privileged execution.
+///
+/// ACP permission requests may carry only the `toolCallId`, so the name comes
+/// from the correlated transcript tool row when the request has no `title`.
+pub(crate) fn approval_tool_label(tool_call: &Value, entries: &[ChatEntry]) -> Option<String> {
+    if let Some(title) = tool_call
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+    {
+        return Some(title.to_owned());
+    }
+    let call_id = tool_call.get("toolCallId").and_then(Value::as_str)?;
+    let entry = entries.iter().find(|entry| {
+        entry.role == EntryRole::Tool && entry.external_id.as_deref() == Some(call_id)
+    })?;
+    Some(tool_label(entry.tool_name()))
+}
+
+/// Localized name of one tool, as the escalation line reads it.
+fn tool_label(name: &str) -> String {
+    match name {
+        "bash" | "sh" | "shell" | "command" | "run" | "terminal_send" | "terminal" => {
+            "运行命令".to_owned()
+        }
+        "read" | "cat" => "读取文件".to_owned(),
+        "write" | "edit" | "apply_patch" | "multi_edit" | "str_replace" => "编辑文件".to_owned(),
+        "delete" | "remove" | "rm" => "删除文件".to_owned(),
+        "grep" | "glob" | "search" | "find" | "rg" => "搜索文件".to_owned(),
+        "web_fetch" | "web_search" | "fetch" => "访问网络".to_owned(),
+        "present" => "交付文件".to_owned(),
+        "todo_write" => "更新待办".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+/// Official decision-button label for one ACP permission option.
+///
+/// The ACP names are English (`Allow once`, `Reject`); the card shows the
+/// official `approval.*` copy instead, keeping an unknown option's own name.
+pub(crate) fn approval_option_label(option_id: &str, name: &str) -> String {
+    let id = option_id.to_lowercase();
+    if id.contains("reject") || id.contains("deny") || id.contains("cancel") {
+        "拒绝".to_owned()
+    } else if id.contains("always") {
+        "始终允许".to_owned()
+    } else if id.contains("once") {
+        "允许一次".to_owned()
+    } else if id.contains("allow") {
+        "允许".to_owned()
+    } else {
+        name.to_owned()
+    }
+}
+
 /// Read `rawInput` as an object, or as a JSON string holding one.
 fn raw_arguments(raw: Option<&Value>) -> Option<Value> {
     match raw? {
@@ -133,5 +190,41 @@ mod tests {
         assert_eq!(approval_command(&empty, &[]), None);
         let broken = json!({"toolCallId": "call-7", "rawInput": "{not json"});
         assert_eq!(approval_command(&broken, &[]), None);
+    }
+
+    #[test]
+    fn tool_subject_and_decision_labels_are_localized() {
+        // The request's own title wins when the Host sends one.
+        let request = json!({"toolCallId": "call-8", "title": "自定义工具"});
+        assert_eq!(
+            approval_tool_label(&request, &[]).as_deref(),
+            Some("自定义工具")
+        );
+        // Otherwise the correlated tool row names the tool.
+        let entries = vec![tool_entry("call-9", "bash", json!({"command": "ls"}))];
+        assert_eq!(
+            approval_tool_label(&json!({"toolCallId": "call-9"}), &entries).as_deref(),
+            Some("运行命令")
+        );
+        let entries = vec![tool_entry("call-10", "apply_patch", json!({}))];
+        assert_eq!(
+            approval_tool_label(&json!({"toolCallId": "call-10"}), &entries).as_deref(),
+            Some("编辑文件")
+        );
+        assert_eq!(
+            approval_tool_label(&json!({"toolCallId": "missing"}), &[]),
+            None
+        );
+        assert_eq!(
+            approval_option_label("allow-once", "Allow once"),
+            "允许一次"
+        );
+        assert_eq!(approval_option_label("allow", "Allow once"), "允许");
+        assert_eq!(
+            approval_option_label("always-allow", "Allow always"),
+            "始终允许"
+        );
+        assert_eq!(approval_option_label("reject-once", "Reject"), "拒绝");
+        assert_eq!(approval_option_label("custom-option", "Keep"), "Keep");
     }
 }
