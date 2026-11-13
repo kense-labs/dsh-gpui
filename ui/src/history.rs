@@ -142,6 +142,45 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
             out.entries.push(reply);
         }
         match kind {
+            // Tool-registry notices: a developer message whose content blocks add
+            // or remove tools. The official transcript shows the
+            // ContextInjectionRow tool variant, so a reopened session must too.
+            "developer/message" => {
+                let source = data
+                    .pointer("/message/source/kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if source == "tool-registry" {
+                    let cells: Vec<Value> = data
+                        .pointer("/message/content")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|block| {
+                            let kind = block.get("type").and_then(Value::as_str)?;
+                            let added = match kind {
+                                "tool-addition" => true,
+                                "tool-removal" => false,
+                                _ => return None,
+                            };
+                            Some(serde_json::json!({
+                                "added": added,
+                                "name": block.get("toolName").cloned().unwrap_or(Value::Null),
+                            }))
+                        })
+                        .collect();
+                    let changes = crate::state::tool_changes(&Value::Array(cells));
+                    if !changes.is_empty() {
+                        let id = data
+                            .pointer("/message/id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| format!("hist-tool-change-{}", out.entries.len()));
+                        out.entries
+                            .push(crate::state::tool_change_entry(&id, &changes, at_ms));
+                    }
+                }
+            }
             "user/message" => {
                 if data.pointer("/source/kind").and_then(Value::as_str) == Some("user")
                     && let Some(time) = event["time"].as_u64()
@@ -793,6 +832,63 @@ mod tests {
         assert_eq!(projected.entries[0].title, "系统提示词");
         assert!(projected.entries[0].text.contains("DeepSeek Harness"));
         assert_eq!(projected.entries[0].key, "system-prompt-8");
+    }
+
+    #[test]
+    fn a_tool_registry_notice_replays_as_the_official_tool_change_row() {
+        let events = vec![json!({
+            "type": "developer/message", "seq": 4351, "time": 1_794_486_299_033u64,
+            "data": {
+                "turn": 8, "step": 1,
+                "message": {
+                    "source": {"kind": "tool-registry"},
+                    "content": [
+                        {"type": "tool-addition", "toolName": "wait_agent"},
+                        {"type": "tool-removal", "toolName": "interrupt_agent"},
+                    ],
+                    "role": "developer",
+                    "id": "fcc67030-3a46-4e1d-9053-8ff17cb800b8",
+                },
+                "headerSeq": 4350,
+            },
+            "surfaceOp": "append",
+        })];
+        let projected = project_session_events(&events);
+        let change = projected
+            .entries
+            .iter()
+            .find(|entry| entry.role == EntryRole::ToolChange)
+            .expect("the tool notice is a row");
+        assert_eq!(change.title, "工具已更新");
+        assert_eq!(change.status, "新增 1 个，移除 1 个");
+        assert!(change.text.contains("新增：wait_agent"));
+        assert!(change.text.contains("移除：interrupt_agent"));
+        assert_eq!(
+            change.external_id.as_deref(),
+            Some("fcc67030-3a46-4e1d-9053-8ff17cb800b8")
+        );
+    }
+
+    #[test]
+    fn a_single_tool_change_names_the_tool_in_the_title() {
+        let events = vec![json!({
+            "type": "developer/message", "seq": 7, "time": 1_794_486_300_000u64,
+            "data": {
+                "turn": 1, "step": 1,
+                "message": {
+                    "source": {"kind": "tool-registry"},
+                    "content": [{"type": "tool-addition", "toolName": "bash"}],
+                    "role": "developer",
+                    "id": "single-change",
+                },
+            },
+        })];
+        let projected = project_session_events(&events);
+        let change = &projected.entries[0];
+        assert_eq!(change.role, EntryRole::ToolChange);
+        assert_eq!(change.title, "已添加工具：bash");
+        assert!(change.status.is_empty());
+        assert!(change.text.is_empty());
     }
 
     #[test]

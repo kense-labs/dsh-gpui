@@ -67,6 +67,8 @@ pub enum EntryRole {
     Error,
     /// 官方 TurnMaxTokensItem：本轮撞到输出 token 上限的警告行。
     Warning,
+    /// 官方 ContextInjectionRow 的工具变更变体：`developer/message` 的工具增删通知。
+    ToolChange,
 }
 
 /// One message, thought, tool invocation, or local status row.
@@ -747,6 +749,18 @@ fn apply_context_injection(entries: &mut Vec<ChatEntry>, update: &Value) {
         return;
     }
     let source = string_field(update, "sourceKind");
+    let changes = tool_changes(&update["toolChanges"]);
+    if !changes.is_empty() {
+        let entry = tool_change_entry(&id, &changes, update.get("time").and_then(Value::as_f64));
+        if let Some(existing) = entries.iter_mut().find(|entry| {
+            entry.role == EntryRole::ToolChange && entry.external_id.as_deref() == Some(id.as_str())
+        }) {
+            *existing = entry;
+        } else {
+            entries.push(entry);
+        }
+        return;
+    }
     let text = context_entries_text(update);
     let title = context_source_label(&source).to_owned();
     let status = if update["update"] == true {
@@ -793,6 +807,7 @@ fn role_name(role: EntryRole) -> &'static str {
         EntryRole::System => "system",
         EntryRole::Error => "error",
         EntryRole::Warning => "warning",
+        EntryRole::ToolChange => "tool-change",
     }
 }
 
@@ -919,6 +934,86 @@ pub fn turn_max_tokens_entry(turn: u64, at_ms: Option<f64>) -> ChatEntry {
         text: "回答被截断，已有输出保留在对话中。发送“继续”可让模型接着输出。".into(),
         input: String::new(),
         status: String::new(),
+        tool: None,
+        at_ms,
+    }
+}
+
+/// One tool-registry change from a `developer/message` tool notice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolChange {
+    pub added: bool,
+    pub name: String,
+}
+
+/// Parse the `toolChanges` array shared by live updates and replayed events.
+pub fn tool_changes(value: &Value) -> Vec<ToolChange> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|change| {
+            let name = change
+                .get("name")
+                .and_then(Value::as_str)?
+                .trim()
+                .to_owned();
+            if name.is_empty() {
+                return None;
+            }
+            Some(ToolChange {
+                added: change.get("added").and_then(Value::as_bool).unwrap_or(true),
+                name,
+            })
+        })
+        .collect()
+}
+
+/// ChatEntry for a tool-registry notice: the official ContextInjectionRow picks
+/// 已添加工具：{name} / 已移除工具：{name} for a single change, and 工具已更新 with
+/// a 新增 N 个 / 移除 N 个 summary plus 新增：names / 移除：names body otherwise.
+pub fn tool_change_entry(id: &str, changes: &[ToolChange], at_ms: Option<f64>) -> ChatEntry {
+    let added: Vec<&str> = changes
+        .iter()
+        .filter(|change| change.added)
+        .map(|change| change.name.as_str())
+        .collect();
+    let removed: Vec<&str> = changes
+        .iter()
+        .filter(|change| !change.added)
+        .map(|change| change.name.as_str())
+        .collect();
+    let (title, status, text) = if changes.len() == 1 {
+        let change = &changes[0];
+        let title = if change.added {
+            format!("已添加工具：{}", change.name)
+        } else {
+            format!("已移除工具：{}", change.name)
+        };
+        (title, String::new(), String::new())
+    } else {
+        let mut lines = Vec::new();
+        if !added.is_empty() {
+            lines.push(format!("新增：{}", added.join("、")));
+        }
+        if !removed.is_empty() {
+            lines.push(format!("移除：{}", removed.join("、")));
+        }
+        let summary = match (added.len(), removed.len()) {
+            (count, 0) => format!("新增 {count} 个"),
+            (0, count) => format!("移除 {count} 个"),
+            (added, removed) => format!("新增 {added} 个，移除 {removed} 个"),
+        };
+        ("工具已更新".to_owned(), summary, lines.join("\n"))
+    };
+    ChatEntry {
+        key: format!("tool-change-{id}"),
+        external_id: Some(id.to_owned()),
+        role: EntryRole::ToolChange,
+        title,
+        text,
+        input: String::new(),
+        status,
         tool: None,
         at_ms,
     }

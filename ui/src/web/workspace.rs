@@ -6212,6 +6212,7 @@ fn render_entry(
         EntryRole::Retry => render_model_retry(entry, expanded, cx),
         EntryRole::Command => render_command_card(entry, expanded, cx),
         EntryRole::Context => render_context_injection(entry, expanded, cx),
+        EntryRole::ToolChange => render_tool_change(entry, expanded, cx),
         EntryRole::SystemPrompt => render_system_prompt(entry, expanded, cx),
         EntryRole::Job => render_job_row(entry, expanded, cx),
         EntryRole::System if entry.title == "turn-end" => row().w_full().justify_start().child(
@@ -6429,6 +6430,80 @@ fn job_elapsed_label(entry: &ChatEntry) -> Option<String> {
 ///
 /// 技能目录是常驻的一类（`skill-catalog`）；它不显示为聊天气泡，也不触发一轮
 /// 回复，只作为可展开的注入记录留在对话流里。
+/// 官方 ContextInjectionRow 的工具变更变体：browse 图标 + 标题 + 摘要 + 展开后的
+/// 新增/移除名单。单条变更不可展开（和官方一致）。
+fn render_tool_change(entry: &ChatEntry, expanded: bool, cx: &mut Context<DshApp>) -> gpui::Div {
+    let p = dsh(cx);
+    let key = entry.key.clone();
+    let body = entry.text.clone();
+    let expandable = !body.trim().is_empty();
+    let open = expanded && expandable;
+    let toggle_key = key.clone();
+    let mut row = row()
+        .id(gpui::ElementId::Name(format!("tool-change-{key}").into()))
+        .role(gpui::Role::Button)
+        .aria_label(format!("{} {}", entry.title, entry.status))
+        .aria_expanded(open)
+        .tab_index(0)
+        .tab_stop(expandable)
+        .w_full()
+        .gap(px(7.))
+        .items_center()
+        .rounded(px(8.))
+        .h(px(24.))
+        .px(px(2.))
+        .when(expandable, |row| {
+            row.cursor_pointer().hover(|style| style.bg(p.hover))
+        })
+        .text_color(p.faint)
+        .child(icon(Glyph::Card, 14., p.faint))
+        .child(
+            div()
+                .flex_none()
+                .text_size(px(13.))
+                .line_height(px(20.))
+                .child(entry.title.clone()),
+        )
+        .when(!entry.status.is_empty(), |row| {
+            row.child(div().flex_none().size(px(2.)).rounded_full().bg(p.faint))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(13.))
+                        .line_height(px(20.))
+                        .child(entry.status.clone()),
+                )
+        });
+    if expandable {
+        row = row
+            .child(icon(
+                if open { Glyph::Up } else { Glyph::Down },
+                12.,
+                p.faint,
+            ))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                toggle_entry(&mut this.conversation.expanded_entries, &toggle_key);
+                cx.notify();
+            }));
+    }
+    let mut card = column().w_full().child(row);
+    if open {
+        card = card.child(
+            div()
+                .w_full()
+                .pl(px(21.))
+                .pt(px(4.))
+                .text_size(px(12.))
+                .line_height(px(18.))
+                .text_color(p.secondary)
+                .child(body),
+        );
+    }
+    card
+}
+
 fn render_context_injection(
     entry: &ChatEntry,
     expanded: bool,

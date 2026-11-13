@@ -1947,6 +1947,26 @@ function observeSessionUpdates(ctx) {
       });
       return;
     }
+    // Tool-registry notices are `developer/message` events whose content is a
+    // list of tool additions/removals. The official transcript renders them as
+    // ContextInjectionRow variants (已添加工具：… / 工具已更新 + 新增/移除 lists);
+    // without this they never reach the UI at all.
+    if (type === 'developer/message') {
+      const source = data.source?.kind ?? data.message?.source?.kind;
+      if (source !== 'tool-registry') return;
+      const changes = (Array.isArray(data.content) ? data.content : [])
+        .filter(block => block?.type === 'tool-addition' || block?.type === 'tool-removal')
+        .map(block => ({ added: block.type === 'tool-addition', name: block.toolName }));
+      if (changes.length === 0) return;
+      notify(session.id, {
+        sessionUpdate: 'context_injection',
+        messageId: data.message?.id ?? `tool-registry-${event.seq}`,
+        sourceKind: 'tool-registry',
+        toolChanges: changes,
+        time: event.time,
+      });
+      return;
+    }
     // Direct-child discovery facts are what the official lineage catalog lists;
     // the parent run can open each child's transcript from them.
     if (type === 'subagent/catalog') {
