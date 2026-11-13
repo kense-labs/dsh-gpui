@@ -2725,11 +2725,10 @@ impl DshApp {
         let total = items.len();
         // Official rail: fixed 10px pitch between marks, capped at 420px tall.
         // Once a session has more turns than that cap fits, compress the pitch
-        // (never the other way around) so every turn stays reachable.
+        // (never the other way around) so every turn stays reachable. Each mark
+        // box is exactly one pitch tall; the tick scales in place inside it.
         let pitch = (420. / total as f32).clamp(3., 10.);
-        let mark_height = (pitch - 2.).clamp(2., 8.);
-        let gap = (pitch - mark_height).max(1.);
-        let mut marks = column().w_full().gap(px(gap)).items_center();
+        let mut marks = column().w_full().items_center().gap(px(0.));
         for (index, item) in items.iter().enumerate() {
             let is_active = active == Some(index);
             let anchor = item.anchor.clone();
@@ -2742,20 +2741,28 @@ impl DshApp {
                 .aria_label(label)
                 .tab_index(0)
                 .w_full()
-                .h(px(mark_height))
+                .h(px(pitch))
                 .flex()
                 .items_center()
-                .justify_center()
+                .justify_end()
                 .cursor_pointer()
                 .child(
                     div()
-                        .w(px(if hover == Some(index) { 14. } else { 10. }))
-                        .h(px(if mark_height >= 4. { 2. } else { 1. }))
-                        .rounded_full()
-                        .bg(if is_active || hover == Some(index) {
-                            p.ink
+                        .w(px(if is_active {
+                            20.
+                        } else if hover == Some(index) {
+                            18.
                         } else {
-                            p.line
+                            12.
+                        }))
+                        .h(px(if pitch >= 4. { 2. } else { 1. }))
+                        .rounded_full()
+                        .bg(if is_active {
+                            p.ink
+                        } else if hover == Some(index) {
+                            p.faint
+                        } else {
+                            p.border_l4
                         }),
                 )
                 .on_hover(cx.listener(move |this, inside: &bool, _, cx| {
@@ -2813,43 +2820,43 @@ impl DshApp {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let p = dsh(cx);
+        let (prompt, response) = crate::turns::preview_lines(item);
+        // Official preview prompt falls back to the turn number when the turn
+        // has no user text (a trigger-only turn).
+        let prompt = if prompt.is_empty() {
+            format!("第 {} 轮", item.turn)
+        } else {
+            prompt
+        };
         let mut preview = column()
             .absolute()
-            .right(px(22.))
+            .right(px(30.))
             .top(px(-6.))
-            .w(px(240.))
-            .gap(px(3.))
-            .px(px(10.))
-            .py(px(8.))
-            .rounded(px(10.))
-            .border(px(0.5))
-            .border_color(p.line)
+            .w(px(300.))
+            .px(px(12.))
+            .py(px(10.))
+            .rounded(px(12.))
             .bg(p.stage)
-            .shadow(crate::tokens::elevation_prominent())
+            .shadow(crate::tokens::elevation_panel())
             .occlude()
             .child(
                 div()
-                    .text_size(px(11.))
-                    .line_height(px(16.))
-                    .text_color(p.faint)
-                    .child(format!("第 {} 轮", item.turn)),
-            )
-            .child(
-                div()
                     .truncate()
-                    .text_size(px(12.))
-                    .line_height(px(18.))
-                    .text_color(p.secondary)
-                    .child(item.prompt.clone()),
+                    .text_size(px(13.))
+                    .line_height(px(20.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(p.ink)
+                    .child(prompt),
             );
-        if !item.response.is_empty() {
+        if !response.is_empty() {
             preview = preview.child(
                 div()
-                    .truncate()
+                    .mt(px(4.))
+                    .line_clamp(3)
                     .text_size(px(12.))
                     .line_height(px(18.))
                     .text_color(p.faint)
-                    .child(item.response.clone()),
+                    .child(response),
             );
         }
         preview
