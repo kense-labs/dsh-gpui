@@ -46,8 +46,72 @@ impl ShellProfile {
         }
         cmd.env("DSH_SESSION_ID", session);
         cmd.env("TERM", "xterm-256color");
+        #[cfg(unix)]
+        ensure_utf8_locale(&mut cmd);
         cmd
     }
+}
+
+/// zsh renders UTF-8 prompt characters as literal `\M-^X` sequences when its
+/// effective locale is C/POSIX. GUI launches (Finder / launchd) inherit no
+/// LANG at all, so force a UTF-8 locale unless one is already configured.
+#[cfg(unix)]
+fn ensure_utf8_locale(cmd: &mut CommandBuilder) {
+    let vars: Vec<(&str, Option<String>)> = ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .map(|key| (*key, env::var(key).ok()))
+        .collect();
+    if !needs_utf8_locale(&vars) {
+        return;
+    }
+    // macOS ships en_US.UTF-8; C.UTF-8 is available on modern Linux/glibc.
+    let locale = if cfg!(target_os = "macos") {
+        "en_US.UTF-8"
+    } else {
+        "C.UTF-8"
+    };
+    // LC_ALL takes precedence over LANG, so replace it too when it is C/POSIX.
+    cmd.env("LC_ALL", locale);
+    cmd.env("LC_CTYPE", locale);
+    cmd.env("LANG", locale);
+}
+
+fn is_utf8_locale(value: &str) -> bool {
+    let upper = value.to_ascii_uppercase();
+    upper.contains("UTF-8") || upper.contains("UTF8")
+}
+
+/// The first non-empty variable in precedence order decides whether the shell
+/// will treat multi-byte characters as printable.
+fn needs_utf8_locale(vars: &[(&str, Option<String>)]) -> bool {
+    for (_, value) in vars {
+        if let Some(value) = value.as_deref().filter(|value| !value.is_empty()) {
+            return !is_utf8_locale(value);
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+#[test]
+fn forces_a_utf8_locale_when_the_effective_locale_is_not_multibyte() {
+    let vars = |entries: &[(&'static str, &'static str)]| {
+        entries
+            .iter()
+            .map(|(key, value)| (*key, Some((*value).to_owned())))
+            .collect::<Vec<(&str, Option<String>)>>()
+    };
+    assert!(needs_utf8_locale(&vars(&[])));
+    assert!(needs_utf8_locale(&vars(&[("LANG", "C")])));
+    assert!(needs_utf8_locale(&vars(&[
+        ("LC_ALL", "POSIX"),
+        ("LANG", "en_US.UTF-8"),
+    ])));
+    assert!(!needs_utf8_locale(&vars(&[("LANG", "zh_CN.UTF-8")])));
+    assert!(!needs_utf8_locale(&vars(&[
+        ("LC_CTYPE", "en_US.UTF-8"),
+        ("LANG", "C"),
+    ])));
 }
 
 fn shell_kind(name: &str) -> String {
