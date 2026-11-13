@@ -120,30 +120,29 @@ pub fn search_workspace(
             incomplete = true;
             break;
         }
+        // Directories derive from listed files. A directory can match the
+        // query on its own name (or path) even when no file under it matches,
+        // so every ancestor participates independently — the official
+        // `workspaceFiles.search` admits those directories too.
+        let mut prefix = String::new();
+        let segments: Vec<&str> = relative.split('/').collect();
+        for segment in &segments[..segments.len().saturating_sub(1)] {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(segment);
+            let haystack = if match_path {
+                prefix.as_str()
+            } else {
+                *segment
+            };
+            if haystack.to_lowercase().contains(&needle) {
+                answers.entry(prefix.clone()).or_insert("directory");
+            }
+        }
         let name = relative.rsplit('/').next().unwrap_or(&relative);
         let haystack = if match_path { relative.as_str() } else { name };
         if !haystack.to_lowercase().contains(&needle) {
-            // Ancestor directories of a match still participate below.
-            let mut parent = relative.as_str();
-            let mut ancestors = Vec::new();
-            while let Some((head, _)) = parent.rsplit_once('/') {
-                ancestors.push(head.to_owned());
-                parent = head;
-            }
-            let mut matched_ancestor = false;
-            for ancestor in ancestors {
-                let ancestor_name = ancestor.rsplit('/').next().unwrap_or(&ancestor);
-                let haystack = if match_path {
-                    ancestor.as_str()
-                } else {
-                    ancestor_name
-                };
-                if haystack.to_lowercase().contains(&needle) {
-                    answers.entry(ancestor).or_insert("directory");
-                    matched_ancestor = true;
-                }
-            }
-            let _ = matched_ancestor;
             continue;
         }
         answers.insert(relative.clone(), "file");
@@ -260,6 +259,21 @@ mod tests {
             depths.windows(2).all(|pair| pair[0] <= pair[1]),
             "shallow first"
         );
+    }
+
+    #[test]
+    fn matching_directories_appear_without_a_matching_file() {
+        let dir = workspace();
+        fs::write(dir.path().join("src/lib.rs"), "").unwrap();
+        // No file is named `src`, but the directory itself matches the query.
+        let answer = search_workspace(dir.path(), "src", false, true, &[]).unwrap();
+        assert!(paths(&answer).contains(&"src"));
+        // `nested` does not contain the query, so it is not admitted on its own.
+        assert!(!paths(&answer).contains(&"src/nested"));
+        // A slashed query matches directory paths the same way.
+        let answer = search_workspace(dir.path(), "src/nested", false, true, &[]).unwrap();
+        assert!(paths(&answer).contains(&"src/nested"));
+        assert!(paths(&answer).contains(&"src/nested/helper.rs"));
     }
 
     #[test]

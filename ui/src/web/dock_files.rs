@@ -457,6 +457,32 @@ impl DshApp {
                     })),
             )
             .child(
+                // The official gear sits beside search; the header keeps the
+                // same control on a hit-testable row in this client.
+                div()
+                    .id("files-search-settings")
+                    .role(gpui::Role::Button)
+                    .aria_label("搜索设置")
+                    .tab_index(0)
+                    .size(px(24.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .text_color(if self.files_search_settings_open {
+                        p.label_primary
+                    } else {
+                        p.label_tertiary
+                    })
+                    .hover(|style| style.bg(p.hover))
+                    .child(icon(Glyph::Settings, 15., p.faint))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.files_search_settings_open = !this.files_search_settings_open;
+                        cx.notify();
+                    })),
+            )
+            .child(
                 self.dock_button(DockControl::FilesRefresh(pane), "重新读取", false, cx)
                     .group("files-refresh")
                     .child(
@@ -483,31 +509,6 @@ impl DshApp {
                     .flex_1()
                     .min_w_0()
                     .child(input(&self.files_search_editor, cx)),
-            )
-            .child(
-                div()
-                    .id("files-search-settings")
-                    .role(gpui::Role::Button)
-                    .aria_label("搜索设置")
-                    .tab_index(0)
-                    .size(px(28.))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(6.))
-                    .cursor_pointer()
-                    .text_color(if self.files_search_settings_open {
-                        p.label_primary
-                    } else {
-                        p.label_tertiary
-                    })
-                    .hover(|style| style.bg(p.hover))
-                    .child(icon(Glyph::Settings, 15., p.faint))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.files_search_settings_open = !this.files_search_settings_open;
-                        cx.notify();
-                    })),
             );
         let page = page.child(header).child(search_bar).child(
             if self.files_search.query.trim().is_empty() {
