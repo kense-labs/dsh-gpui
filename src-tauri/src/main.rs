@@ -93,6 +93,7 @@ fn main() {
             history::list_local_sessions,
             history::read_attachment,
             history::read_image_file,
+            history::turn_token_usage,
             acp::close_session,
             acp::set_session_archived,
             acp::prompt,

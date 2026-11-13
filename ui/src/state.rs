@@ -1111,6 +1111,62 @@ pub fn tool_change_entry(id: &str, changes: &[ToolChange], at_ms: Option<f64>) -
     }
 }
 
+/// One turn's token buckets (official TurnUsagePanel data).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TurnTokenUsage {
+    pub total_tokens: u64,
+    pub input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub output_tokens: u64,
+    /// `provider/model` routes used by the turn.
+    pub routes: Vec<String>,
+}
+
+impl TurnTokenUsage {
+    /// Cache-hit share of the prompt side, as the official panel prints it.
+    pub fn cache_hit_percent(&self) -> Option<u64> {
+        let prompt = self.input_tokens + self.cache_read_tokens + self.cache_write_tokens;
+        if prompt == 0 || self.cache_read_tokens == 0 {
+            return None;
+        }
+        Some((self.cache_read_tokens.saturating_mul(100) + prompt / 2) / prompt)
+    }
+}
+
+/// Parse the native per-turn usage reply into a turn-keyed map.
+pub fn turn_usage_map(reply: &Value) -> std::collections::HashMap<u64, TurnTokenUsage> {
+    reply
+        .get("turns")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|turn| {
+            let turn_number = turn.get("turn").and_then(Value::as_u64)?;
+            let read = |key: &str| turn.get(key).and_then(Value::as_u64).unwrap_or(0);
+            let routes = turn
+                .get("routes")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect();
+            Some((
+                turn_number,
+                TurnTokenUsage {
+                    total_tokens: read("totalTokens"),
+                    input_tokens: read("inputTokens"),
+                    cache_read_tokens: read("cacheReadTokens"),
+                    cache_write_tokens: read("cacheWriteTokens"),
+                    output_tokens: read("outputTokens"),
+                    routes,
+                },
+            ))
+        })
+        .collect()
+}
+
 /// Official `CompactionItem`: the marker left where the model history was
 /// compacted. `items`/`tokens` are the shadowed counts from `compaction/summary`;
 /// the summary text is markdown and only present when the log still carries it.
@@ -1382,7 +1438,8 @@ mod tests {
     use super::{
         ChatEntry, EntryRole, adopt_logged_user_message, apply_update, context_entries_text,
         context_source_label, is_auth_failure, job_detail_text, job_status_label,
-        prompt_failure_message, trigger_title, turn_failure, turn_failure_entry, validate_api_key,
+        prompt_failure_message, trigger_title, turn_failure, turn_failure_entry, turn_usage_map,
+        validate_api_key,
     };
     use serde_json::json;
 
@@ -1714,7 +1771,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn a_background_job_registers_and_settles_on_one_row() {
         // Payloads copied from a real `job/registered` / `job/settled` pair in
         // ~/.dsh so the row stays pinned to what the host writes.
@@ -2004,6 +2060,28 @@ mod tests {
             assert!(!effect.turn_triggered);
         }
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn turn_usage_map_reads_buckets_and_cache_hit() {
+        let reply = serde_json::json!({"turns": [
+            {"turn": 1, "inputTokens": 100, "cacheReadTokens": 300, "cacheWriteTokens": 0,
+             "outputTokens": 50, "totalTokens": 450,
+             "routes": ["deepseek-official/deepseek-v4.1-flash"]},
+            {"turn": 2, "inputTokens": 10, "cacheReadTokens": 0, "cacheWriteTokens": 0,
+             "outputTokens": 5, "totalTokens": 15, "routes": []},
+        ]});
+        let map = turn_usage_map(&reply);
+        assert_eq!(map.len(), 2);
+        let first = &map[&1];
+        assert_eq!(first.total_tokens, 450);
+        assert_eq!(first.routes, vec!["deepseek-official/deepseek-v4.1-flash"]);
+        // 300 of 400 prompt tokens came from cache.
+        assert_eq!(first.cache_hit_percent(), Some(75));
+        // No cached input means the row is omitted.
+        assert_eq!(map[&2].cache_hit_percent(), None);
+        assert_eq!(map[&2].total_tokens, 15);
+        assert!(turn_usage_map(&serde_json::json!({})).is_empty());
     }
 
     #[test]

@@ -84,6 +84,8 @@ pub(super) struct Conversation {
     /// render from the turn's produced paths and deliveries).
     pub(super) mention_vocab:
         std::collections::HashMap<String, crate::mentions::FileMentionVocabulary>,
+    /// Per-turn token usage read from the session log (official TurnUsagePanel).
+    pub(super) turn_usage: std::collections::HashMap<u64, crate::state::TurnTokenUsage>,
 }
 
 impl Conversation {
@@ -156,6 +158,21 @@ impl Conversation {
         self.next_local_id += 1;
         entry.at_ms = Some(bridge::now_ms());
         self.entries.push(entry);
+    }
+
+    /// Turn number of one transcript row: every user-role row opens a turn, the
+    /// same numbering the host writes into `turn/start`.
+    pub(super) fn turn_number_for(&self, key: &str) -> Option<u64> {
+        let mut turn = 0u64;
+        for entry in &self.entries {
+            if entry.role == EntryRole::User {
+                turn = turn.saturating_add(1);
+            }
+            if entry.key == key {
+                return (turn > 0).then_some(turn);
+            }
+        }
+        None
     }
 
     /// Turn number of the most recent turn already on screen: one turn per

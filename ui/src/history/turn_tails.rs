@@ -13,6 +13,8 @@ struct Turn {
 struct ClosingAnswer {
     branch_boundary: Option<u64>,
     plan_tail: Option<String>,
+    /// Turn number the closing answer belongs to.
+    turn: u64,
 }
 
 /// Match the closing finalized text answer for each ended turn. Sequence
@@ -31,6 +33,11 @@ impl TurnTails {
 
     pub(crate) fn branch_boundary(&self, message: &str) -> Option<u64> {
         self.answers.get(message)?.branch_boundary
+    }
+
+    /// Turn number of one closing answer message.
+    pub(crate) fn answer_turn(&self, message: &str) -> Option<u64> {
+        self.answers.get(message).map(|answer| answer.turn)
     }
 
     pub(crate) fn follows_plan(&self, message: &str) -> bool {
@@ -175,6 +182,7 @@ impl TurnTails {
                     ClosingAnswer {
                         branch_boundary: (latest == Some(*seq)).then_some(end),
                         plan_tail: turn.plan_tail.clone(),
+                        turn: number,
                     },
                 );
                 if let Some(call_id) = &turn.plan_tail {
@@ -214,6 +222,22 @@ mod tests {
         assert!(!tails.contains("blank"));
         assert!(!tails.contains("replacement"));
         assert!(!tails.contains("in-progress"));
+    }
+
+    #[test]
+    fn a_synthetic_turn_registers_its_closing_answer() {
+        let events = [
+            serde_json::json!({"type":"user/message","seq":10,"data":{"source":{"kind":"user"},"id":"u1","content":[{"type":"text","text":"q"}]}}),
+            serde_json::json!({"type":"turn/start","seq":11,"data":{"turn":1}}),
+            serde_json::json!({"type":"assistant/message","seq":12,"surfaceOp":"append","data":{"turn":1,"step":1,"message":{"id":"a1","role":"assistant","content":[{"type":"text","text":"答"}]}}}),
+            serde_json::json!({"type":"turn/end","seq":13,"data":{"turn":1}}),
+        ];
+        let mut tails = TurnTails::default();
+        for event in &events {
+            tails.observe_history(event);
+        }
+        assert!(tails.contains("a1"));
+        assert_eq!(tails.answer_turn("a1"), Some(1));
     }
 
     #[test]

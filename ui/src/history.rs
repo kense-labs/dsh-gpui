@@ -948,7 +948,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn a_replayed_system_prompt_is_one_collapsed_row() {
         // Payload shape copied from a real ACP session log: the complete
         // model-visible prompt is recorded once at the turn's first step and the

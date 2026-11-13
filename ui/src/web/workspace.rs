@@ -348,6 +348,11 @@ impl DshApp {
                 element.child(self.render_toasts(cx))
             })
             .children(self.render_image_viewer(cx))
+            .children(self.render_turn_usage_overlay(
+                f32::from(w.viewport_size().width),
+                f32::from(w.viewport_size().height),
+                cx,
+            ))
             .children(self.render_session_download(w, cx))
             .children(self.render_session_feedback(w, cx))
             .children(self.render_session_feedback_notice(w, cx))
@@ -3016,6 +3021,7 @@ impl DshApp {
                         },
                     ))
                     .child(self.render_message_ratings(message, cx))
+                    .children(self.turn_usage_actions(message, entry, cx))
                     .child(turn_action_button(
                         "turn-branch",
                         "在新对话中分支",

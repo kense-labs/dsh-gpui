@@ -689,6 +689,8 @@ pub(crate) struct DshApp {
     pub(crate) link_open_external: bool,
     /// Composer statistics compact mode (official 性能与用量 · 简洁).
     pub(crate) performance_compact: bool,
+    /// Open per-turn usage dialog (official TurnUsagePanel).
+    pub(super) turn_usage_dialog: Option<turn_usage::TurnUsageDialog>,
     /// Full-screen picture opened from a user bubble (official image dialog).
     pub(crate) image_viewer: Option<ImageViewer>,
     confirm_permission: Option<String>,
@@ -1071,6 +1073,7 @@ impl DshApp {
             requested_attachments: std::collections::HashSet::new(),
             link_open_external: false,
             performance_compact: false,
+            turn_usage_dialog: None,
             image_viewer: None,
             confirm_permission: None,
             full_access_acknowledged: false,
@@ -2014,6 +2017,18 @@ impl DshApp {
         }
     }
 
+    /// Read the session log's per-turn token buckets for the usage panels.
+    fn request_turn_usage(&mut self) {
+        let Some(session_id) = self.active_session.clone() else {
+            return;
+        };
+        let cwd = self.workspace.clone();
+        invoke(
+            "turn_token_usage",
+            json!({ "sessionId": session_id, "cwd": cwd }),
+        );
+    }
+
     fn request_session_history(&mut self) {
         let Some(session_id) = self.active_session.clone() else {
             return;
@@ -2731,6 +2746,8 @@ impl DshApp {
         self.observe_local_session_activity(session, previous, false);
         if self.active_session.as_deref() == Some(session) {
             self.maybe_follow_tail();
+            // The just-closed turn's token buckets are only in the log.
+            self.request_turn_usage();
         }
     }
 
@@ -3033,6 +3050,7 @@ impl DshApp {
                             self.apply_session_history(session, &reply, prepend);
                             self.request_user_images();
                             self.preload_markdown_images();
+                            self.request_turn_usage();
                             if !prepend {
                                 self.settle_history_scroll(session, cx);
                             }
@@ -3044,6 +3062,18 @@ impl DshApp {
                     }
                 }
             }
+            // Per-turn token usage for the 本轮用量 panels.
+            "turn_token_usage" => match result {
+                Ok(reply) => {
+                    if let Some(session) = owner
+                        && let Some(conversation) = self.conversation_mut(session)
+                    {
+                        conversation.turn_usage = crate::state::turn_usage_map(&reply);
+                        cx.notify();
+                    }
+                }
+                Err(_) => {}
+            },
             // One user-message picture finished decoding into a data URL: patch it
             // into every visible row that references the attachment.
             "read_attachment" => match result {
@@ -4001,6 +4031,7 @@ mod terminal;
 mod terminal_shell_menu;
 mod terminal_title;
 mod transcript_preferences;
+mod turn_usage;
 mod web_search_settings;
 mod workspace;
 mod workspace_rows;

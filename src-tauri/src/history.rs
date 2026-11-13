@@ -656,6 +656,110 @@ pub async fn peek_session_titles(sessions: Vec<SessionTitleQuery>) -> Result<Val
 }
 
 /// Merge durable local sessions (projcache) that ACP `session/list` may omit.
+/// Per-turn token usage folded from the session log (official TurnUsagePanel).
+#[derive(Default, Clone)]
+struct TurnUsage {
+    input_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+    /// `provider/model` routes used by the turn, in first-seen order.
+    routes: Vec<String>,
+}
+
+/// Fold `assistant/message` usage buckets and `request/context` routes per turn.
+fn fold_turn_usage(events: &[serde_json::Value]) -> serde_json::Value {
+    use std::collections::BTreeMap;
+    let mut turns: BTreeMap<u64, TurnUsage> = BTreeMap::new();
+    let mut current_turn: Option<u64> = None;
+    for event in events {
+        let kind = event
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let data = event
+            .get("data")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        match kind {
+            "turn/start" => {
+                current_turn = data.get("turn").and_then(|value| value.as_u64());
+            }
+            "request/context" => {
+                let Some(turn) = current_turn else { continue };
+                let (Some(provider), Some(model)) = (
+                    data.get("provider").and_then(|value| value.as_str()),
+                    data.get("model").and_then(|value| value.as_str()),
+                ) else {
+                    continue;
+                };
+                let route = format!("{provider}/{model}");
+                let usage = turns.entry(turn).or_default();
+                if !usage.routes.iter().any(|seen| *seen == route) {
+                    usage.routes.push(route);
+                }
+            }
+            "assistant/message" => {
+                let turn = data
+                    .get("turn")
+                    .and_then(|value| value.as_u64())
+                    .or(current_turn);
+                let Some(turn) = turn else { continue };
+                let Some(usage) = data.get("usage") else {
+                    continue;
+                };
+                let read = |key: &str| {
+                    usage
+                        .get(key)
+                        .and_then(|value| {
+                            value
+                                .as_u64()
+                                .or_else(|| value.as_f64().map(|value| value as u64))
+                        })
+                        .unwrap_or(0)
+                };
+                let input = read("inputTokens");
+                let cache_read = read("cacheReadTokens");
+                let cache_write = read("cacheWriteTokens");
+                let output = read("outputTokens");
+                let accumulated = turns.entry(turn).or_default();
+                accumulated.input_tokens = accumulated.input_tokens.saturating_add(input);
+                accumulated.cache_read_tokens =
+                    accumulated.cache_read_tokens.saturating_add(cache_read);
+                accumulated.cache_write_tokens =
+                    accumulated.cache_write_tokens.saturating_add(cache_write);
+                accumulated.output_tokens = accumulated.output_tokens.saturating_add(output);
+                let total = usage
+                    .get("totalTokens")
+                    .and_then(|value| {
+                        value
+                            .as_u64()
+                            .or_else(|| value.as_f64().map(|value| value as u64))
+                    })
+                    .unwrap_or(input + cache_read + cache_write + output);
+                accumulated.total_tokens = accumulated.total_tokens.saturating_add(total);
+            }
+            _ => {}
+        }
+    }
+    let turns: Vec<serde_json::Value> = turns
+        .into_iter()
+        .map(|(turn, usage)| {
+            serde_json::json!({
+                "turn": turn,
+                "inputTokens": usage.input_tokens,
+                "cacheReadTokens": usage.cache_read_tokens,
+                "cacheWriteTokens": usage.cache_write_tokens,
+                "outputTokens": usage.output_tokens,
+                "totalTokens": usage.total_tokens,
+                "routes": usage.routes,
+            })
+        })
+        .collect();
+    serde_json::json!({ "turns": turns })
+}
+
 /// Read one stored attachment as a data: URL for transcript images.
 ///
 /// The Harness dedupes user images into `~/.dsh/attachments/v1/objects/<aa>/<sha>`
@@ -740,6 +844,39 @@ fn image_media_type(path: &std::path::Path) -> Option<&'static str> {
         Some("gif") => Some("image/gif"),
         _ => None,
     }
+}
+
+/// Per-turn token usage for the chat's 本轮用量 panels.
+#[tauri::command]
+pub async fn turn_token_usage(session_id: String, cwd: String) -> Result<Value, String> {
+    if session_id.trim().is_empty() {
+        return Err("缺少 sessionId".to_string());
+    }
+    tokio::task::spawn_blocking(move || {
+        let root = dsh_home().join("sessions");
+        let mut last_error = format!("未找到会话日志：{session_id}");
+        for dir in candidate_dirs(&root, &cwd, &session_id) {
+            let Some(path) = find_log_path(&dir) else {
+                continue;
+            };
+            let plain = match decode_log_bytes(&path) {
+                Ok(plain) => plain,
+                Err(error) => {
+                    last_error = error;
+                    continue;
+                }
+            };
+            let events: Vec<Value> = plain
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+                .collect();
+            return Ok(fold_turn_usage(&events));
+        }
+        Err(last_error)
+    })
+    .await
+    .map_err(|error| format!("读取会话用量失败：{error}"))?
 }
 
 /// Minimal standard base64 encoder (no padding-free variant needed here).
@@ -911,6 +1048,43 @@ mod local_scan_tests {
             hit,
             "expected Kense titled session in local scan: {sessions:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod turn_usage_tests {
+    use super::fold_turn_usage;
+
+    #[test]
+    fn folds_per_turn_buckets_and_routes() {
+        let events: Vec<serde_json::Value> = vec![
+            serde_json::json!({"type":"turn/start","seq":1,"data":{"turn":1}}),
+            serde_json::json!({"type":"request/context","seq":2,"data":{"provider":"deepseek-official","model":"deepseek-v4.1-flash"}}),
+            serde_json::json!({"type":"assistant/message","seq":3,"data":{"turn":1,"usage":{
+                "inputTokens":100,"outputTokens":50,"cacheReadTokens":20,"cacheWriteTokens":5,"totalTokens":175}}}),
+            serde_json::json!({"type":"assistant/message","seq":4,"data":{"turn":1,"usage":{
+                "inputTokens":10,"outputTokens":5,"cacheReadTokens":2,"cacheWriteTokens":0,"totalTokens":17}}}),
+            serde_json::json!({"type":"turn/start","seq":5,"data":{"turn":2}}),
+            serde_json::json!({"type":"request/context","seq":6,"data":{"provider":"other","model":"m2"}}),
+            serde_json::json!({"type":"assistant/message","seq":7,"data":{"turn":2,"usage":{
+                "inputTokens":1,"outputTokens":2,"cacheReadTokens":3,"cacheWriteTokens":4}}}),
+        ];
+        let folded = fold_turn_usage(&events);
+        let turns = folded["turns"].as_array().expect("turns array");
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0]["turn"], 1);
+        assert_eq!(turns[0]["inputTokens"], 110);
+        assert_eq!(turns[0]["cacheReadTokens"], 22);
+        assert_eq!(turns[0]["cacheWriteTokens"], 5);
+        assert_eq!(turns[0]["outputTokens"], 55);
+        assert_eq!(turns[0]["totalTokens"], 192);
+        assert_eq!(
+            turns[0]["routes"],
+            serde_json::json!(["deepseek-official/deepseek-v4.1-flash"])
+        );
+        // A message without totalTokens falls back to the bucket sum.
+        assert_eq!(turns[1]["totalTokens"], 10);
+        assert_eq!(turns[1]["routes"], serde_json::json!(["other/m2"]));
     }
 }
 
