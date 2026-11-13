@@ -6420,11 +6420,26 @@ fn render_entry(
                 )
                 .when(expanded, |element| {
                     let mut detail = column().w_full().pl(px(4.)).py(px(4.)).gap(px(6.));
+                    // 大参数/长输出只排版有界前缀，避免在布局里整段排版百万字符。
                     if !entry.input.is_empty() {
-                        detail = detail.child(code_text(&entry.input, p));
+                        let input = crate::tool_detail::detail_text(&entry.input);
+                        detail = detail.child(code_text(&input.shown, p));
+                        if input.truncated() {
+                            detail = detail.child(tool_detail_note(
+                                crate::tool_detail::truncation_note(input.total),
+                                p,
+                            ));
+                        }
                     }
                     if !entry.text.is_empty() {
-                        detail = detail.child(code_text(&entry.text, p));
+                        let output = crate::tool_detail::detail_text(&entry.text);
+                        detail = detail.child(code_text(&output.shown, p));
+                        if output.truncated() {
+                            detail = detail.child(tool_detail_note(
+                                crate::tool_detail::truncation_note(output.total),
+                                p,
+                            ));
+                        }
                     }
                     element.child(detail)
                 })
@@ -9138,6 +9153,17 @@ fn remap_inline_spans(source: &str, display: &str) -> Vec<crate::markdown::Inlin
         display_cursor += len;
     }
     spans
+}
+
+/// One faint note under a truncated expanded section.
+fn tool_detail_note(text: String, p: crate::tokens::Tokens) -> gpui::Div {
+    div()
+        .w_full()
+        .px(px(16.))
+        .text_size(px(11.))
+        .line_height(px(16.))
+        .text_color(p.faint)
+        .child(text)
 }
 
 fn code_text(text: &str, p: crate::tokens::Tokens) -> gpui::Div {
