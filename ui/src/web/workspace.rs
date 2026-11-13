@@ -6426,9 +6426,11 @@ fn render_entry(
                     let shell = crate::tool_cards::shell_command(&tool, &entry.input);
                     let read = crate::tool_cards::read_lines(&tool, &entry.text);
                     let search = crate::tool_cards::search_card(&tool, &entry.text);
+                    let web = crate::tool_cards::web_card(&tool, &entry.text);
                     // 类型化卡片自己呈现输入（命令/路径已在标题或块上），不再
                     // 重复展示原始 JSON 参数。
-                    let typed = shell.is_some() || read.is_some() || search.is_some();
+                    let typed =
+                        shell.is_some() || read.is_some() || search.is_some() || web.is_some();
                     if let Some(shell) = &shell {
                         detail = detail.child(render_shell_command(shell, p));
                     } else if !typed && !entry.input.is_empty() {
@@ -6445,6 +6447,8 @@ fn render_entry(
                         detail = detail.child(render_read_lines(read, p));
                     } else if let Some(search) = &search {
                         detail = detail.child(render_search_card(search, p));
+                    } else if let Some(web) = &web {
+                        detail = detail.child(render_web_card(web, p));
                     } else if !entry.text.is_empty() {
                         let output = crate::tool_detail::detail_text(&entry.text);
                         detail = detail.child(code_text(&output.shown, p));
@@ -9167,6 +9171,58 @@ fn remap_inline_spans(source: &str, display: &str) -> Vec<crate::markdown::Inlin
         display_cursor += len;
     }
     spans
+}
+
+/// Web fetch detail: the URL, its HTTP status, and the fetched body preview.
+fn render_web_card(card: &crate::tool_cards::WebCard, p: crate::tokens::Tokens) -> gpui::Div {
+    let mut block = column()
+        .w_full()
+        .gap(px(8.))
+        .rounded(px(12.))
+        .border(px(0.5))
+        .border_color(p.line)
+        .bg(p.stage)
+        .px(px(16.))
+        .py(px(10.));
+    let mut header = row().w_full().gap(px(8.)).items_center().child(
+        div()
+            .flex_1()
+            .min_w_0()
+            .truncate()
+            .text_size(px(12.))
+            .line_height(px(18.))
+            .text_color(p.link)
+            .child(card.url.clone()),
+    );
+    if let Some(status) = card.status {
+        let failed = status >= 400;
+        header = header.child(
+            div()
+                .flex_none()
+                .px(px(6.))
+                .h(px(20.))
+                .flex()
+                .items_center()
+                .rounded(px(6.))
+                .bg(p.selector)
+                .text_size(px(11.))
+                .line_height(px(16.))
+                .text_color(if failed { p.danger } else { p.label_secondary })
+                .child(format!("HTTP {status}")),
+        );
+    }
+    block = block.child(header);
+    if !card.content.is_empty() {
+        let content = crate::tool_detail::detail_text(&card.content);
+        block = block.child(code_text(&content.shown, p));
+        if content.truncated() {
+            block = block.child(tool_detail_note(
+                crate::tool_detail::truncation_note(content.total),
+                p,
+            ));
+        }
+    }
+    block
 }
 
 /// Shell tool detail: the command line the tool ran, as a terminal block.
