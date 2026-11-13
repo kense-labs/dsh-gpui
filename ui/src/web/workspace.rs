@@ -2059,6 +2059,46 @@ impl DshApp {
             tool: Some(ToolCall::root("web_fetch".into())),
             at_ms: None,
         });
+        // Typed tool cards: shell command, read lines, grep results.
+        let bash = "exit code: 0\n\nrunning 56 tests\ntest result: ok. 56 passed";
+        self.conversation.entries.push(ChatEntry {
+            key: "demo-bash".into(),
+            external_id: Some("demo-bash-call".into()),
+            role: EntryRole::Tool,
+            title: "bash".into(),
+            text: bash.to_owned(),
+            input: "{\"command\":\"cargo test --workspace\",\"description\":\"运行全部测试\"}"
+                .into(),
+            status: "completed".into(),
+            tool: Some(ToolCall::root("bash".into())),
+            at_ms: None,
+        });
+        let read =
+            "1: fn main() {\n2:     println!(\"hi\");\n3: }\n\n(End of file - total 3 lines)";
+        self.conversation.entries.push(ChatEntry {
+            key: "demo-read".into(),
+            external_id: Some("demo-read-call".into()),
+            role: EntryRole::Tool,
+            title: "read".into(),
+            text: read.to_owned(),
+            input: "{\"path\":\"src/main.rs\"}".into(),
+            status: "completed".into(),
+            tool: Some(ToolCall::root("read".into())),
+            at_ms: None,
+        });
+        let grep =
+            "Found 2 matches\n\nsrc/main.rs\nLine 1: fn main() {\nLine 2:     println!(\"hi\");";
+        self.conversation.entries.push(ChatEntry {
+            key: "demo-grep".into(),
+            external_id: Some("demo-grep-call".into()),
+            role: EntryRole::Tool,
+            title: "grep".into(),
+            text: grep.to_owned(),
+            input: "{\"pattern\":\"main\"}".into(),
+            status: "completed".into(),
+            tool: Some(ToolCall::root("grep".into())),
+            at_ms: None,
+        });
         self.conversation.follow_tail = true;
         self.conversation.scroll.scroll_to_bottom();
         cx.notify();
