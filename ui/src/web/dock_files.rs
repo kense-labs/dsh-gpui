@@ -579,6 +579,9 @@ impl DshApp {
             if search.loading && search.matches.is_empty() {
                 body = body.child(file_note("正在搜索…", cx));
             }
+            if !search.loading && !search.matches.is_empty() {
+                body = body.child(file_note(format!("{} 个结果", search.matches.len()), cx));
+            }
             for (index, (path, kind)) in search.matches.iter().enumerate() {
                 let is_directory = kind == "directory";
                 let open_path = path.clone();
@@ -1044,7 +1047,7 @@ impl DshApp {
             return rows.child(file_note("正在读取…", cx));
         }
         if let Some(error) = &listing.error {
-            rows = rows.child(file_note(file_error_note(error), cx));
+            rows = rows.child(file_note(crate::file_notes::file_error_note(error), cx));
         } else if listing.entries.is_empty() {
             rows = rows.child(file_note("空目录", cx));
         } else if !self.files_search_show_hidden
@@ -1053,10 +1056,7 @@ impl DshApp {
                 .iter()
                 .all(|entry| entry.name.starts_with('.'))
         {
-            rows = rows.child(file_note(
-                "该目录只有隐藏项，可点击「显示隐藏项」查看。",
-                cx,
-            ));
+            rows = rows.child(file_note("隐藏项未显示", cx));
         }
         for entry in &listing.entries {
             if !self.files_search_show_hidden && entry.name.starts_with('.') {
@@ -1274,20 +1274,6 @@ fn files_path_label(workspace: &str, cx: &App) -> gpui::Stateful<gpui::Div> {
             .absolute()
             .inset_0(),
         )
-}
-
-/// 官方：失败层按 not-found / outside-workspace / not-directory 分类文案。
-fn file_error_note(error: &str) -> String {
-    let lower = error.to_lowercase();
-    if lower.contains("not found") || lower.contains("enoent") {
-        "目录不存在".to_owned()
-    } else if lower.contains("outside") {
-        "路径不在当前工作区内".to_owned()
-    } else if lower.contains("not a directory") || lower.contains("enotdir") {
-        "目标不是目录".to_owned()
-    } else {
-        error.to_owned()
-    }
 }
 
 fn file_note(label: impl Into<gpui::SharedString>, cx: &App) -> gpui::Div {
