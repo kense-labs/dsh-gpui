@@ -171,6 +171,69 @@ pub async fn open_start_tool(workspace: String, tool: String) -> Result<(), Stri
         .map_err(|error| format!("打开工作区工具失败：{error}"))?
 }
 
+/// Open one host path with the default application, or reveal it in the file
+/// manager (official `open-in-app` file actions).
+#[tauri::command]
+pub async fn open_path(path: String, reveal: bool) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("缺少文件路径".to_string());
+    }
+    tokio::task::spawn_blocking(move || open_host_path(&path, reveal))
+        .await
+        .map_err(|error| format!("打开文件失败：{error}"))?
+}
+
+/// Platform command arguments for opening (or revealing) one host path.
+///
+/// Kept pure so the Windows and macOS argv shapes stay testable on every host.
+fn host_path_arguments(path: &str, reveal: bool) -> (String, Vec<String>) {
+    if cfg!(target_os = "macos") {
+        let mut args = Vec::new();
+        if reveal {
+            args.push("-R".to_string());
+        }
+        args.push(path.to_string());
+        ("open".to_string(), args)
+    } else if cfg!(windows) {
+        if reveal {
+            ("explorer.exe".to_string(), vec![format!("/select,{path}")])
+        } else {
+            (
+                "cmd".to_string(),
+                vec![
+                    "/C".to_string(),
+                    "start".to_string(),
+                    String::new(),
+                    path.to_string(),
+                ],
+            )
+        }
+    } else {
+        let target = if reveal {
+            std::path::Path::new(path)
+                .parent()
+                .map(|parent| parent.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string())
+        } else {
+            path.to_string()
+        };
+        ("xdg-open".to_string(), vec![target])
+    }
+}
+
+fn open_host_path(path: &str, reveal: bool) -> Result<(), String> {
+    let (program, args) = host_path_arguments(path, reveal);
+    let status = std::process::Command::new(&program)
+        .args(&args)
+        .status()
+        .map_err(|error| format!("无法打开文件：{error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("打开文件失败：{status}"))
+    }
+}
+
 #[tauri::command]
 pub async fn open_browser_url(url: String) -> Result<String, String> {
     tokio::task::spawn_blocking(move || open_url(&url))
@@ -506,6 +569,31 @@ fn slash_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_path_arguments_follow_the_platform_contract() {
+        let (program, args) = host_path_arguments("/tmp/a.txt", false);
+        if cfg!(target_os = "macos") {
+            assert_eq!(program, "open");
+            assert_eq!(args, vec!["/tmp/a.txt".to_string()]);
+        } else if cfg!(windows) {
+            assert_eq!(program, "cmd");
+            assert_eq!(args.last().map(String::as_str), Some("/tmp/a.txt"));
+        } else {
+            assert_eq!(program, "xdg-open");
+        }
+        let (program, args) = host_path_arguments("/tmp/a.txt", true);
+        if cfg!(target_os = "macos") {
+            assert_eq!(program, "open");
+            assert_eq!(args, vec!["-R".to_string(), "/tmp/a.txt".to_string()]);
+        } else if cfg!(windows) {
+            assert_eq!(program, "explorer.exe");
+            assert_eq!(args, vec!["/select,/tmp/a.txt".to_string()]);
+        } else {
+            assert_eq!(program, "xdg-open");
+            assert_eq!(args, vec!["/tmp".to_string()]);
+        }
+    }
 
     #[test]
     fn relative_paths_cannot_escape_the_workspace() {

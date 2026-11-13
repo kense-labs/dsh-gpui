@@ -129,6 +129,7 @@ fn main() {
             #[cfg(target_os = "macos")]
             workspace::applications::open_workspace_application,
             workspace::open_browser_url,
+            workspace::open_path,
             browser::browser_shell_generation,
             browser::present_embedded_browser,
             browser::close_embedded_browser,

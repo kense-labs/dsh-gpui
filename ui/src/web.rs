@@ -579,6 +579,14 @@ pub(crate) struct Toast {
     pub(crate) at: f64,
 }
 
+/// One failed host-path open (official `FileOpenErrorDialog`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FileOpenError {
+    pub(crate) path: String,
+    pub(crate) message: String,
+    pub(crate) reveal: bool,
+}
+
 pub(crate) struct DshApp {
     pub(crate) status: ServiceStatus,
     service_starting: bool,
@@ -691,6 +699,10 @@ pub(crate) struct DshApp {
     pub(crate) performance_compact: bool,
     /// Open per-turn usage dialog (official TurnUsagePanel).
     pub(super) turn_usage_dialog: Option<turn_usage::TurnUsageDialog>,
+    /// Host path waiting for `open_path`; the reply turns a failure into the
+    /// official 无法打开文件 dialog.
+    pub(super) file_open_pending: Option<(String, bool)>,
+    pub(crate) file_open_error: Option<FileOpenError>,
     /// Full-screen picture opened from a user bubble (official image dialog).
     pub(crate) image_viewer: Option<ImageViewer>,
     confirm_permission: Option<String>,
@@ -1074,6 +1086,8 @@ impl DshApp {
             link_open_external: false,
             performance_compact: false,
             turn_usage_dialog: None,
+            file_open_pending: None,
+            file_open_error: None,
             image_viewer: None,
             confirm_permission: None,
             full_access_acknowledged: false,
@@ -2015,6 +2029,33 @@ impl DshApp {
                 }
             }
         }
+    }
+
+    /// Open one host path with the default application (or reveal it in the
+    /// file manager). Failures surface in the official 无法打开文件 dialog.
+    pub(super) fn open_host_path(&mut self, path: String, reveal: bool, cx: &mut Context<Self>) {
+        let path = if std::path::Path::new(&path).is_absolute() {
+            path
+        } else {
+            crate::mentions::resolve_path(&self.workspace, &path)
+        };
+        self.file_open_error = None;
+        self.file_open_pending = Some((path.clone(), reveal));
+        invoke("open_path", json!({ "path": path, "reveal": reveal }));
+        cx.notify();
+    }
+
+    /// Retry the gesture that failed.
+    pub(super) fn retry_file_open(&mut self, cx: &mut Context<Self>) {
+        let Some(error) = self.file_open_error.clone() else {
+            return;
+        };
+        self.open_host_path(error.path, error.reveal, cx);
+    }
+
+    pub(super) fn dismiss_file_open_error(&mut self, cx: &mut Context<Self>) {
+        self.file_open_error = None;
+        cx.notify();
     }
 
     /// Read the session log's per-turn token buckets for the usage panels.
@@ -3061,6 +3102,23 @@ impl DshApp {
                         }
                     }
                 }
+            }
+            // Host path open/reveal: a refusal becomes the official dialog.
+            "open_path" => {
+                let pending = self.file_open_pending.take();
+                match result {
+                    Ok(_) => self.file_open_error = None,
+                    Err(error) => {
+                        if let Some((path, reveal)) = pending {
+                            self.file_open_error = Some(FileOpenError {
+                                path,
+                                message: error,
+                                reveal,
+                            });
+                        }
+                    }
+                }
+                cx.notify();
             }
             // Per-turn token usage for the 本轮用量 panels.
             "turn_token_usage" => match result {

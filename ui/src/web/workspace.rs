@@ -356,6 +356,7 @@ impl DshApp {
             .children(self.render_session_download(w, cx))
             .children(self.render_session_feedback(w, cx))
             .children(self.render_session_feedback_notice(w, cx))
+            .children(self.render_file_open_error(w, cx))
             .children(self.render_archive_confirmation(cx))
             .children(self.render_session_markdown_notice(w, cx))
             .when(self.drop_active, |element| {
@@ -1924,6 +1925,106 @@ impl DshApp {
                             .child(self.render_composer(w, cx, true)),
                     ),
             )
+    }
+
+    /// Official `FileOpenErrorDialog`: a host refusal with the wire reason and a
+    /// retry of the same path.
+    #[allow(dead_code)]
+    pub(super) fn render_file_open_error(
+        &mut self,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Stateful<gpui::Div>> {
+        let error = self.file_open_error.clone()?;
+        let p = dsh(cx);
+        let width = (f32::from(w.viewport_size().width) - 48.).clamp(0., 420.);
+        let retry_label = if error.reveal { "重试" } else { "重试" };
+        let _ = retry_label;
+        Some(
+            div()
+                .id("file-open-error")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(p.bg_mask_1)
+                .occlude()
+                .on_click(cx.listener(|this, _, _, cx| this.dismiss_file_open_error(cx)))
+                .child(
+                    column()
+                        .id("file-open-error-panel")
+                        .w(px(width))
+                        .pb(px(22.))
+                        .rounded(px(28.))
+                        .bg(composer_bg(cx))
+                        .shadow(crate::tokens::elevation_prominent())
+                        .occlude()
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                        .child(super::permission_dialog::dialog_header(
+                            "无法打开文件",
+                            "close-file-open-error",
+                            None,
+                            cx,
+                            |this, _, cx| this.dismiss_file_open_error(cx),
+                        ))
+                        .child(
+                            column()
+                                .w_full()
+                                .px(px(24.))
+                                .gap(px(8.))
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .text_size(px(14.))
+                                        .line_height(px(22.))
+                                        .text_color(p.secondary)
+                                        .child(if error.message.trim().is_empty() {
+                                            "无法打开此文件".to_owned()
+                                        } else {
+                                            error.message.clone()
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(12.))
+                                        .line_height(px(18.))
+                                        .text_color(p.faint)
+                                        .child(error.path.clone()),
+                                ),
+                        )
+                        .child(
+                            row()
+                                .w_full()
+                                .mt(px(18.))
+                                .px(px(24.))
+                                .justify_end()
+                                .gap(px(8.))
+                                .child(super::permission_dialog::dialog_action(
+                                    "file-open-cancel",
+                                    "取消",
+                                    false,
+                                    false,
+                                    72.,
+                                    cx,
+                                    |this, _, cx| this.dismiss_file_open_error(cx),
+                                ))
+                                .child(super::permission_dialog::dialog_action(
+                                    "file-open-retry",
+                                    "重试",
+                                    true,
+                                    false,
+                                    84.,
+                                    cx,
+                                    |this, _, cx| this.retry_file_open(cx),
+                                )),
+                        ),
+                ),
+        )
     }
 
     fn render_transcript_entry(
@@ -6264,7 +6365,7 @@ fn render_entry(
         EntryRole::Context => render_context_injection(entry, expanded, cx),
         EntryRole::ToolChange => render_tool_change(entry, expanded, cx),
         EntryRole::Compaction => render_compaction(entry, expanded, cx),
-        EntryRole::Deliverable => render_deliverables(entry, expanded, cx),
+        EntryRole::Deliverable => render_deliverables(entry, expanded, workspace, cx),
         EntryRole::ChangedFiles => render_changed_files(entry, expanded, workspace, cx),
         EntryRole::SystemPrompt => render_system_prompt(entry, expanded, cx),
         EntryRole::Job => render_job_row(entry, expanded, cx),
@@ -6574,7 +6675,12 @@ fn render_compaction(entry: &ChatEntry, expanded: bool, cx: &mut Context<DshApp>
 ///
 /// 单个文件铺满一行，多个文件两列网格；超过四个时折叠为「全部 N 个文件」。
 /// 点击卡片在右侧文档面板打开该文件（官方是侧边栏预览）。
-fn render_deliverables(entry: &ChatEntry, expanded: bool, cx: &mut Context<DshApp>) -> gpui::Div {
+fn render_deliverables(
+    entry: &ChatEntry,
+    expanded: bool,
+    workspace: &str,
+    cx: &mut Context<DshApp>,
+) -> gpui::Div {
     let files: Vec<Value> = serde_json::from_str(&entry.input).unwrap_or_default();
     if files.is_empty() {
         return column();
@@ -6596,7 +6702,7 @@ fn render_deliverables(entry: &ChatEntry, expanded: bool, cx: &mut Context<DshAp
         let mut line = row().w_full().gap(px(10.)).items_stretch();
         let end = (index + 2).min(shown.len());
         for file in &shown[index..end] {
-            line = line.child(render_deliverable_card(file, single, cx));
+            line = line.child(render_deliverable_card(file, single, workspace, cx));
         }
         if end - index == 1 && !single {
             // Keep the last odd card at half width like the official grid.
@@ -6642,6 +6748,32 @@ fn render_deliverables(entry: &ChatEntry, expanded: bool, cx: &mut Context<DshAp
         cards = cards.child(row().w_full().justify_center().child(toggle));
     }
     column().w_full().mt(px(12.)).child(cards)
+}
+
+/// Compact icon action used by the delivery card's open-in-app controls.
+fn deliverable_action(
+    id: String,
+    label: &'static str,
+    glyph: Glyph,
+    cx: &mut Context<DshApp>,
+    action: impl Fn(&mut DshApp, &mut Window, &mut Context<DshApp>) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    let p = dsh(cx);
+    div()
+        .id(gpui::ElementId::Name(id.into()))
+        .role(gpui::Role::Button)
+        .aria_label(label)
+        .tab_index(0)
+        .cursor_pointer()
+        .size(px(24.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(6.))
+        .hover(|style| style.bg(p.selector))
+        .child(icon(glyph, 14., p.faint))
+        .on_click(cx.listener(move |this, _, w, cx| action(this, w, cx)))
 }
 
 /// Official ChangedFiles card: the files this turn edited.
@@ -6854,6 +6986,7 @@ fn file_name(path: &str) -> &str {
 fn render_deliverable_card(
     file: &Value,
     single: bool,
+    workspace: &str,
     cx: &mut Context<DshApp>,
 ) -> gpui::AnyElement {
     let p = dsh(cx);
@@ -6884,9 +7017,13 @@ fn render_deliverable_card(
         description
     };
     let open_path = path.clone();
-    div()
+    let absolute = crate::mentions::resolve_path(workspace, &path);
+    // Preview area (icons + name) opens the sidebar document; the separate
+    // action buttons mirror the official open-in-app split control and never
+    // nest inside the preview button.
+    let preview = div()
         .id(gpui::ElementId::Name(
-            format!("deliverable-card-{path}").into(),
+            format!("deliverable-preview-{path}").into(),
         ))
         .role(gpui::Role::Button)
         .aria_label(if single {
@@ -6896,19 +7033,11 @@ fn render_deliverable_card(
         })
         .tab_index(0)
         .cursor_pointer()
-        .when(single, |card| card.w_full())
-        .when(!single, |card| card.flex_1().min_w_0())
-        .h(px(60.))
         .flex()
         .items_center()
         .gap(px(10.))
-        .px(px(10.))
-        .py(px(8.))
-        .rounded(px(12.))
-        .border(px(0.5))
-        .border_color(p.border_l1)
-        .bg(p.stage)
-        .hover(|style| style.bg(p.hover))
+        .flex_1()
+        .min_w_0()
         .child(
             div()
                 .flex_none()
@@ -6951,8 +7080,51 @@ fn render_deliverable_card(
             }
             let pane = this.sidebar.surface.layout.focused();
             this.open_workspace_document(pane, open_path.clone(), w, cx);
-        }))
-        .into_any_element()
+        }));
+    let external_path = absolute.clone();
+    let reveal_path = absolute.clone();
+    let open_action = deliverable_action(
+        format!("deliverable-open-{path}"),
+        "用默认应用打开",
+        Glyph::Link,
+        cx,
+        move |this, _, cx| this.open_host_path(external_path.clone(), false, cx),
+    );
+    let reveal_action = deliverable_action(
+        format!("deliverable-reveal-{path}"),
+        "显示文件位置",
+        Glyph::Folder,
+        cx,
+        move |this, _, cx| this.open_host_path(reveal_path.clone(), true, cx),
+    );
+    let mut card = div()
+        .id(gpui::ElementId::Name(
+            format!("deliverable-card-{path}").into(),
+        ))
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .px(px(8.))
+        .py(px(8.))
+        .rounded(px(12.))
+        .border(px(0.5))
+        .border_color(p.border_l1)
+        .bg(p.stage)
+        .hover(|style| style.bg(p.hover));
+    card = card.child(preview).child(
+        row()
+            .flex_none()
+            .gap(px(2.))
+            .items_center()
+            .child(open_action)
+            .child(reveal_action),
+    );
+    if single {
+        card = card.w_full();
+    } else {
+        card = card.flex_1().min_w_0();
+    }
+    card.into_any_element()
 }
 
 /// User-message pictures (official UserContent): a row of rounded thumbnails
@@ -7055,8 +7227,9 @@ impl DshApp {
             .filter(|rest| crate::right_dock::workspace_document_path(rest));
         let Some(relative) = relative.map(str::to_owned) else {
             // Outside the workspace: hand the file to the system instead of
-            // promising a sidebar preview that cannot render it.
-            bridge::open_url(&format!("file://{path}"));
+            // promising a sidebar preview that cannot render it. A refusal shows
+            // the official 无法打开文件 dialog with a retry.
+            self.open_host_path(path.to_owned(), false, cx);
             return;
         };
         if !self.right_panel_visible() {
