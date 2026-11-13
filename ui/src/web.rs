@@ -585,6 +585,12 @@ pub(crate) struct DshApp {
     running_subagents: HashMap<String, String>,
     /// Read-only child transcript currently open, and the parent to return to.
     subagent_view: Option<subagent_view::SubagentView>,
+    /// Blank session opened by a previous launch; reused instead of creating a
+    /// new unused session each time.
+    scratch_session: Option<String>,
+    /// The pending open is that scratch-session reuse, so a missing session
+    /// falls back to a fresh one instead of a read-only view.
+    scratch_opening: bool,
     opening_session_events: Vec<Value>,
     pub(crate) page: WorkspacePage,
     pending_action: Option<PendingAction>,
@@ -961,6 +967,8 @@ impl DshApp {
             session_activity: HashMap::new(),
             running_subagents: HashMap::new(),
             subagent_view: None,
+            scratch_session: None,
+            scratch_opening: false,
             opening_session_events: Vec::new(),
             page: WorkspacePage::Conversation,
             pending_action: None,
@@ -1590,6 +1598,53 @@ impl DshApp {
         self.new_session_at(self.workspace.clone(), None, w, cx);
     }
 
+    /// Open the blank session a previous launch left behind, or create one.
+    ///
+    /// Creating a session writes its seed events to disk immediately, so doing
+    /// that on every launch left one unused 未命名 session behind per start.
+    /// The remembered id is only reused while it is still a blank session: the
+    /// first message sent into it forgets the id, and the next launch creates a
+    /// fresh blank session again.
+    fn open_scratch_session(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        if !self.connected() || self.creating_session {
+            return;
+        }
+        let remembered = self.scratch_session.clone();
+        let Some(id) = remembered else {
+            self.new_session(w, cx);
+            return;
+        };
+        self.scratch_opening = true;
+        self.begin_action(
+            PendingAction::Resume(SessionSummary {
+                id,
+                cwd: self.workspace.clone(),
+                title: None,
+                blank: true,
+                created_at_ms: None,
+            }),
+            cx,
+        );
+    }
+
+    /// Remember the blank session a launch opened.
+    fn remember_scratch_session(&mut self, id: &str, cx: &App) {
+        if self.scratch_session.as_deref() == Some(id) {
+            return;
+        }
+        self.scratch_session = Some(id.to_owned());
+        self.save_workspace_preferences(cx);
+    }
+
+    /// The scratch session received its first content: stop reusing it.
+    fn forget_scratch_session(&mut self, session: &str, cx: &App) {
+        if self.scratch_session.as_deref() != Some(session) {
+            return;
+        }
+        self.scratch_session = None;
+        self.save_workspace_preferences(cx);
+    }
+
     fn new_session_at(
         &mut self,
         cwd: String,
@@ -1846,12 +1901,28 @@ impl DshApp {
                         w,
                         cx,
                     );
+                    self.remember_scratch_session(id, cx);
                     self.refresh_sessions();
                 }
             }
             (PendingAction::Resume(session), Ok(reply)) => {
+                let scratch = self.scratch_opening
+                    && self.scratch_session.as_deref() == Some(session.id.as_str());
+                self.scratch_opening = false;
                 self.open_conversation(session, Some(&reply), true, None, w, cx);
+                if scratch {
+                    // Reusing the blank session is a fresh start, not a restore.
+                    self.conversation.resumed_session = false;
+                }
                 self.refresh_sessions();
+            }
+            (PendingAction::Resume(_session), Err(_error)) if self.scratch_opening => {
+                // The remembered blank session is gone (cleaned up or archived);
+                // start a fresh one instead of showing an empty read-only view.
+                self.scratch_opening = false;
+                self.scratch_session = None;
+                self.save_workspace_preferences(cx);
+                self.new_session(w, cx);
             }
             (PendingAction::Resume(session), Err(error)) => {
                 // A writer elsewhere can hold the lease while its transcript remains readable.
@@ -2261,6 +2332,7 @@ impl DshApp {
         if self.conversation.command_busy {
             return;
         }
+        self.forget_scratch_session(&session, cx);
         let name = line
             .trim_start_matches('/')
             .split_whitespace()
@@ -2404,6 +2476,7 @@ impl DshApp {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.forget_scratch_session(&session, cx);
         self.error = None;
         self.conversation.error = None;
         self.page = WorkspacePage::Conversation;
@@ -2494,6 +2567,8 @@ impl DshApp {
     }
 
     fn start_prompt(&mut self, session: &str, prompt: OutgoingPrompt, cx: &mut Context<Self>) {
+        // The blank startup session becomes a real conversation: stop reusing it.
+        self.forget_scratch_session(session, cx);
         let defer_collapse = self.collapse_next_input;
         let Some(conversation) = self.conversation_mut(session) else {
             return;
@@ -2808,7 +2883,7 @@ impl DshApp {
                         self.error = None;
                         self.apply_archive_snapshot(&reply["workspaceArchive"]);
                         self.load_startup_model_providers(&reply, w, cx);
-                        self.new_session(w, cx);
+                        self.open_scratch_session(w, cx);
                     }
                     Err(error) => {
                         self.status = ServiceStatus::Error;

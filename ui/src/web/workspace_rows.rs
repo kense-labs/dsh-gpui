@@ -121,6 +121,14 @@ impl DshApp {
         if let Some(replies) = reply["foldedReplies"].as_str() {
             self.keep_folded_replies = replies != "final";
         }
+        if let Some(scratch) = reply
+            .get("scratchSession")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            self.scratch_session = Some(scratch.to_owned());
+        }
         if let Some(mode) = reply.get("themeMode").and_then(Value::as_str) {
             let next = match mode {
                 "light" => ThemeMode::Light,
@@ -183,6 +191,7 @@ impl DshApp {
                     "collapseTiming": if self.collapse_next_input { "next-input" } else { "completion" },
                     "foldedReplies": if self.keep_folded_replies { "all" } else { "final" },
                     "workspaceOpenWith": self.workspace_open_with,
+                    "scratchSession": self.scratch_session,
                     "workDetails": match self.work_details {
                         WorkDetailsMode::Compact => "compact",
                         WorkDetailsMode::Standard => "standard",

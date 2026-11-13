@@ -32,6 +32,9 @@ pub struct WorkspacePreferences {
     pub collapse_timing: Option<String>,
     pub folded_replies: Option<String>,
     pub workspace_open_with: Option<String>,
+    /// Id of the blank session the client opened at startup, so the next launch
+    /// reuses it instead of leaving one unused session on disk per launch.
+    pub scratch_session: Option<String>,
 }
 
 #[tauri::command]
