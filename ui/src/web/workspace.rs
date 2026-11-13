@@ -2099,6 +2099,20 @@ impl DshApp {
             tool: Some(ToolCall::root("grep".into())),
             at_ms: None,
         });
+        // Turn-tail cards: deliverables and changed files.
+        let files = vec![
+            serde_json::json!({"path": "ui/src/web.rs", "description": "侧栏与渲染入口"}),
+            serde_json::json!({"path": "src-tauri/src/main.rs", "description": "原生宿主命令"}),
+        ];
+        self.conversation
+            .entries
+            .push(crate::state::deliverable_entry(&files, None));
+        self.conversation
+            .entries
+            .push(crate::state::changed_files_entry(
+                &["ui/src/web.rs".to_string(), "ui/src/history.rs".to_string()],
+                None,
+            ));
         self.conversation.follow_tail = true;
         self.conversation.scroll.scroll_to_bottom();
         cx.notify();
