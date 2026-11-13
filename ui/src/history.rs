@@ -45,8 +45,14 @@ fn user_visible_source(kind: &str) -> Option<&'static str> {
         "user" => Some(""),
         "goal" => Some("goal"),
         "schedule" => Some("trigger:schedule"),
-        "webhook" | "github" => Some("trigger:webhook"),
+        "webhook" => Some("trigger:webhook"),
+        "github" => Some("trigger:github"),
         "agent" | "agent-message" => Some("trigger:agent"),
+        "team" | "team-message" => Some("trigger:team"),
+        "subagent" | "subagent-settled" => Some("trigger:subagent-settled"),
+        "job" | "tool-jobs" => Some("trigger:tool-jobs"),
+        "tool-goal" => Some("trigger:tool-goal"),
+        "plugin" => Some("trigger:plugin"),
         _ => None,
     }
 }
@@ -147,38 +153,56 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                     .and_then(Value::as_str)
                     .unwrap_or("user");
                 // Context injections (official ContextInjectionRow) are logged
-                // non-user messages. The durable source carries the entries, so
-                // a reopened session rebuilds the same collapsible row instead
-                // of dropping it.
-                if source == "skill-catalog" {
-                    let id = data.get("id").and_then(Value::as_str).map(str::to_string);
-                    out.entries.push(ChatEntry {
-                        key: id
-                            .clone()
-                            .unwrap_or_else(|| format!("hist-context-{}", out.entries.len())),
-                        external_id: id,
-                        role: EntryRole::Context,
-                        title: source.to_owned(),
-                        text: crate::state::context_entries_text(&data),
-                        input: String::new(),
-                        status: if data.pointer("/source/update") == Some(&Value::Bool(true)) {
-                            "update".to_owned()
-                        } else {
-                            String::new()
-                        },
-                        tool: None,
-                        at_ms,
-                    });
-                    continue;
-                }
-                let Some(title) = user_visible_source(source) else {
-                    continue;
-                };
-                let text = data
+                // A non-human message either wakes a turn (official
+                // TurnTriggerNodeView) or is an injection into model history
+                // (official ContextInjectionRow). Both are durable, so a reopened
+                // session must rebuild the same rows the live stream showed.
+                let blocks_text = data
                     .get("content")
                     .and_then(Value::as_array)
                     .map(|blocks| content_texts(blocks))
                     .unwrap_or_default();
+                if source != "user" && source != "user-question-reply" {
+                    if user_visible_source(source).is_some() {
+                        // Fall through to the trigger row below.
+                    } else {
+                        let id = data.get("id").and_then(Value::as_str).map(str::to_string);
+                        let body = {
+                            let catalog = crate::state::context_entries_text(&data);
+                            if catalog.is_empty() {
+                                blocks_text.clone()
+                            } else {
+                                catalog
+                            }
+                        };
+                        if !body.trim().is_empty() {
+                            out.entries.push(ChatEntry {
+                                key: id.clone().unwrap_or_else(|| {
+                                    format!("hist-context-{}", out.entries.len())
+                                }),
+                                external_id: id,
+                                role: EntryRole::Context,
+                                title: crate::state::context_source_label(source).to_owned(),
+                                text: body,
+                                input: String::new(),
+                                status: if data.pointer("/source/update")
+                                    == Some(&Value::Bool(true))
+                                {
+                                    "update".to_owned()
+                                } else {
+                                    String::new()
+                                },
+                                tool: None,
+                                at_ms,
+                            });
+                        }
+                        continue;
+                    }
+                }
+                let Some(title) = user_visible_source(source) else {
+                    continue;
+                };
+                let text = blocks_text;
                 if text.trim().is_empty() {
                     continue;
                 }
@@ -909,14 +933,52 @@ mod tests {
     }
 
     #[test]
-    fn skips_system_injected_user_messages() {
-        let events = vec![json!({
-            "type": "user/message",
-            "data": {
-                "source": {"kind": "time-context"},
-                "content": [{"type": "text", "text": "now"}]
-            }
-        })];
-        assert!(project_session_events(&events).entries.is_empty());
+    fn replayed_context_injections_become_collapsible_rows() {
+        // Live and replayed sessions must agree: an injection is a collapsed
+        // context row, never a user bubble and never a turn trigger.
+        let events = vec![
+            json!({
+                "type": "user/message", "seq": 4, "time": 10,
+                "data": {
+                    "id": "ctx-time",
+                    "source": {"kind": "time-context", "form": "snapshot"},
+                    "content": [{"type": "text", "text": "Time sampled while preparing turn 1, step 1"}]
+                }
+            }),
+            json!({
+                "type": "user/message", "seq": 5, "time": 11,
+                "data": {
+                    "id": "ctx-runtime",
+                    "source": {"kind": "runtime-context", "form": "snapshot"},
+                    "content": [{"type": "text", "text": "runtime facts"}]
+                }
+            }),
+            json!({
+                "type": "user/message", "seq": 6, "time": 12,
+                "data": {
+                    "id": "goal-round",
+                    "source": {"kind": "goal"},
+                    "content": [{"type": "text", "text": "<goal_round>\nObjective: \"把目标做完\"\nRound: 2/8"}]
+                }
+            }),
+        ];
+        let projected = project_session_events(&events);
+        let contexts: Vec<_> = projected
+            .entries
+            .iter()
+            .filter(|entry| entry.role == EntryRole::Context)
+            .collect();
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(contexts[0].title, "时间上下文");
+        assert!(contexts[0].text.contains("Time sampled"));
+        assert_eq!(contexts[1].title, "运行时上下文");
+        // A goal round still wakes the turn and stays a trigger row.
+        let trigger = projected
+            .entries
+            .iter()
+            .find(|entry| entry.role == EntryRole::User)
+            .expect("goal trigger row");
+        assert_eq!(trigger.title, "goal");
+        assert_eq!(trigger.text, "把目标做完");
     }
 }

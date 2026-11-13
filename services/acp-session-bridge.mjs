@@ -69,6 +69,15 @@ const inboxActionMethod = '_dsh/gpui/session/inbox-action';
 // projects, and its pause/resume/clear verbs are the goal service's own.
 const goalStateMethod = '_dsh/gpui/session/goal-state';
 const goalActionMethod = '_dsh/gpui/session/goal-action';
+// Non-human messages either wake a Turn (official TurnTriggerNodeView) or are
+// injected into model history (official ContextInjectionRow). Only the waking
+// producers get a trigger card; the rest are collapsed context rows, exactly
+// like the official projection distinguishes them.
+const TRIGGER_SOURCES = new Set([
+  'goal', 'schedule', 'webhook', 'github', 'agent', 'agent-message', 'team',
+  'team-message', 'subagent', 'subagent-settled', 'job', 'tool-jobs', 'tool-goal',
+  'plugin',
+]);
 const planReviews = new Map();
 const questionRequests = new Map();
 const messageMethods = new Map([
@@ -1868,32 +1877,29 @@ function observeSessionUpdates(ctx) {
           seq: event.seq,
         });
       }
-      // A non-human message is rendered as a trigger card (official
-      // TurnTriggerNodeView), which needs the text and source kind. Forwarding
-      // only the tail left a live goal round with no card at all: it appeared
-      // afterwards, from history replay, but never while it was running.
       const human = source === 'user' || source === 'user-question-reply';
-      // Context injections (official ContextInjectionRow): logged, never spoken
-      // by a human, and shown as a collapsed row rather than a trigger card.
-      // The skill catalog is the one that is always present, and its durable
-      // `entries` are what a reader expands to.
-      if (!human && source === 'skill-catalog') {
-        notify(session.id, {
-          sessionUpdate: 'context_injection',
-          messageId: data.id,
-          sourceKind: source,
-          form: data.source?.form,
-          entries: data.source?.entries,
-          update: data.source?.update === true,
-          incomplete: data.source?.incomplete === true,
-          content: contentBlocks(data.content),
-          time: event.time,
-        });
-        return;
-      }
-      const internal = source === 'runtime-context'
-        || source === 'compact-checkpoint';
-      if (!human && !internal) {
+      if (!human) {
+        // Injected context (time snapshots, runtime snapshots, catalogs, tool
+        // notices): a collapsed row, never a trigger card and never a model
+        // prompt bubble. Sending these as triggers put a giant
+        // "Time sampled while preparing…" bubble into every live step while a
+        // reopened session dropped them.
+        if (!TRIGGER_SOURCES.has(source)) {
+          notify(session.id, {
+            sessionUpdate: 'context_injection',
+            messageId: data.id,
+            sourceKind: source,
+            form: data.source?.form,
+            entries: data.source?.entries,
+            update: data.source?.update === true,
+            incomplete: data.source?.incomplete === true,
+            content: contentBlocks(data.content),
+            time: event.time,
+          });
+          return;
+        }
+        // Waking notifications keep their trigger card (official
+        // TurnTriggerNodeView) so a goal round or job settle is visible.
         notify(session.id, {
           sessionUpdate: 'turn_trigger',
           messageId: data.id,

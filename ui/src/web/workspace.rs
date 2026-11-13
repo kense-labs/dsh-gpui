@@ -6537,12 +6537,14 @@ fn render_turn_trigger(entry: &ChatEntry, expanded: bool, cx: &mut Context<DshAp
     let key = entry.key.clone();
     let title = match entry.title.as_str() {
         "goal" | "trigger:goal" => "继续执行目标",
-        "trigger:agent" | "trigger:agent-message" => "智能体消息",
-        "trigger:schedule" => "定时触发",
-        "trigger:webhook" | "trigger:github" => "Webhook 触发",
-        "trigger:team" | "trigger:team-message" => "团队消息",
-        "trigger:subagent" | "trigger:subagent-settled" => "子智能体",
-        "trigger:job" | "trigger:tool-jobs" => "任务队列",
+        "trigger:agent" | "trigger:agent-message" => "收到任务消息",
+        "trigger:schedule" => "自动化任务",
+        "trigger:webhook" => "收到外部事件",
+        "trigger:github" => "收到 GitHub 事件",
+        "trigger:team" | "trigger:team-message" => "收到团队消息",
+        "trigger:subagent" | "trigger:subagent-settled" => "子任务状态更新",
+        "trigger:job" | "trigger:tool-jobs" => "后台任务状态更新",
+        "trigger:plugin" => "插件状态更新",
         _ => "自动触发",
     };
     let glyph = match entry.title.as_str() {

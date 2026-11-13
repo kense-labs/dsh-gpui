@@ -221,21 +221,26 @@ pub fn apply_update(entries: &mut Vec<ChatEntry>, update: &Value) -> UpdateEffec
         }
         // Host/ACP 扩展：非人类 waking 消息 → 官方 TurnTrigger 卡。
         Some("turn_trigger") => {
+            let source = update
+                .get("sourceKind")
+                .and_then(Value::as_str)
+                .unwrap_or("goal");
+            // The ACP transport names every non-human message `turn_trigger`.
+            // Only waking producers open a Turn; injected model history becomes
+            // the collapsed context row the durable projection also builds, or
+            // live and replayed views would disagree (and a step's time snapshot
+            // would surface as a giant user bubble).
+            if !is_trigger_source(source) {
+                if source != "user-question-reply" {
+                    apply_context_injection(entries, update);
+                }
+                return effect;
+            }
             let id = update
                 .get("messageId")
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("trigger-{}", entries.len()));
-            let source = update
-                .get("sourceKind")
-                .and_then(Value::as_str)
-                .unwrap_or("goal");
-            if matches!(
-                source,
-                "runtime-context" | "compact-checkpoint" | "user-question-reply"
-            ) {
-                return effect;
-            }
             let raw = update
                 .get("content")
                 .and_then(Value::as_str)
@@ -393,47 +398,7 @@ pub fn apply_update(entries: &mut Vec<ChatEntry>, update: &Value) -> UpdateEffec
         // Host/ACP 扩展：上下文注入行（官方 ContextInjectionRow）。
         // 技能目录是常驻的一类；`entries` 是该行展开后的内容，`update`
         // 表示这是替换目录而不是首次发布。
-        Some("context_injection") => {
-            let id = string_field(update, "messageId");
-            if id.is_empty() {
-                return effect;
-            }
-            let source = string_field(update, "sourceKind");
-            let text = context_entries_text(update);
-            let title = if source.is_empty() {
-                "skill-catalog".to_owned()
-            } else {
-                source
-            };
-            if let Some(entry) = entries.iter_mut().find(|entry| {
-                entry.role == EntryRole::Context
-                    && entry.external_id.as_deref() == Some(id.as_str())
-            }) {
-                entry.title = title;
-                entry.text = text;
-                entry.status = if update["update"] == true {
-                    "update".to_owned()
-                } else {
-                    String::new()
-                };
-            } else {
-                entries.push(ChatEntry {
-                    key: format!("context-{id}"),
-                    external_id: Some(id),
-                    role: EntryRole::Context,
-                    title,
-                    text,
-                    input: String::new(),
-                    status: if update["update"] == true {
-                        "update".to_owned()
-                    } else {
-                        String::new()
-                    },
-                    tool: None,
-                    at_ms: update.get("time").and_then(Value::as_f64),
-                });
-            }
-        }
+        Some("context_injection") => apply_context_injection(entries, update),
         // Host/ACP 扩展：斜杠指令结果行（官方 GenericCommandCard）。
         // `command/run` 建立行，`command/done` 回填结果；用 commandId 配对。
         Some("gpui_command_run" | "gpui_command_done") => {
@@ -629,6 +594,37 @@ pub fn job_detail_text(update: &Value) -> String {
 ///
 /// 实时事件把 `entries` 放在顶层，历史回放则嵌在 `data.source.entries`；两种来源
 /// 共用这一个函数，避免同一行在两处渲染出不同内容。
+/// Friendly label for one durable context-injection producer kind.
+///
+/// The official row always titles itself 上下文注入 and names the producer in
+/// its detail slot; the raw source kind (`time-context`, `skill-catalog`, …) is
+/// an internal identifier a reader should not have to decode.
+pub fn context_source_label(kind: &str) -> &str {
+    match kind {
+        "skill-catalog" => "技能目录",
+        "time-context" => "时间上下文",
+        "runtime-context" => "运行时上下文",
+        "compact-checkpoint" => "压缩快照",
+        "session-reference" => "跨会话召回",
+        "agent-instructions" | "instructions" => "智能体指令",
+        "directives" => "指令",
+        "skill-invocation" => "已载入技能",
+        "tool-goal" => "目标更新",
+        "tool-jobs" => "后台任务通知",
+        "user-approval" => "审批结果",
+        "model-selection" => "模型选择",
+        "user-question-reply" => "问题回复",
+        "" => "上下文注入",
+        other => other,
+    }
+}
+
+/// Body of one context-injection row.
+///
+/// The skill catalog carries structured `entries`; every other producer is a
+/// plain snapshot whose text lives in `content` (an ACP update sends it as one
+/// string, a durable event as content blocks). Both must stay readable after a
+/// session is reopened.
 pub fn context_entries_text(value: &Value) -> String {
     let source = value.get("source").unwrap_or(value);
     let mut lines: Vec<String> = source["entries"]
@@ -648,7 +644,72 @@ pub fn context_entries_text(value: &Value) -> String {
     if source["incomplete"] == true {
         lines.push("（本次发现的目录不完整）".to_owned());
     }
+    if lines.is_empty() {
+        lines = content_snapshot_text(value);
+    }
     lines.join("\n")
+}
+
+/// Text of a plain (non-catalog) context snapshot.
+fn content_snapshot_text(value: &Value) -> Vec<String> {
+    let content = value.get("content").unwrap_or(&Value::Null);
+    if let Some(text) = content.as_str() {
+        let trimmed = text.trim();
+        return if trimmed.is_empty() {
+            Vec::new()
+        } else {
+            vec![trimmed.to_owned()]
+        };
+    }
+    content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Merge one context-injection update into a single collapsible row.
+///
+/// A live ACP update and a replayed durable event describe the same message id,
+/// so both paths share this so a session shows one row per injection.
+fn apply_context_injection(entries: &mut Vec<ChatEntry>, update: &Value) {
+    let id = string_field(update, "messageId");
+    if id.is_empty() {
+        return;
+    }
+    let source = string_field(update, "sourceKind");
+    let text = context_entries_text(update);
+    let title = context_source_label(&source).to_owned();
+    let status = if update["update"] == true {
+        "update".to_owned()
+    } else {
+        String::new()
+    };
+    if let Some(entry) = entries.iter_mut().find(|entry| {
+        entry.role == EntryRole::Context && entry.external_id.as_deref() == Some(id.as_str())
+    }) {
+        entry.title = title;
+        if !text.is_empty() {
+            entry.text = text;
+        }
+        entry.status = status;
+        return;
+    }
+    entries.push(ChatEntry {
+        key: format!("context-{id}"),
+        external_id: Some(id),
+        role: EntryRole::Context,
+        title,
+        text,
+        input: String::new(),
+        status,
+        tool: None,
+        at_ms: update.get("time").and_then(Value::as_f64),
+    });
 }
 
 fn role_name(role: EntryRole) -> &'static str {
@@ -666,6 +727,32 @@ fn role_name(role: EntryRole) -> &'static str {
         EntryRole::System => "system",
         EntryRole::Error => "error",
     }
+}
+
+/// Whether a non-human message source wakes a Turn (official TurnTriggerNodeView).
+///
+/// Everything else is injected model history: the ACP transport forwards both
+/// kinds as `turn_trigger`, so the client must classify by source instead of
+/// trusting the update name.
+pub fn is_trigger_source(kind: &str) -> bool {
+    matches!(
+        kind,
+        "goal"
+            | "schedule"
+            | "webhook"
+            | "github"
+            | "agent"
+            | "agent-message"
+            | "team"
+            | "team-message"
+            | "subagent"
+            | "subagent-settled"
+            | "job"
+            | "tool-jobs"
+            // Goal tool notices open a continuation turn as well.
+            | "tool-goal"
+            | "plugin"
+    )
 }
 
 /// Adopt the durable identity of one logged human message.
@@ -709,10 +796,107 @@ pub fn adopt_logged_user_message(
 mod tests {
     use super::{
         ChatEntry, EntryRole, adopt_logged_user_message, apply_update, context_entries_text,
-        is_auth_failure, job_detail_text, job_status_label, prompt_failure_message,
-        validate_api_key,
+        context_source_label, is_auth_failure, job_detail_text, job_status_label,
+        prompt_failure_message, validate_api_key,
     };
     use serde_json::json;
+
+    #[test]
+    fn a_plain_context_snapshot_reads_its_body_from_the_content() {
+        // Live ACP updates carry the body as one string; durable events carry
+        // content blocks. Both must expand to the model-facing text.
+        let live = serde_json::json!({
+            "sessionUpdate": "context_injection",
+            "messageId": "m-1",
+            "sourceKind": "time-context",
+            "content": "Time sampled while preparing turn 1, step 1",
+        });
+        assert_eq!(
+            context_entries_text(&live),
+            "Time sampled while preparing turn 1, step 1"
+        );
+        let replayed = serde_json::json!({
+            "id": "m-2",
+            "source": {"kind": "runtime-context"},
+            "content": [{"type": "text", "text": "runtime facts"}],
+        });
+        assert_eq!(context_entries_text(&replayed), "runtime facts");
+        // The skill catalog still expands to its structured entries.
+        let catalog = serde_json::json!({
+            "source": {"entries": [{"name": "review", "description": "代码评审"}]},
+            "content": [{"type": "text", "text": "ignored"}],
+        });
+        assert_eq!(context_entries_text(&catalog), "review — 代码评审");
+    }
+
+    #[test]
+    fn context_producers_get_readable_labels() {
+        assert_eq!(context_source_label("skill-catalog"), "技能目录");
+        assert_eq!(context_source_label("time-context"), "时间上下文");
+        assert_eq!(context_source_label("runtime-context"), "运行时上下文");
+        assert_eq!(context_source_label("future-source"), "future-source");
+    }
+
+    #[test]
+    fn a_time_context_injection_is_a_context_row_not_a_trigger() {
+        let mut entries = Vec::new();
+        let effect = apply_update(
+            &mut entries,
+            &serde_json::json!({
+                "sessionUpdate": "context_injection",
+                "messageId": "ctx-1",
+                "sourceKind": "time-context",
+                "content": "Time sampled while preparing turn 2, step 1",
+                "time": 10,
+            }),
+        );
+        assert!(!effect.turn_triggered);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].role, EntryRole::Context);
+        assert_eq!(entries[0].title, "时间上下文");
+        assert_eq!(
+            entries[0].text,
+            "Time sampled while preparing turn 2, step 1"
+        );
+    }
+
+    #[test]
+    fn a_transport_trigger_for_injected_context_becomes_a_context_row() {
+        // The ACP transport labels every non-human message `turn_trigger`. An
+        // injection must not start a reply or become a user bubble; it is the
+        // same collapsed row the durable projection builds.
+        let mut entries = Vec::new();
+        let effect = apply_update(
+            &mut entries,
+            &json!({
+                "sessionUpdate": "turn_trigger",
+                "messageId": "ctx-9",
+                "sourceKind": "time-context",
+                "form": "snapshot",
+                "content": "Time sampled while preparing turn 3, step 1",
+                "time": 5,
+            }),
+        );
+        assert!(!effect.turn_triggered);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].role, EntryRole::Context);
+        assert_eq!(entries[0].title, "时间上下文");
+        // A waking producer keeps its trigger card and opens the turn.
+        let effect = apply_update(
+            &mut entries,
+            &json!({
+                "sessionUpdate": "turn_trigger",
+                "messageId": "goal-2",
+                "sourceKind": "goal",
+                "content": "<goal_round>\nObjective: \"继续\"",
+                "time": 6,
+            }),
+        );
+        assert!(effect.turn_triggered);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].role, EntryRole::User);
+        assert_eq!(entries[1].title, "goal");
+    }
 
     #[test]
     fn a_logged_user_message_adopts_the_optimistic_row() {
@@ -873,7 +1057,7 @@ mod tests {
         assert!(!effect.turn_triggered);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].role, EntryRole::Context);
-        assert_eq!(entries[0].title, "skill-catalog");
+        assert_eq!(entries[0].title, "技能目录");
         assert_eq!(
             entries[0].text,
             "ppt-generation — 生成演示文稿\nask-form — 表单提问"
