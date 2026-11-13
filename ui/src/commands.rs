@@ -188,21 +188,74 @@ pub(crate) fn claimed_command_len(draft: &str) -> Option<usize> {
     (end > 1).then_some(end)
 }
 
+/// 官方 `builtinCommandTokens`：六个内建命令的英文与简体中文写法。
+///
+/// 这张表是官方 `packages/interaction/commands/src/builtin.ts` 的原文，客户端与宿主
+/// 共用同一组拼写。缺一项就会出现「菜单里有、输入却到不了对应处理路径」的割裂。
+///
+/// 表里六个命令**不都由宿主执行**：KWork 把 `/feedback`、`/permission`、`/export`
+/// 做成了本地界面（反馈面板、权限选择器、下载），只有 `/goal`、`/plan`、`/compact`
+/// 转交 ACP 宿主。`strip_command_token` 是给本地路径用的解析器，
+/// `canonical_host_command` 才是转交宿主用的。
+pub(crate) const HOST_COMMAND_TOKENS: &[(&str, &str, &str)] = &[
+    ("goal", "goal", "目标"),
+    ("plan", "plan", "计划"),
+    ("feedback", "feedback", "反馈"),
+    ("compact", "compact", "压缩"),
+    ("permission", "permission", "权限"),
+    ("export", "export", "导出"),
+];
+
+/// 由客户端自己实现、不能转交宿主的命令。
+///
+/// 这些命令在官方有宿主实现，但 KWork 提供了更完整的本地界面（反馈表单、权限
+/// 选择器、下载管理）；转交宿主会绕开这些界面。
+pub(crate) fn client_side_command(name: &str) -> bool {
+    matches!(name, "export" | "permission" | "feedback")
+}
+
 /// 把中英文输入写法归一成 ACP 注册的 canonical 命令名。
+///
+/// 只返回**由宿主执行**的命令；本地命令返回 `None`，让调用方走本地分支。
 pub(crate) fn canonical_host_command(line: &str) -> Option<(String, String)> {
-    let trimmed = line.trim();
-    if !trimmed.starts_with('/') {
+    let (name, rest) = resolve_command_token(line)?;
+    if client_side_command(&name) {
         return None;
     }
-    let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
-    let token = &trimmed[1..end];
-    let name = match token {
-        "goal" | "目标" => "goal",
-        "plan" | "计划" => "plan",
-        "compact" | "压缩" => "compact",
-        _ => return None,
-    };
-    Some((name.to_owned(), format!("/{name}{}", &trimmed[end..])))
+    Some((name.clone(), format!("/{name}{rest}")))
+}
+
+/// 解析输入行开头的内建命令，返回 canonical 名与该行剩余部分（含前导空白）。
+///
+/// 同时接受英文与官方中文写法。调用方据此决定走本地界面还是转交宿主。
+/// 必须先确认有 `/` 前缀再切片：否则对「普通消息」这类非 ASCII 文本取
+/// `[1..]` 会落在字符边界中间而 panic。
+pub(crate) fn resolve_command_token(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix('/')?;
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let token = &rest[..end];
+    let name = HOST_COMMAND_TOKENS
+        .iter()
+        .find(|(_, en, zh)| token == *en || token == *zh)
+        .map(|(name, _, _)| *name)?;
+    Some((name.to_owned(), trimmed[1 + end..].to_owned()))
+}
+
+/// 输入行是否以某个 builtin 的某种写法开头，返回其后的参数文本。
+///
+/// 客户端自己接管的命令（`/feedback` 的反馈面板、`/plan` 的模式切换）必须同时
+/// 识别英文与中文写法；只认英文会让两种写法走上不同路径，行为不一致。
+pub(crate) fn strip_command_token<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    let (_, en, zh) = HOST_COMMAND_TOKENS
+        .iter()
+        .find(|(candidate, _, _)| *candidate == name)?;
+    let line = line.trim();
+    [en, zh].into_iter().find_map(|token| {
+        line.strip_prefix('/')
+            .and_then(|rest| rest.strip_prefix(token))
+            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+    })
 }
 
 /// 按斜杠过滤词筛选可见指令。
@@ -300,8 +353,9 @@ pub(crate) fn fuzzy_name_rank(query: &str, label: &str) -> Option<(bool, i64)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandCatalog, canonical_host_command, claimed_command_len, command_claim_hint,
-        fuzzy_name_rank, localized_command_token, visible_commands,
+        CommandCatalog, HOST_COMMAND_TOKENS, canonical_host_command, claimed_command_len,
+        client_side_command, command_claim_hint, fuzzy_name_rank, localized_command_token,
+        resolve_command_token, strip_command_token, visible_commands,
     };
     use serde_json::json;
 
@@ -406,8 +460,96 @@ mod tests {
             canonical_host_command("/压缩"),
             Some(("compact".to_owned(), "/compact".to_owned()))
         );
+        // Client-owned builtins must NOT be handed to the host: their KWork
+        // surfaces (feedback form, permission picker, download) own the action.
+        assert_eq!(canonical_host_command("/权限 workspace-write"), None);
+        assert_eq!(canonical_host_command("/permission readonly"), None);
+        assert_eq!(canonical_host_command("/反馈 很有用"), None);
+        assert_eq!(canonical_host_command("/导出"), None);
+        // ...but they still resolve, so callers can route them locally.
+        assert_eq!(
+            resolve_command_token("/权限 workspace-write"),
+            Some(("permission".to_owned(), " workspace-write".to_owned()))
+        );
+        assert_eq!(
+            resolve_command_token("/反馈 很有用"),
+            Some(("feedback".to_owned(), " 很有用".to_owned()))
+        );
         assert_eq!(canonical_host_command("普通消息"), None);
         assert_eq!(canonical_host_command("/unknown"), None);
+    }
+
+    #[test]
+    fn resolve_command_token_never_slices_mid_character() {
+        // A non-slash line starting with a multi-byte character used to panic on
+        // `[1..]` because the slash check ran after the slice.
+        assert_eq!(resolve_command_token("普通消息"), None);
+        assert_eq!(resolve_command_token("中文"), None);
+        assert_eq!(resolve_command_token("emoji 🙂 here"), None);
+        assert_eq!(resolve_command_token(""), None);
+        assert_eq!(resolve_command_token("/"), None);
+        assert_eq!(resolve_command_token("/unknown"), None);
+        // A slash line still yields the remainder verbatim.
+        assert_eq!(
+            resolve_command_token("/goal 目标"),
+            Some(("goal".to_owned(), " 目标".to_owned()))
+        );
+    }
+
+    #[test]
+    fn strip_command_token_accepts_both_official_spellings() {
+        // English and Chinese spellings must be interchangeable, or the same
+        // command takes a different path depending on how it was typed.
+        assert_eq!(
+            strip_command_token("/feedback 很有用", "feedback"),
+            Some(" 很有用")
+        );
+        assert_eq!(
+            strip_command_token("/反馈 很有用", "feedback"),
+            Some(" 很有用")
+        );
+        // A bare token yields an empty argument, not a miss.
+        assert_eq!(strip_command_token("/feedback", "feedback"), Some(""));
+        assert_eq!(strip_command_token("/反馈", "feedback"), Some(""));
+        // Only the exact token matches: longer names and bare words do not.
+        assert_eq!(strip_command_token("/feedbackx", "feedback"), None);
+        assert_eq!(strip_command_token("反馈", "feedback"), None);
+        assert_eq!(strip_command_token("/plan off", "feedback"), None);
+        // Leading/trailing space is tolerable because the composer trims.
+        assert_eq!(
+            strip_command_token("  /反馈 详情  ", "feedback"),
+            Some(" 详情")
+        );
+    }
+
+    #[test]
+    fn every_official_builtin_spelling_resolves() {
+        // Both columns of the official `builtinCommandTokens` table must resolve,
+        // or the command shows in the menu yet cannot be typed.
+        for (name, en, zh) in HOST_COMMAND_TOKENS {
+            let english = resolve_command_token(&format!("/{en}"))
+                .unwrap_or_else(|| panic!("/{en} did not resolve"));
+            assert_eq!(english.0, *name, "/{en} resolved to the wrong command");
+            let chinese = resolve_command_token(&format!("/{zh}"))
+                .unwrap_or_else(|| panic!("/{zh} did not resolve"));
+            assert_eq!(chinese.0, *name, "/{zh} resolved to the wrong command");
+        }
+        // Every builtin is either delegated to the host or handled by a local
+        // surface; the two sets must not overlap and must cover the table.
+        for (name, en, _) in HOST_COMMAND_TOKENS {
+            let delegated = canonical_host_command(&format!("/{en}")).is_some();
+            assert_eq!(
+                delegated,
+                !client_side_command(name),
+                "/{en} disagrees between the host path and the client-owned set"
+            );
+        }
+        let client_side: Vec<_> = HOST_COMMAND_TOKENS
+            .iter()
+            .map(|(name, _, _)| *name)
+            .filter(|name| client_side_command(name))
+            .collect();
+        assert_eq!(client_side, ["feedback", "permission", "export"]);
     }
 
     #[test]

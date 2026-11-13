@@ -340,12 +340,11 @@ impl DshApp {
 
     pub(super) fn submit_plan_command(&mut self, w: &mut Window, cx: &mut Context<Self>) -> bool {
         let draft = self.composer.read(cx).value().to_owned();
-        let command = draft.trim();
-        let end = command.find(char::is_whitespace).unwrap_or(command.len());
-        if !matches!(&command[..end], "/plan" | "/计划") {
+        // Shared resolver so `/plan` and `/计划` cannot drift apart.
+        let Some(rest) = crate::commands::strip_command_token(&draft, "plan") else {
             return false;
-        }
-        let message = command[end..].trim();
+        };
+        let message = rest.trim();
         let active = message != "off";
         let attachments = &self.conversation.draft_attachments;
         if !active && !attachments.is_empty() {

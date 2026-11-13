@@ -4,7 +4,10 @@ use crate::{
     anim,
     anim::{FISH_SWIM, menu_in, modal_in, pending_dot},
     bridge,
-    commands::{CommandCatalog, CommandSpec, canonical_host_command, visible_commands},
+    commands::{
+        CommandCatalog, CommandSpec, canonical_host_command, client_side_command,
+        resolve_command_token, visible_commands,
+    },
     files::{
         FileListing, FileToken, WorkspaceFile, active_file_token, file_mention, replace_token,
     },
@@ -2107,12 +2110,20 @@ impl DshApp {
         {
             return;
         }
-        let command = match self.composer.read(cx).value() {
-            "/permission" => Some(ComposerMenu::PermissionChoices),
-            "/model" => Some(ComposerMenu::CommandModels),
+        // Client-owned commands open their own surface. Resolving the built-in
+        // token (rather than comparing the raw line) keeps the Chinese spellings
+        // working: `/权限` previously fell through to the model as plain text.
+        // `/model` is a KWork extension rather than an official builtin, so it is
+        // matched literally alongside them.
+        let draft = self.composer.read(cx).value().trim().to_owned();
+        let menu = match resolve_command_token(&draft) {
+            Some((name, rest)) if rest.trim().is_empty() && name == "permission" => {
+                Some(ComposerMenu::PermissionChoices)
+            }
+            _ if matches!(draft.as_str(), "/model") => Some(ComposerMenu::CommandModels),
             _ => None,
         };
-        if let Some(command) = command {
+        if let Some(command) = menu {
             self.open_command_picker(command, true, w, cx);
             cx.notify();
             return;
@@ -2130,14 +2141,15 @@ impl DshApp {
         }
     }
 
-    /// 把 `/goal`、`/compact` 及中文别名交给会话的 ACP 命令目录执行。
-    /// `/plan` 由 `submit_plan_command` 处理，因为它还要提交可选的后续消息。
+    /// 把 `/goal`、`/compact`、`/permission` 等及中文别名交给会话的 ACP 命令目录执行。
+    /// `/plan` 由 `submit_plan_command` 处理，因为它还要提交可选的后续消息；
+    /// 纯客户端的命令（如 `/export`）在这里返回 `false`，交给后面的提交路径。
     fn submit_host_command(&mut self, w: &mut Window, cx: &mut Context<Self>) -> bool {
         let draft = self.composer.read(cx).value().to_owned();
         let Some((name, line)) = canonical_host_command(&draft) else {
             return false;
         };
-        if name == "plan" {
+        if name == "plan" || client_side_command(&name) {
             return false;
         }
         if !self.command_catalog.supports(&name) {

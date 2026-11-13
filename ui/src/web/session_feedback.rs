@@ -196,10 +196,11 @@ impl DshApp {
         cx: &mut Context<Self>,
     ) -> bool {
         let text = self.composer.read(cx).value().trim();
-        let Some(remark) = text
-            .strip_prefix("/feedback")
-            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
-        else {
+        // Both official spellings of the builtin token must reach the same panel.
+        // Handling only the English one sent `/反馈` down the host path instead,
+        // where an empty argument is an error, so the two spellings behaved
+        // differently.
+        let Some(remark) = crate::commands::strip_command_token(text, "feedback") else {
             return false;
         };
         let remark = trim_feedback(remark).to_owned();
