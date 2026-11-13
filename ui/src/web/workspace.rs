@@ -2724,6 +2724,47 @@ impl DshApp {
                 content = content.child(self.render_question_tool(id, None, cx));
             }
         }
+        // Official pending steering rows: a Host-pending next-step message keeps
+        // its user bubble at the transcript tail (QueueDock only lists next-turn
+        // rows), so a mid-turn 插话 is visible next to the running status.
+        for queued in self
+            .conversation
+            .queued_prompts
+            .iter()
+            .filter(|row| row.mode == crate::submit::SubmitMode::Steer)
+        {
+            let text = queued.display.clone();
+            content = content.child(
+                flow_rows.row(
+                    format!("pending-steer-{}", queued.item_id),
+                    row().w_full().justify_end().child(
+                        column()
+                            .max_w(gpui::relative(0.702))
+                            .items_end()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .px(px(16.))
+                                    .py(px(10.))
+                                    .rounded(px(20.))
+                                    .border(px(0.5))
+                                    .border_color(p.line)
+                                    .bg(p.bubble)
+                                    .text_size(px(14.))
+                                    .line_height(px(22.))
+                                    .child(text),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .line_height(px(18.))
+                                    .text_color(p.faint)
+                                    .child("插话 · 待回应"),
+                            ),
+                    ),
+                ),
+            );
+        }
         if self.conversation.running {
             // 官方运行状态：鲸尾 + 阶段标签（思考中→深度思考中）+ 已处理/已消耗。
             let elapsed = self
@@ -4299,7 +4340,14 @@ impl DshApp {
     fn render_queue_cards(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = dsh(cx);
         let running = self.conversation.running;
-        let count = self.conversation.queued_prompts.len();
+        // Steering rows live in the transcript as pending user bubbles, so the
+        // dock mirrors only the official next-turn (queued) rows.
+        let count = self
+            .conversation
+            .queued_prompts
+            .iter()
+            .filter(|row| row.mode != crate::submit::SubmitMode::Steer)
+            .count();
         let mut list = column().w_full().gap(px(6.));
         if count > 1 {
             list = list.child(
@@ -4319,6 +4367,9 @@ impl DshApp {
             );
         }
         for (index, queued) in self.conversation.queued_prompts.iter().enumerate() {
+            if queued.mode == crate::submit::SubmitMode::Steer {
+                continue;
+            }
             let preview = short_text(&queued.display, 96);
             let for_copy = queued.display.clone();
             let mode = queued.mode;

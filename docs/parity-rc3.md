@@ -21,6 +21,7 @@ KWork 是 Rust/GPUI 客户端，通过 ACP 与 Host 通信；官方客户端是 
 | 类型化工具卡 | `ui-tool-*` | shell（`$ 命令` + 描述）、read（行号 + 文件尾注）、grep（文件分组）、web_fetch（URL + HTTP 状态 + 正文）；暗色/浅色均验证 |
 | 交付出物卡片 | `ui-sidebar` DeliverablesTail | 路径 + 描述、2 列网格、全部/收起；点击预览在侧栏打开文档、默认应用打开、Finder 显示；真机验证 |
 | 已编辑文件卡 | `changed-files` | 文件列表行点击在侧栏打开；行数 `+N/-M` 不可达（见下） |
+| 插话与排队 | `ui-chat` PendingSteering / QueueDock | 运行中插话的行内回显为转录区末尾的用户气泡（「插话 · 待回应」），Host 受理后变为持久消息；排队消息仍在输入区上方的 QueueDock 卡片中编辑/插话/删除；真机验证 |
 | 审批流 | `ui-approvals` | 命令摘要、工具标签本地化、拒绝/允许一次/始终允许；真实审批流程验证过 |
 | 计划/待办 | `ui-chat` plan card、`todo/write` | 计划卡与待办行；ACP 事件回放验证 |
 | 子代理 | `subagent/*` | 子代理目录、描述行、只读子会话视图；回放与真实会话验证 |
