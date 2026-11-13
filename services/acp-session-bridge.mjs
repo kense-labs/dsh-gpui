@@ -81,6 +81,9 @@ const compactionSummaries = new Map()
 // when the inbox claimed it for the next turn (official `waking`); a notice that
 // arrives mid-turn stays a collapsed context row, exactly like the replay does.
 const inboxes = new WeakMap()
+// Tool call whose arguments are still streaming in the current assistant
+// message (official `summary.preparing`): only the name changes are forwarded.
+const preparingTools = new WeakMap()
 const planReviews = new Map();
 const questionRequests = new Map();
 const messageMethods = new Map([
@@ -1823,20 +1826,43 @@ function observeSessionUpdates(ctx) {
       ...(origin === 'subagent' && parentSession ? { parentSessionId: parentSession } : {}),
     });
   };
-  ctx.on('agent/status', ({ agent, status }) => notifyAgentStatus(agent, status === 'running'));
-  ctx.on('agent/disposed', ({ agent }) => notifyAgentStatus(agent, false));
+  ctx.on('agent/status', ({ agent, status }) => notifyAgentStatus(agent, status === 'running'), { global: true });
+  ctx.on('agent/disposed', ({ agent }) => notifyAgentStatus(agent, false), { global: true });
   // A goal created, paused, resumed, edited, blocked, or cleared commits one
   // `goal/change`; forwarding the fresh live view keeps the composer strip in
   // step without polling.
   ctx.on('goal/changed', ({ agent }) => notify(agent.id, {
     sessionUpdate: 'gpui_goal_changed',
     goal: currentGoalView(ctx, agent),
-  }));
+  }), { global: true });
   ctx.on('agent/assistant-stream', ({ agent, frame }) => {
     if (frame.type === 'chunk') {
       const chunk = frame.chunk;
+      if (chunk.type === 'block-start' && chunk.blockType === 'tool-call') {
+        notify(agent.id, { sessionUpdate: 'gpui_tool_preparing', preparing: true, name: null });
+        return;
+      }
+      if (chunk.type === 'tool-call-delta') {
+        const previous = preparingTools.get(agent);
+        if (chunk.name && chunk.name !== previous) {
+          preparingTools.set(agent, chunk.name);
+          notify(agent.id, { sessionUpdate: 'gpui_tool_preparing', preparing: true, name: chunk.name });
+        }
+        return;
+      }
+      if (chunk.type === 'block-end' && chunk.block?.type === 'tool-call') {
+        preparingTools.delete(agent);
+        notify(agent.id, { sessionUpdate: 'gpui_tool_preparing', preparing: false });
+        return;
+      }
       if (chunk.type !== 'reasoning-delta' && chunk.type !== 'text-delta' &&
           !(chunk.type === 'block-end' && ['reasoning', 'text'].includes(chunk.block.type))) return;
+    }
+    if (frame.type === 'end') {
+      // The message finished streaming: the tool now executes, and its live
+      // activity label takes over from 准备X.
+      preparingTools.delete(agent);
+      notify(agent.id, { sessionUpdate: 'gpui_tool_preparing', preparing: false });
     }
     const update = { sessionUpdate: 'gpui_assistant_stream', frame };
     if (frame.type === 'end' && frame.outcome.kind === 'committed' &&
@@ -1850,7 +1876,7 @@ function observeSessionUpdates(ctx) {
       }
     }
     notify(agent.id, update);
-  });
+  }, { global: true });
   ctx.on('session/event', (session, event) => {
     if (event.type === 'tool/ptc-dispatch-start' || event.type === 'tool/ptc-dispatch') {
       notify(session.id, { sessionUpdate: 'gpui_ptc_dispatch', event });

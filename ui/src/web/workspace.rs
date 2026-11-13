@@ -2472,22 +2472,36 @@ impl DshApp {
                 .map(|started| ((bridge::monotonic_ms() - started) / 1000.) as f32)
                 .unwrap_or(0.);
             let live_kind = running_tool.map(|entry| crate::process::activity(entry.tool_name()));
-            let live_label = live_kind
-                .map(|kind| kind.live_label().to_string())
-                .unwrap_or_else(|| {
-                    let thinking = matches!(
-                        self.conversation.entries.last(),
-                        Some(ChatEntry {
-                            role: EntryRole::Thought,
-                            ..
-                        })
-                    );
-                    if thinking {
-                        "正在分析请求".to_string()
-                    } else {
-                        "深度求索中".to_string()
-                    }
-                });
+            // While the model streams a tool call's arguments the tool is not
+            // running yet: official shows 准备X for it.
+            let preparing_label = self.conversation.preparing_tool.as_ref().map(|name| {
+                if name.is_empty() {
+                    crate::process::ProcessKind::Thinking
+                        .prepare_label()
+                        .to_string()
+                } else {
+                    crate::process::activity(name).prepare_label().to_string()
+                }
+            });
+            let live_label = match preparing_label {
+                Some(label) => label,
+                None => live_kind
+                    .map(|kind| kind.live_label().to_string())
+                    .unwrap_or_else(|| {
+                        let thinking = matches!(
+                            self.conversation.entries.last(),
+                            Some(ChatEntry {
+                                role: EntryRole::Thought,
+                                ..
+                            })
+                        );
+                        if thinking {
+                            "正在分析请求".to_string()
+                        } else {
+                            "深度求索中".to_string()
+                        }
+                    }),
+            };
             let label = if elapsed >= 1. {
                 format!("{live_label}，用时 {}s···", elapsed.floor() as u32)
             } else {

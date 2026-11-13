@@ -39,6 +39,9 @@ pub(super) struct Conversation {
     pub(super) resumed_session: bool,
     pub(super) entries: Vec<ChatEntry>,
     pub(super) assistant_stream: crate::assistant_stream::AssistantStream,
+    /// Tool name whose arguments are still streaming (`Some("")` when the name is
+    /// not known yet); drives the official 准备X live label.
+    pub(super) preparing_tool: Option<String>,
     pub(super) usage: Option<(u64, u64)>,
     pub(super) permission: Option<PermissionRequest>,
     pub(super) permission_mode: super::permission_picker::PermissionMode,
@@ -115,6 +118,7 @@ impl Conversation {
         self.turn_started = Some(now);
         self.last_event_ms = Some(now);
         self.turn_summary = None;
+        self.preparing_tool = None;
         self.turn_usage_base = self.usage.map(|(used, _)| used);
     }
 
@@ -138,6 +142,7 @@ impl Conversation {
         self.last_turn_settled = Some(bridge::monotonic_ms());
         self.turn_summary = Some(TurnSummary { end, seconds, used });
         self.running = false;
+        self.preparing_tool = None;
         self.assistant_stream.clear();
         self.flush_pending_deliverables();
         self.permission = None;

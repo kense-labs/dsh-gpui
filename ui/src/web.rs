@@ -3363,6 +3363,19 @@ impl DshApp {
             conversation.plan_active = update["active"].as_bool();
             return;
         }
+        if update["sessionUpdate"] == "gpui_tool_preparing" {
+            if update["preparing"] == true {
+                conversation.preparing_tool =
+                    Some(update["name"].as_str().unwrap_or_default().to_owned());
+            } else {
+                conversation.preparing_tool = None;
+            }
+            if selected {
+                self.maybe_follow_tail();
+            }
+            cx.notify();
+            return;
+        }
         if update["sessionUpdate"] == "gpui_assistant_stream" {
             if conversation.running {
                 conversation.assistant_stream.update(update);

@@ -39,6 +39,27 @@ impl ProcessKind {
         }
     }
 
+    /// Label while the model is still streaming a tool call's arguments
+    /// (official `message.stepProcess.prepare.*`).
+    pub fn prepare_label(self) -> &'static str {
+        match self {
+            Self::Thinking => "准备调用工具",
+            Self::Read => "准备读取文件",
+            Self::ReadImage => "准备读取图片",
+            Self::Write => "准备写入文件",
+            Self::Search => "准备搜索代码",
+            Self::Edit => "准备编辑文件",
+            Self::Commands => "准备运行命令",
+            Self::Code => "准备运行代码",
+            Self::WebSearch => "准备搜索网页",
+            Self::WebFetch => "准备访问网页",
+            Self::Subagents => "准备协调子智能体",
+            Self::Plan => "准备更新计划",
+            Self::Questions => "准备提问",
+            Self::Tools => "准备调用工具",
+        }
+    }
+
     pub fn live_label(self) -> &'static str {
         match self {
             Self::Thinking => "正在分析请求",
@@ -516,6 +537,22 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn prepare_labels_follow_the_official_strings() {
+        assert_eq!(ProcessKind::Read.prepare_label(), "准备读取文件");
+        assert_eq!(ProcessKind::Commands.prepare_label(), "准备运行命令");
+        assert_eq!(ProcessKind::Thinking.prepare_label(), "准备调用工具");
+        assert_eq!(ProcessKind::Tools.prepare_label(), "准备调用工具");
+        assert_eq!(
+            crate::process::activity("bash").prepare_label(),
+            "准备运行命令"
+        );
+        assert_eq!(
+            crate::process::activity("str_replace_editor").prepare_label(),
+            "准备调用工具"
+        );
+    }
+
     fn activity_maps_official_tool_names() {
         assert_eq!(activity("bash"), ProcessKind::Commands);
         assert_eq!(activity("read"), ProcessKind::Read);
