@@ -1925,6 +1925,12 @@ function observeSessionUpdates(ctx) {
       });
       return;
     }
+    // Direct-child discovery facts are what the official lineage catalog lists;
+    // the parent run can open each child's transcript from them.
+    if (type === 'subagent/catalog') {
+      notify(session.id, { sessionUpdate: 'gpui_subagent_catalog', ...data });
+      return;
+    }
     // Every pending-Inbox mutation is durable and already carries its whole
     // splice. The client re-reads the pending rows instead of rebuilding the
     // splice chain itself, so a claimed steering item leaves the dock exactly

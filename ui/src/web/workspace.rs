@@ -1964,6 +1964,9 @@ impl DshApp {
             .gap_0()
             .pt(px(16.))
             .pb(px(16.));
+        if let Some(label) = self.subagent_view_label().map(str::to_owned) {
+            content = content.child(self.render_subagent_banner(&label, cx));
+        }
         if self.conversation.history_has_more || self.conversation.history_loading {
             let label = if self.conversation.history_loading {
                 "载入历史…"
@@ -3145,6 +3148,9 @@ impl DshApp {
             .when(self.conversation.goal.is_some(), |element| {
                 element.child(self.render_goal_bar(cx))
             })
+            .when(!self.conversation.subagents.is_empty(), |element| {
+                element.child(self.render_subagent_catalog(cx))
+            })
             .when(!self.conversation.queued_prompts.is_empty(), |element| {
                 element.child(self.render_queue_cards(cx))
             })
@@ -3582,6 +3588,175 @@ impl DshApp {
                 |this, w, cx| this.run_goal_action("clear", w, cx),
             ));
         bar.into_any_element()
+    }
+
+    /// composer 上方的子智能体目录（官方 session-header lineage 的功能对应）。
+    ///
+    /// 折叠时只有一行「子智能体 N · M 运行中」；展开后每个直接子会话一行，
+    /// 显示标签、创建模式与活动状态，点一行打开它的只读执行记录。
+    fn render_subagent_catalog(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let p = dsh(cx);
+        let total = self.conversation.subagents.len();
+        let running = self
+            .conversation
+            .subagents
+            .iter()
+            .filter(|row| self.running_subagents.contains_key(&row.child_id))
+            .count();
+        let expanded = self.conversation.subagents_expanded;
+        let summary = if running > 0 {
+            format!("子智能体 {total} · {running} 运行中")
+        } else {
+            format!("子智能体 {total}")
+        };
+        let mut column = column().w_full().gap(px(6.));
+        column = column.child(
+            row()
+                .id("subagent-catalog-header")
+                .role(gpui::Role::Button)
+                .aria_label(&summary)
+                .aria_expanded(expanded)
+                .tab_index(0)
+                .w_full()
+                .h(px(28.))
+                .px(px(10.))
+                .gap(px(8.))
+                .items_center()
+                .rounded(px(crate::tokens::Tokens::RADIUS_SM))
+                .cursor_pointer()
+                .hover(|style| style.bg(p.hover))
+                .text_size(px(12.))
+                .line_height(px(18.))
+                .text_color(p.label_caption)
+                .child(icon(Glyph::User, 13., p.label_caption))
+                .child(div().flex_1().min_w_0().truncate().child(summary.clone()))
+                .child(icon(
+                    if expanded { Glyph::Up } else { Glyph::Down },
+                    12.,
+                    p.faint,
+                ))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_subagent_list(cx))),
+        );
+        if expanded {
+            for catalog_row in self.conversation.subagents.clone() {
+                let running = self.running_subagents.contains_key(&catalog_row.child_id);
+                let activity = crate::subagents::activity_label(&catalog_row, running);
+                let child_id = catalog_row.child_id.clone();
+                let label = catalog_row.label.clone();
+                let has_transcript = catalog_row.has_local_session();
+                let item = row()
+                    .id(gpui::ElementId::Name(
+                        format!("subagent-{}", catalog_row.child_id).into(),
+                    ))
+                    .role(gpui::Role::Button)
+                    .aria_label(format!("打开子智能体 {} 的执行记录", catalog_row.label))
+                    .tab_stop(has_transcript)
+                    .w_full()
+                    .min_h(px(32.))
+                    .px(px(12.))
+                    .py(px(6.))
+                    .gap(px(8.))
+                    .items_center()
+                    .rounded(px(crate::tokens::Tokens::RADIUS_SM))
+                    .border(px(0.5))
+                    .border_color(p.line)
+                    .bg(p.stage)
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .px(px(6.))
+                            .py(px(1.))
+                            .rounded_full()
+                            .border(px(0.5))
+                            .border_color(p.line)
+                            .text_size(px(10.))
+                            .line_height(px(14.))
+                            .text_color(p.label_caption)
+                            .child(catalog_row.mode.label()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(13.))
+                            .line_height(px(20.))
+                            .text_color(p.secondary)
+                            .child(catalog_row.label.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(11.))
+                            .line_height(px(16.))
+                            .text_color(if running {
+                                p.state_business_primary
+                            } else {
+                                p.label_caption
+                            })
+                            .child(activity),
+                    );
+                column = column.child(if has_transcript {
+                    item.cursor_pointer()
+                        .hover(|style| style.bg(p.hover))
+                        .on_click(cx.listener(move |this, _, w, cx| {
+                            this.open_subagent_child(&child_id, &label, w, cx);
+                        }))
+                } else {
+                    item.opacity(0.6)
+                });
+            }
+        }
+        column
+    }
+
+    /// 只读子会话顶部的导航条：说明当前看的是谁的执行记录，并提供返回父会话。
+    fn render_subagent_banner(
+        &self,
+        label: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let p = dsh(cx);
+        row()
+            .id("subagent-banner")
+            .w_full()
+            .mb(px(10.))
+            .px(px(12.))
+            .py(px(8.))
+            .gap(px(8.))
+            .items_center()
+            .rounded(px(crate::tokens::Tokens::RADIUS_SM))
+            .border(px(0.5))
+            .border_color(p.line)
+            .bg(p.stage)
+            .child(icon(Glyph::User, 14., p.label_caption))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(12.))
+                    .line_height(px(18.))
+                    .text_color(p.label_caption)
+                    .child(format!("子智能体 · {label} · 只读执行记录")),
+            )
+            .child(
+                div()
+                    .id("subagent-back")
+                    .role(gpui::Role::Button)
+                    .aria_label("返回父会话")
+                    .tab_index(0)
+                    .px(px(8.))
+                    .py(px(3.))
+                    .rounded(px(6.))
+                    .bg(p.hover)
+                    .cursor_pointer()
+                    .text_size(px(12.))
+                    .line_height(px(18.))
+                    .text_color(p.secondary)
+                    .child("返回父会话")
+                    .on_click(cx.listener(|this, _, w, cx| this.close_subagent_view(w, cx))),
+            )
     }
 
     /// 官方 QueueDock：Host Inbox 里每条待投递消息一行。

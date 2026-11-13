@@ -24,6 +24,10 @@ pub(super) struct Conversation {
     pub(super) goal_busy: bool,
     /// Last rejected goal verb, shown inside the strip (official `actionError`).
     pub(super) goal_error: Option<String>,
+    /// Direct children this session spawned (official subagent catalog).
+    pub(super) subagents: Vec<crate::subagents::SubagentRow>,
+    /// Whether the composer's subagent list is expanded.
+    pub(super) subagents_expanded: bool,
     /// 待投递列表的本地单调序号；用于忽略比某一行更早请求的 Host 快照。
     pub(super) inbox_seq: u64,
     pub(super) wrapped_code: std::collections::HashSet<String>,

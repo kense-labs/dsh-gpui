@@ -35,6 +35,8 @@ pub struct HistoryProjection {
     pub session_title: Option<(u64, String)>,
     /// Last committed human prompt, used by the workspace row's activity label.
     pub last_prompt_at_ms: Option<u64>,
+    /// Direct children this session spawned, in discovery order.
+    pub subagents: Vec<crate::subagents::SubagentRow>,
 }
 
 /// Sources that should appear as ordinary user bubbles or turn triggers.
@@ -54,6 +56,11 @@ fn content_texts(blocks: &[Value]) -> String {
         .iter()
         .filter_map(|block| match block.get("type").and_then(Value::as_str) {
             Some("text") | Some("reasoning") => block.get("text").and_then(Value::as_str),
+            // Media blocks carry no text, but dropping them silently erased a
+            // prompt that was only an image when the session was reopened.
+            Some("image") => Some("[图片]"),
+            Some("file") => Some("[文件]"),
+            Some("audio") => Some("[音频]"),
             _ => None,
         })
         .filter(|text| !text.is_empty())
@@ -605,6 +612,11 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                     out.session_title = Some((seq, title.to_string()));
                 }
             }
+            "subagent/catalog" => {
+                if let Some(row) = crate::subagents::SubagentRow::from_event_data(&data) {
+                    crate::subagents::upsert_subagent(&mut out.subagents, row);
+                }
+            }
             "goal/change" => {
                 let operation = data
                     .get("operation")
@@ -682,6 +694,47 @@ mod tests {
 
     #[test]
     #[test]
+    #[test]
+    fn a_replayed_subagent_catalog_lists_the_children() {
+        // Payload copied from a real parent session log: the parent records one
+        // durable discovery fact per direct child, and reopening it must still
+        // list them so the child transcript stays reachable.
+        let events = vec![
+            json!({"type":"subagent/catalog","seq":11,"time":1_794_454_553_991u64,
+                "data":{"version":0,"childId":"3ee01e83-40f7-4abf-b1e4-03c4bc0d85ef",
+                "childCreatedAt":1_794_454_553_990u64,"mode":"continuable","label":"研究 goal 官方 UI 呈现"}}),
+            json!({"type":"subagent/catalog","seq":12,"time":1_794_454_553_992u64,
+                "data":{"version":0,"childId":"670c17fd-6c94-4ac5-8e69-a0e6a62b0845",
+                "childCreatedAt":1_794_454_553_992u64,"mode":"one-shot","label":"研究思考动画实现"}}),
+        ];
+        let projected = project_session_events(&events);
+        assert_eq!(projected.subagents.len(), 2);
+        assert_eq!(projected.subagents[0].label, "研究 goal 官方 UI 呈现");
+        assert_eq!(
+            projected.subagents[0].mode,
+            crate::subagents::SubagentMode::Continuable
+        );
+        assert_eq!(
+            projected.subagents[1].child_id,
+            "670c17fd-6c94-4ac5-8e69-a0e6a62b0845"
+        );
+    }
+
+    #[test]
+    fn a_prompt_that_was_only_an_image_keeps_a_placeholder() {
+        // Billing artifacts and the durable image block carry no text: dropping
+        // them erased the whole user bubble when the session was reopened.
+        let events = vec![json!({
+            "type":"user/message","seq":3,"time":20,
+            "data":{"id":"img-1","source":{"kind":"user"},
+                "content":[{"type":"image","attachment":{"attachmentId":"a-1","mediaType":"image/png"}}]}
+        })];
+        let projected = project_session_events(&events);
+        assert_eq!(projected.entries.len(), 1);
+        assert_eq!(projected.entries[0].role, EntryRole::User);
+        assert_eq!(projected.entries[0].text, "[图片]");
+    }
+
     fn a_replayed_todo_row_keeps_the_live_summary() {
         // A reopened session must show the same todo summary a live turn showed,
         // not the bare tool name.

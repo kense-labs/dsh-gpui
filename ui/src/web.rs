@@ -583,6 +583,8 @@ pub(crate) struct DshApp {
     parked_conversations: HashMap<String, Conversation>,
     session_activity: HashMap<String, SessionActivity>,
     running_subagents: HashMap<String, String>,
+    /// Read-only child transcript currently open, and the parent to return to.
+    subagent_view: Option<subagent_view::SubagentView>,
     opening_session_events: Vec<Value>,
     pub(crate) page: WorkspacePage,
     pending_action: Option<PendingAction>,
@@ -958,6 +960,7 @@ impl DshApp {
             parked_conversations: HashMap::new(),
             session_activity: HashMap::new(),
             running_subagents: HashMap::new(),
+            subagent_view: None,
             opening_session_events: Vec::new(),
             page: WorkspacePage::Conversation,
             pending_action: None,
@@ -1641,6 +1644,8 @@ impl DshApp {
         if !self.connected() || self.creating_session {
             return;
         }
+        // Any ordinary navigation leaves the read-only child record.
+        self.subagent_view = None;
         if self.archived_sessions.contains(&session.id) {
             // 官方：已归档结果不清空查询、不导航。
             self.push_toast("已归档对话暂时无法查看，请取消归档后查看", cx);
@@ -1935,6 +1940,15 @@ impl DshApp {
             conversation.turn_process.observe_history(event);
         }
         conversation.history_has_more = projected.has_more;
+        // The catalog is independent of transcript rows: a parent whose history
+        // page holds only subagent facts must still list its children.
+        for row in std::mem::take(&mut projected.subagents) {
+            crate::subagents::upsert_subagent(&mut conversation.subagents, row);
+        }
+        // Pages can arrive newest-first; the catalog reads in discovery order.
+        conversation
+            .subagents
+            .sort_by_key(|row| row.created_at_ms.unwrap_or(u64::MAX));
         if projected.entries.is_empty() {
             return;
         }
@@ -3028,6 +3042,16 @@ impl DshApp {
             self.handle_goal_changed(session, update, cx);
             return;
         }
+        if update["sessionUpdate"] == "gpui_subagent_catalog" {
+            if let (Some(conversation), Some(row)) = (
+                self.conversation_mut(session),
+                crate::subagents::SubagentRow::from_event_data(update),
+            ) {
+                crate::subagents::upsert_subagent(&mut conversation.subagents, row);
+                cx.notify();
+            }
+            return;
+        }
         let Some(conversation) = self.conversation_mut(session) else {
             if self.creating_session {
                 self.opening_session_events.push(event);
@@ -3698,6 +3722,7 @@ mod session_inbox;
 mod session_markdown;
 mod shortcut_settings;
 mod start_panel;
+mod subagent_view;
 mod terminal;
 mod terminal_shell_menu;
 mod terminal_title;
