@@ -59,7 +59,13 @@ function buildEnv() {
   return cachedEnv;
 }
 const run = (command, args) => {
-  execFileSync(command, args, { cwd: root, env: buildEnv(), stdio: 'inherit' });
+  execFileSync(command, args, {
+    cwd: root,
+    env: buildEnv(),
+    stdio: 'inherit',
+    // A Windows .cmd shim cannot be spawned directly by execFileSync.
+    shell: process.platform === 'win32' && /\.cmd$/i.test(command),
+  });
 };
 
 // Every file that can change the contents of ui/dist. ui/dist itself is
@@ -266,7 +272,8 @@ run('rustup', [
 ]);
 
 const lock = readFileSync(join(root, 'Cargo.lock'), 'utf8');
-const match = lock.match(/name = "wasm-bindgen"\nversion = "([^"]+)"/);
+// Windows checkouts can convert Cargo.lock to CRLF; accept both line endings.
+const match = lock.match(/name = "wasm-bindgen"\r?\nversion = "([^"]+)"/);
 if (!match) throw new Error('无法从 Cargo.lock 确定 wasm-bindgen 版本。');
 const version = match[1];
 const tools = process.env.CARGO_INSTALL_ROOT || join(root, '.tools');

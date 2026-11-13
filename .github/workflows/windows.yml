@@ -22,6 +22,9 @@ jobs:
     runs-on: windows-latest
     env:
       KWORK_UI_BUILD: always
+      # First Windows pipeline: skip the optional wasm-opt size pass (it needs
+      # a .cmd shim); the installer ships the unoptimized 27MB wasm instead.
+      KWORK_WASM_OPT: off
     steps:
       - uses: actions/checkout@v4
 
