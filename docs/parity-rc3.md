@@ -30,7 +30,7 @@ KWork 是 Rust/GPUI 客户端，通过 ACP 与 Host 通信；官方客户端是 
 | 工作区侧栏 | `ui-sidebar` | 工作区分组、置顶/隐藏/折叠、会话归档与重命名、排序、分组切换 |
 | 文件侧栏 | `ui-sidebar-files` | 搜索、按工作区持久化的排除规则、显示隐藏项、忽略文件开关 |
 | 内置浏览器 | `ui-sidebar-browser` | 右栏标签、地址栏、前进后退刷新、恢复上次页面 |
-| 设置 | `ui-settings` | 服务目录、快捷键、正文偏好、开发者工具、隐藏工作区 |
+| 设置 | `ui-settings` | API Key / 通用 / 外观 / 模型 / 模型服务 / 内置插件 / Agent 预设 / 会话日志各页真机走查；弹窗内容可滚动（性能与用量、版本行可达），输入、选择器与状态文案正常 |
 | 文件类型图标 | `ui-primitives` FileTypeIcon | Files 树与文档页签按扩展名显示类型图标（Markdown 用 MD 标记、图片用显示器图标、其余通用文档图标；官方每种语言有全彩图标，此处为可辨识的近似）；真机验证 |
 | API Key 显隐 | `ui-settings-models` ApiKeyInput | 编辑草稿时眼睛按钮切换明文/掩码（仅未保存草稿，保存后凭据仍为只写）；真机验证 |
 | 外观偏好 | `ui-theme` | 浅色 / 深色 / 跟随系统三选一，选中项跟随**已存偏好**而非解析结果；跟随系统时实时响应 macOS 外观切换（轮询）；偏好持久化 `themeMode`；真机验证 |
@@ -61,6 +61,8 @@ KWork 是 Rust/GPUI 客户端，通过 ACP 与 Host 通信；官方客户端是 
 | 账号通知 | `ui-account-notifications` | 不适用 | 官方 Web 端账号体系能力 |
 | 插件管理状态 | 设置 schema 下发 | 只展示 Host 提供的信息 | Host 未提供完整插件 schema/版本字段 |
 | 上下文用量环 | 客户端估算 | 使用 Host 提供的 usage | 估算口径不同，仅展示 Host 数据 |
+| 最小投递间隔提示 | 官方 Web 端 `schedule.deliveryLimits()` | 仅保留操作失败时的「等待最短投递间隔」提示 | delivery limits 走 Web remote 接口，ACP 没有对应方法；新增自动化时无法显示具体间隔秒数 |
+| 会话日志上传 | 官方设置页上传本地 transcript | 不上传 | Host 未开放上传通道，设置页已明确说明 |
 | 数学 KaTeX 排版 | KaTeX | 近似实现 | 见上表 |
 
 ## 验证方式
