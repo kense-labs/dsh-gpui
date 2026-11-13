@@ -68,12 +68,27 @@ pub fn turn_items<'a>(entries: impl IntoIterator<Item = &'a ChatEntry>) -> Vec<T
     items
 }
 
-/// Index of the turn currently at the top of the viewport.
+/// Index of the turn the reader is looking at.
+///
+/// Official ChatView picks the latest turn while the viewport is parked at the
+/// bottom and otherwise the turn at the top of the viewport:
+///
+/// ```text
+/// activeTurn = nearBottom ? latestTurn : readVisibleTurn(metrics)
+/// ```
 ///
 /// `tops` are the per-turn anchor offsets from the transcript measurement pass;
 /// `None` means the anchor has not been measured yet and cannot win. The
 /// `slack` keeps a turn active while its opening row is just above the fold.
-pub fn active_turn(tops: &[Option<f32>], scroll_top: f32, slack: f32) -> Option<usize> {
+pub fn active_turn(
+    tops: &[Option<f32>],
+    scroll_top: f32,
+    slack: f32,
+    near_bottom: bool,
+) -> Option<usize> {
+    if near_bottom && !tops.is_empty() {
+        return Some(tops.len() - 1);
+    }
     let mut active = None;
     for (index, top) in tops.iter().enumerate() {
         let Some(top) = top else {
@@ -164,12 +179,22 @@ mod tests {
     #[test]
     fn the_active_turn_follows_the_top_of_the_viewport() {
         let tops = [Some(0.), Some(400.), Some(900.), None];
-        assert_eq!(active_turn(&tops, 0., 8.), Some(0));
-        assert_eq!(active_turn(&tops, 30., 8.), Some(0));
-        assert_eq!(active_turn(&tops, 404., 8.), Some(1));
-        assert_eq!(active_turn(&tops, 1200., 8.), Some(2));
+        assert_eq!(active_turn(&tops, 0., 8., false), Some(0));
+        assert_eq!(active_turn(&tops, 30., 8., false), Some(0));
+        assert_eq!(active_turn(&tops, 404., 8., false), Some(1));
+        assert_eq!(active_turn(&tops, 1200., 8., false), Some(2));
         // Before the first measured anchor nothing is active.
-        assert_eq!(active_turn(&[None, Some(10.)], 0., 8.), None);
+        assert_eq!(active_turn(&[None, Some(10.)], 0., 8., false), None);
+        // Parked at the bottom the latest turn wins even though an earlier turn
+        // still owns the top of the viewport.
+        assert_eq!(active_turn(&tops, 4000., 8., true), Some(3));
+    }
+
+    #[test]
+    fn the_latest_turn_is_active_at_the_bottom_even_before_measuring() {
+        let tops = [None, None, None];
+        assert_eq!(active_turn(&tops, 0., 8., true), Some(2));
+        assert_eq!(active_turn(&[], 0., 8., true), None);
     }
 
     #[test]

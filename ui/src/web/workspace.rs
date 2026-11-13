@@ -2714,14 +2714,22 @@ impl DshApp {
         }
         let p = dsh(cx);
         let scroll_top = -self.conversation.scroll.offset().y.as_f32();
+        let max_offset = self.conversation.scroll.max_offset().y.as_f32();
+        let near_bottom = max_offset - scroll_top <= 24.;
         let tops: Vec<Option<f32>> = items
             .iter()
             .map(|item| self.conversation.flow_scroll.row_top(&item.anchor))
             .collect();
-        let active = crate::turns::active_turn(&tops, scroll_top, 24.);
+        let active = crate::turns::active_turn(&tops, scroll_top, 24., near_bottom);
         let hover = self.conversation.turn_rail_hover;
         let total = items.len();
-        let mut marks = column().w_full().gap(px(4.)).items_center();
+        // Official rail: fixed 10px pitch between marks, capped at 420px tall.
+        // Once a session has more turns than that cap fits, compress the pitch
+        // (never the other way around) so every turn stays reachable.
+        let pitch = (420. / total as f32).clamp(3., 10.);
+        let mark_height = (pitch - 2.).clamp(2., 8.);
+        let gap = (pitch - mark_height).max(1.);
+        let mut marks = column().w_full().gap(px(gap)).items_center();
         for (index, item) in items.iter().enumerate() {
             let is_active = active == Some(index);
             let anchor = item.anchor.clone();
@@ -2733,7 +2741,7 @@ impl DshApp {
                 .aria_label(label)
                 .tab_index(0)
                 .w_full()
-                .h(px(8.))
+                .h(px(mark_height))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -2741,7 +2749,7 @@ impl DshApp {
                 .child(
                     div()
                         .w(px(if hover == Some(index) { 14. } else { 10. }))
-                        .h(px(2.))
+                        .h(px(if mark_height >= 4. { 2. } else { 1. }))
                         .rounded_full()
                         .bg(if is_active || hover == Some(index) {
                             p.ink
