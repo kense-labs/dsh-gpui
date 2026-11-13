@@ -684,6 +684,9 @@ pub(crate) struct DshApp {
     pub(crate) toasts: Vec<Toast>,
     /// User-message images already requested from the host (by attachment id).
     pub(crate) requested_attachments: std::collections::HashSet<String>,
+    /// Chat HTTP(S) links open in the built-in right-sidebar browser (official
+    /// default) unless the 网页链接 preference selects the system browser.
+    pub(crate) link_open_external: bool,
     /// Full-screen picture opened from a user bubble (official image dialog).
     pub(crate) image_viewer: Option<ImageViewer>,
     confirm_permission: Option<String>,
@@ -1064,6 +1067,7 @@ impl DshApp {
             archived_sessions: std::collections::HashSet::new(),
             toasts: Vec::new(),
             requested_attachments: std::collections::HashSet::new(),
+            link_open_external: false,
             image_viewer: None,
             confirm_permission: None,
             full_access_acknowledged: false,

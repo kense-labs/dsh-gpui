@@ -6784,6 +6784,23 @@ fn render_user_images(entry: &ChatEntry, cx: &mut Context<DshApp>) -> Option<gpu
 /// Full-screen picture dialog (official image dialog): masked backdrop with the
 /// picture centred and a close control.
 impl DshApp {
+    /// Open a Chat HTTP(S) link at the user's preferred destination.
+    ///
+    /// Official `LinkOpeningRow` defaults to the built-in sidebar browser and
+    /// falls back to the system browser when the preference says so.
+    pub(super) fn open_link(&mut self, url: &str, w: &mut Window, cx: &mut Context<DshApp>) {
+        let http = url.starts_with("http://") || url.starts_with("https://");
+        if self.link_open_external || !http || self.active_session.is_none() {
+            bridge::open_url(url);
+            return;
+        }
+        if !self.right_panel_visible() {
+            self.toggle_right_panel(w, cx);
+        }
+        let pane = self.sidebar.surface.layout.focused();
+        self.new_browser_tab(pane, Some(url.to_owned()), w, cx);
+    }
+
     fn render_image_viewer(&self, cx: &mut Context<DshApp>) -> Option<gpui::AnyElement> {
         let viewer = self.image_viewer.clone()?;
         let p = dsh(cx);
@@ -7746,12 +7763,12 @@ pub(super) fn render_markdown(
                                     ))
                                     .on_click(cx.listener({
                                         let selection = selection.cloned();
-                                        move |_, event, _, _| {
+                                        move |this: &mut DshApp, event, w, cx| {
                                             if selection
                                                 .as_ref()
                                                 .is_none_or(|layout| layout.clicked_link(event))
                                             {
-                                                bridge::open_url(&open);
+                                                this.open_link(&open, w, cx);
                                             }
                                         }
                                     }))
@@ -8041,12 +8058,12 @@ fn render_inline_rich(
                             .child(markdown_leaf(label, selected))
                             .on_click(cx.listener({
                                 let selection = selected.map(|(layout, _)| layout.clone());
-                                move |_, event, _, _| {
+                                move |this: &mut DshApp, event, w, cx| {
                                     if selection
                                         .as_ref()
                                         .is_none_or(|layout| layout.clicked_link(event))
                                     {
-                                        bridge::open_url(&open);
+                                        this.open_link(&open, w, cx);
                                     }
                                 }
                             })),

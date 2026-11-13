@@ -121,6 +121,9 @@ impl DshApp {
         if let Some(replies) = reply["foldedReplies"].as_str() {
             self.keep_folded_replies = replies != "final";
         }
+        if let Some(destination) = reply["linkOpen"].as_str() {
+            self.link_open_external = destination == "new-tab";
+        }
         if let Some(scratch) = reply
             .get("scratchSession")
             .and_then(Value::as_str)
@@ -190,6 +193,7 @@ impl DshApp {
                     "contentFontDelta": self.content_font_delta,
                     "collapseTiming": if self.collapse_next_input { "next-input" } else { "completion" },
                     "foldedReplies": if self.keep_folded_replies { "all" } else { "final" },
+                    "linkOpen": if self.link_open_external { "new-tab" } else { "sidebar" },
                     "workspaceOpenWith": self.workspace_open_with,
                     "scratchSession": self.scratch_session,
                     "workDetails": match self.work_details {

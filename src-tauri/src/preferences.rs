@@ -35,6 +35,8 @@ pub struct WorkspacePreferences {
     /// Id of the blank session the client opened at startup, so the next launch
     /// reuses it instead of leaving one unused session on disk per launch.
     pub scratch_session: Option<String>,
+    /// Chat HTTP(S) link destination: `sidebar` (built-in browser) or `new-tab`.
+    pub link_open: Option<String>,
 }
 
 #[tauri::command]
@@ -112,4 +114,31 @@ fn write_preferences(path: &PathBuf, preferences: &impl Serialize) -> Result<(),
         .map_err(|error| format!("无法编码工作区显示设置：{error}"))?;
     std::fs::write(&temporary, bytes).map_err(|error| format!("无法保存显示设置：{error}"))?;
     std::fs::rename(temporary, path).map_err(|error| format!("无法更新显示设置：{error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkspacePreferences;
+
+    #[test]
+    fn link_open_preference_round_trips_as_camel_case() {
+        let preferences = WorkspacePreferences {
+            link_open: Some("new-tab".to_string()),
+            ..WorkspacePreferences::default()
+        };
+        let encoded = serde_json::to_value(&preferences).expect("serialize preferences");
+        assert_eq!(encoded["linkOpen"], "new-tab");
+        let decoded: WorkspacePreferences =
+            serde_json::from_value(encoded).expect("deserialize preferences");
+        assert_eq!(decoded.link_open.as_deref(), Some("new-tab"));
+    }
+
+    #[test]
+    fn older_files_without_the_link_preference_still_load() {
+        let decoded: WorkspacePreferences =
+            serde_json::from_str(r#"{"workspaceOpenWith":"cursor"}"#)
+                .expect("legacy preferences load");
+        assert_eq!(decoded.link_open, None);
+        assert_eq!(decoded.workspace_open_with.as_deref(), Some("cursor"));
+    }
 }

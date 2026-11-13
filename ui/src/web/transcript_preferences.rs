@@ -10,6 +10,9 @@ enum Preference {
     Display,
     Timing,
     Replies,
+    /// Official LinkOpeningRow: Chat HTTP(S) links open in the sidebar browser or
+    /// the system default browser.
+    Links,
 }
 
 impl Preference {
@@ -30,6 +33,11 @@ impl Preference {
                 "工作步骤收起后，保留哪些助手回复",
                 &["全部回复", "仅最终回答"],
             ),
+            Self::Links => (
+                "网页链接默认打开方式",
+                "对话中网页链接的打开位置",
+                &["应用内侧边栏", "默认浏览器"],
+            ),
         }
     }
 
@@ -43,6 +51,7 @@ impl Preference {
             },
             Self::Timing => usize::from(app.collapse_next_input),
             Self::Replies => usize::from(!app.keep_folded_replies),
+            Self::Links => usize::from(app.link_open_external),
         }
     }
 }
@@ -59,7 +68,7 @@ struct OpenMenu {
 }
 
 pub(super) struct TranscriptPreferences {
-    triggers: [Trigger; 3],
+    triggers: [Trigger; 4],
     menu: Option<OpenMenu>,
 }
 
@@ -137,6 +146,7 @@ impl DshApp {
                 }
                 Preference::Timing => self.collapse_next_input = index == 1,
                 Preference::Replies => self.keep_folded_replies = index == 0,
+                Preference::Links => self.link_open_external = index == 1,
             }
             self.save_workspace_preferences(cx);
         }
@@ -191,7 +201,12 @@ impl DshApp {
     }
 
     pub(super) fn render_transcript_preferences(&self, w: &Window, cx: &mut Context<Self>) -> Div {
-        let fields = [Preference::Display, Preference::Timing, Preference::Replies];
+        let fields = [
+            Preference::Display,
+            Preference::Timing,
+            Preference::Replies,
+            Preference::Links,
+        ];
         column().w_full().gap_0().children(
             fields
                 .into_iter()
