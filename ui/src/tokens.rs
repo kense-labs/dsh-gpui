@@ -84,10 +84,14 @@ pub struct Tokens {
     pub scrollbar_l2: Hsla,       // --dsw-alias-scrollbar-bg-l2（菜单/侧栏）
     pub scrollbar_l2_hover: Hsla, // hover-l2
     // Markdown / 代码
-    pub md_code_block: Hsla,        // --dsw-alias-markdown-code-block
-    pub md_code_block_banner: Hsla, // --dsw-alias-markdown-code-block-banner
-    pub md_inline_code: Hsla,       // --dsw-alias-markdown-inline-code
-    pub md_tag: Hsla,               // --dsw-alias-markdown-tag
+    pub md_code_block: Hsla,            // --dsw-alias-markdown-code-block
+    pub md_code_block_banner: Hsla,     // --dsw-alias-markdown-code-block-banner
+    pub md_inline_code: Hsla,           // --dsw-alias-markdown-inline-code
+    pub md_tag: Hsla,                   // --dsw-alias-markdown-tag
+    pub file_diff_added_bg: Hsla,       // --dsw-alias-file-diff-added-bg
+    pub file_diff_added_marker: Hsla,   // --dsw-alias-file-diff-added-marker
+    pub file_diff_deleted_bg: Hsla,     // --dsw-alias-file-diff-deleted-bg
+    pub file_diff_deleted_marker: Hsla, // --dsw-alias-file-diff-deleted-marker
     // 开关
     pub switch_thumb: Hsla, // --dsw-alias-switch-thumb
 
@@ -183,6 +187,10 @@ impl Tokens {
             md_code_block_banner: rgb(0x2c2c2e).into(),
             md_inline_code: rgb(0x292929).into(),
             md_tag: rgb(0x2c2c2e).into(),
+            file_diff_added_bg: rgb(0x1f3124).into(),
+            file_diff_added_marker: rgb(0x41c977).into(),
+            file_diff_deleted_bg: rgb(0x3c1f1b).into(),
+            file_diff_deleted_marker: rgb(0xfa423e).into(),
             switch_thumb: rgb(0xadb2b8).into(),
             ink: rgb(0xf9fafb).into(),
             secondary: rgb(0xcfd3d6).into(),
@@ -267,6 +275,10 @@ impl Tokens {
             md_code_block_banner: rgb(0xf9fafb).into(),
             md_inline_code: rgb(0xfafafa).into(),
             md_tag: rgb(0xf1f3f5).into(),
+            file_diff_added_bg: rgb(0xe6f4e7).into(),
+            file_diff_added_marker: rgb(0x01a241).into(),
+            file_diff_deleted_bg: rgb(0xfce6e2).into(),
+            file_diff_deleted_marker: rgb(0xba2723).into(),
             switch_thumb: rgb(0xffffff).into(),
             ink: rgb(0x0f1115).into(),
             secondary: rgb(0x61666b).into(),

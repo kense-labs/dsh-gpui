@@ -10,6 +10,8 @@ use serde_json::Value;
 #[cfg(any(target_family = "wasm", test))]
 pub(crate) mod fold_scroll;
 #[cfg(any(target_family = "wasm", test))]
+pub(crate) mod pagination;
+#[cfg(any(target_family = "wasm", test))]
 pub(crate) mod turn_process;
 #[cfg(any(target_family = "wasm", test))]
 pub(crate) mod turn_tails;
@@ -82,6 +84,7 @@ fn known_event_type(kind: &str) -> bool {
             | "session/title"
             | "session/title-llm-request"
             | "session/end-seed"
+            | "session-log-deepseek/delivery-accepted"
             | "agent/inbox/spliced"
             | "request/header"
             | "request/context"
@@ -128,7 +131,7 @@ fn content_texts(blocks: &[Value]) -> String {
         .join("\n")
 }
 
-fn tool_title(name: &str, arguments: &str) -> String {
+pub(crate) fn tool_title(name: &str, arguments: &str) -> String {
     // A replayed todo row must read the same as a live one, or reopening a
     // session silently downgrades it to the bare tool name.
     if name == "todo_write"
@@ -140,6 +143,13 @@ fn tool_title(name: &str, arguments: &str) -> String {
     // tool name, so the process tree reads like the official one.
     if name == "present" {
         return "交付文件".to_owned();
+    }
+    // rc.3 tool titles for the Office tools (tool.title.office*).
+    match name {
+        "office_render" => return "渲染文档".to_owned(),
+        "office_convert" => return "转换文档".to_owned(),
+        "office_recalculate" => return "重算工作簿".to_owned(),
+        _ => {}
     }
     if let Ok(value) = serde_json::from_str::<Value>(arguments) {
         if let Some(description) = value.get("description").and_then(Value::as_str) {
@@ -189,6 +199,9 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
     // User rows attach a following session-reference's labels to themselves
     // (official ReferenceLabelProjector keys by the preceding message seq).
     let mut last_user_input: Option<(u64, usize)> = None;
+    // Distinct keys for JSON fallback rows: the same unknown block type can
+    // appear more than once per session.
+    let mut unknown_row_counter: usize = 0;
     // Compaction summaries arrive just before the checkpoint message that
     // replaces the shadowed history; keep them keyed so the marker can cite the
     // official counts without rendering an extra row.
@@ -246,8 +259,9 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
             continue;
         }
         if !known_event_type(kind) {
+            let seq = event.get("seq").and_then(Value::as_u64);
             out.entries
-                .push(crate::state::unknown_surface_entry(kind, &data, at_ms));
+                .push(crate::state::unknown_surface_entry(kind, seq, &data, at_ms));
             continue;
         }
         if matches!(kind, "tool/ptc-dispatch" | "tool/ptc-dispatch-start") {
@@ -715,8 +729,12 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                     });
                 }
                 for block in &unknown_blocks {
-                    out.entries
-                        .push(crate::state::unknown_block_entry(block, at_ms));
+                    unknown_row_counter += 1;
+                    out.entries.push(crate::state::unknown_block_entry(
+                        block,
+                        unknown_row_counter,
+                        at_ms,
+                    ));
                 }
             }
             "tool/call" => {
@@ -1692,10 +1710,24 @@ mod tests {
     }
 
     #[test]
+    fn tool_titles_follow_the_rc3_office_labels() {
+        assert_eq!(tool_title("office_render", "{}"), "渲染文档");
+        assert_eq!(tool_title("office_convert", "{}"), "转换文档");
+        assert_eq!(tool_title("office_recalculate", "{}"), "重算工作簿");
+        assert_eq!(tool_title("present", "{}"), "交付文件");
+        // A description still wins for ordinary tools.
+        assert_eq!(
+            tool_title("read", r#"{"description":"读取配置"}"#),
+            "读取配置"
+        );
+    }
+
+    #[test]
     fn unknown_blocks_and_surfaces_render_json_fallbacks() {
         let events = vec![
             // A surface this build does not know: keep it visible as a JSON block.
             json!({"type": "future/surface", "seq": 1, "data": {"payload": 7}}),
+            json!({"type": "future/surface", "seq": 2, "data": {"payload": 8}}),
             json!({"type": "turn/start", "seq": 2, "data": {"turn": 1}}),
             json!({
                 "type": "assistant/message", "seq": 3, "surfaceOp": "append", "time": 4,
@@ -1703,24 +1735,30 @@ mod tests {
                     "content": [
                         {"type": "text", "text": "回答"},
                         {"type": "asset", "assetId": "asset-9"},
+                        {"type": "asset", "assetId": "asset-10"},
                     ]}},
             }),
             json!({"type": "turn/end", "seq": 4, "data": {"turn": 1, "reason": {"kind": "completed"}}}),
         ];
         let projected = project_session_events(&events);
-        let surface = projected
+        let surfaces: Vec<_> = projected
             .entries
             .iter()
-            .find(|entry| entry.role == EntryRole::UnknownSurface)
-            .expect("unknown surface row");
-        assert_eq!(surface.title, "future/surface");
-        assert!(surface.input.contains("payload"));
-        let block = projected
+            .filter(|entry| entry.role == EntryRole::UnknownSurface)
+            .collect();
+        assert_eq!(surfaces.len(), 2);
+        // Distinct keys even for the same unknown surface type.
+        assert_ne!(surfaces[0].key, surfaces[1].key);
+        assert_eq!(surfaces[0].title, "future/surface");
+        assert!(surfaces[0].input.contains("payload"));
+        let blocks: Vec<_> = projected
             .entries
             .iter()
-            .find(|entry| entry.role == EntryRole::UnknownBlock)
-            .expect("unknown content block");
-        assert!(block.input.contains("assetId"));
+            .filter(|entry| entry.role == EntryRole::UnknownBlock)
+            .collect();
+        assert_eq!(blocks.len(), 2);
+        assert_ne!(blocks[0].key, blocks[1].key);
+        assert!(blocks[0].input.contains("assetId"));
         // The known text still renders as the assistant answer.
         assert!(
             projected
@@ -1728,11 +1766,15 @@ mod tests {
                 .iter()
                 .any(|entry| entry.role == EntryRole::Assistant && entry.text == "回答")
         );
-        // Known infrastructure events never become fallback rows.
+        // Known infrastructure events never become fallback rows. The
+        // DeepSeek delivery receipt is logged after every committed response and
+        // must stay silent, or a reopened session fills with thousands of rows.
         let known = vec![
             json!({"type": "sandbox/mode", "seq": 5, "data": {"mode": "workspace-write"}}),
             json!({"type": "approval/policy", "seq": 6, "data": {}}),
             json!({"type": "permission/preset", "seq": 7, "data": {}}),
+            json!({"type": "session-log-deepseek/delivery-accepted", "seq": 8,
+                "data": {"sessionId": "s"}}),
         ];
         let projected = project_session_events(&known);
         assert!(projected.entries.is_empty());

@@ -451,6 +451,8 @@ fn split_emphasis(text: String) -> Vec<InlinePart> {
 }
 
 /// 代码高亮的 token 类别（近似 shiki 的关键词/字符串/数字/注释）。
+pub(crate) mod diff_fence;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CodeToken {
     Keyword,

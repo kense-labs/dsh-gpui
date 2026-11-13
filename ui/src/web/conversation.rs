@@ -83,6 +83,11 @@ pub(super) struct Conversation {
     pub(super) history_loading: bool,
     pub(super) history_prepend_pending: bool,
     pub(super) history_oldest_seq: Option<u64>,
+    /// An older-page request failed; the edge row shows 重新加载.
+    pub(super) history_error: Option<String>,
+    /// This session has exposed an incomplete history window at least once, so
+    /// the edge keeps showing 已到会话开头 after the last page arrives.
+    pub(super) history_was_partial: bool,
     pub(super) draft_attachments: Vec<DraftAttachment>,
     /// Delivery files announced during the running turn; they become the
     /// official turn-tail cards when the turn settles.
@@ -134,6 +139,17 @@ impl Conversation {
             &files,
             Some(bridge::now_ms()),
         ));
+    }
+
+    /// Official history-edge state (labels live in `history::pagination`).
+    pub(super) fn history_edge(&self) -> Option<crate::history::pagination::HistoryEdge> {
+        crate::history::pagination::history_edge(
+            self.history_has_more,
+            self.history_loading,
+            self.history_prepend_pending,
+            self.history_error.is_some(),
+            self.history_was_partial,
+        )
     }
 
     pub(super) fn begin_turn(&mut self) {

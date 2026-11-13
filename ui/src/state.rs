@@ -167,8 +167,18 @@ pub fn apply_update(entries: &mut Vec<ChatEntry>, update: &Value) -> UpdateEffec
             if id.is_empty() {
                 return effect;
             }
-            let title = string_field(update, "title");
-            let tool = Some(crate::tool_calls::ToolCall::root(title.clone()));
+            let raw_title = string_field(update, "title");
+            let arguments = update
+                .get("rawInput")
+                .map(|value| match value {
+                    Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                })
+                .unwrap_or_default();
+            // Official tool rows show the localized tool title (e.g. office_*
+            // in rc.3), so a live row reads like the replayed one.
+            let title = crate::history::tool_title(&raw_title, &arguments);
+            let tool = Some(crate::tool_calls::ToolCall::root(raw_title));
             let input = update.get("rawInput").map(pretty_value).unwrap_or_default();
             let status = string_field(update, "status");
             let at_ms = update.get("time").and_then(Value::as_f64);
@@ -1759,10 +1769,10 @@ pub fn changed_files(entry: &ChatEntry) -> Vec<String> {
 }
 
 /// One unknown content block from a message (official `message.unknownBlock`).
-pub fn unknown_block_entry(block: &Value, at_ms: Option<f64>) -> ChatEntry {
+pub fn unknown_block_entry(block: &Value, ordinal: usize, at_ms: Option<f64>) -> ChatEntry {
     ChatEntry {
         key: format!(
-            "unknown-block-{}",
+            "unknown-block-{}-{ordinal}",
             block.get("type").and_then(Value::as_str).unwrap_or("")
         ),
         external_id: None,
@@ -1778,9 +1788,17 @@ pub fn unknown_block_entry(block: &Value, at_ms: Option<f64>) -> ChatEntry {
 
 /// One session event type this UI version does not know (official
 /// `message.unknownSurface`): label carries the type, input the payload.
-pub fn unknown_surface_entry(kind: &str, data: &Value, at_ms: Option<f64>) -> ChatEntry {
+pub fn unknown_surface_entry(
+    kind: &str,
+    seq: Option<u64>,
+    data: &Value,
+    at_ms: Option<f64>,
+) -> ChatEntry {
     ChatEntry {
-        key: format!("unknown-surface-{kind}"),
+        key: format!(
+            "unknown-surface-{kind}-{}",
+            seq.map_or_else(|| "0".to_owned(), |seq| seq.to_string())
+        ),
         external_id: None,
         role: EntryRole::UnknownSurface,
         title: kind.to_owned(),

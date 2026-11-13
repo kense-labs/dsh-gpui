@@ -2075,6 +2075,7 @@ impl DshApp {
             return;
         };
         self.conversation.history_loading = true;
+        self.conversation.history_error = None;
         self.conversation.history_prepend_pending = false;
         invoke(
             "load_session_history",
@@ -2101,6 +2102,7 @@ impl DshApp {
             return;
         };
         self.conversation.history_loading = true;
+        self.conversation.history_error = None;
         self.conversation.history_prepend_pending = true;
         invoke(
             "load_session_history",
@@ -2140,6 +2142,8 @@ impl DshApp {
             conversation.turn_process.observe_history(event);
         }
         conversation.history_has_more = projected.has_more;
+        conversation.history_was_partial |= projected.has_more;
+        conversation.history_error = None;
         // The catalog is independent of transcript rows: a parent whose history
         // page holds only subagent facts must still list its children.
         for row in std::mem::take(&mut projected.subagents) {
@@ -3098,7 +3102,9 @@ impl DshApp {
                         }
                         Err(error) => {
                             conversation.history_loading = false;
-                            conversation.error = Some(format!("历史加载失败：{error}"));
+                            conversation.history_was_partial = true;
+                            conversation.history_error = Some(format!("历史加载失败：{error}"));
+                            conversation.error = conversation.history_error.clone();
                         }
                     }
                 }

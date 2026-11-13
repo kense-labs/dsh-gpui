@@ -2097,32 +2097,37 @@ impl DshApp {
         if let Some(label) = self.subagent_view_label().map(str::to_owned) {
             content = content.child(self.render_subagent_banner(&label, cx));
         }
-        if self.conversation.history_has_more || self.conversation.history_loading {
-            let label = if self.conversation.history_loading {
-                "载入历史…"
-            } else {
-                "加载更早"
-            };
-            content = content.child(
-                row().w_full().mb(px(8.)).justify_center().child(
-                    div()
-                        .id("load-older-history")
-                        .role(gpui::Role::Button)
-                        .aria_label(label)
-                        .tab_index(0)
-                        .px(px(12.))
-                        .py(px(4.))
-                        .rounded(px(8.))
-                        .bg(p.hover)
-                        .cursor_pointer()
-                        .text_size(px(12.))
-                        .text_color(p.secondary)
-                        .child(label)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.request_older_history(cx);
-                        })),
-                ),
-            );
+        // Official chat history edge: 加载更早 / 正在加载 / 载入历史… / 重新加载 /
+        // 已到会话开头. It stays while this session exposed an incomplete window.
+        let history = &self.conversation;
+        let history_edge = history
+            .history_edge()
+            .filter(|_| !history.entries.is_empty() || history.history_loading);
+        if let Some(edge) = history_edge {
+            let label = edge.label();
+            let actionable = edge.actionable();
+            let mut edge = div()
+                .id("load-older-history")
+                .role(gpui::Role::Button)
+                .aria_label(label)
+                .tab_index(0)
+                .px(px(12.))
+                .py(px(4.))
+                .rounded(px(8.))
+                .text_size(px(12.))
+                .text_color(p.faint)
+                .child(label.to_owned());
+            if actionable {
+                edge = edge
+                    .cursor_pointer()
+                    .bg(p.hover)
+                    .text_color(p.secondary)
+                    .hover(|style| style.text_color(p.ink))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.request_older_history(cx);
+                    }));
+            }
+            content = content.child(row().w_full().mb(px(8.)).justify_center().child(edge));
         }
         let tree = crate::tool_calls::ToolTree::new(&self.conversation.entries);
         let entries: Vec<_> = self
@@ -2728,6 +2733,16 @@ impl DshApp {
                         this.sync_follow_from_scroll(
                             event.delta.pixel_delta(w.line_height()).y.as_f32(),
                         );
+                        // Official auto-load intent: reaching the top edge asks
+                        // for the previous page without a click.
+                        let scroll_top = -this.conversation.scroll.offset().y.as_f32();
+                        if scroll_top <= 24.
+                            && this.conversation.history_has_more
+                            && !this.conversation.history_loading
+                            && this.conversation.history_error.is_none()
+                        {
+                            this.request_older_history(cx);
+                        }
                         cx.notify();
                     },
                 )),
@@ -8689,33 +8704,28 @@ pub(super) fn render_markdown(
                         .child({
                             let mut body = div()
                                 .w_full()
-                                .px(px(16.))
-                                .py(px(12.))
+                                .when(is_diff, |body| body.py(px(8.)))
+                                .when(!is_diff, |body| body.px(px(16.)).py(px(12.)))
                                 .font_family("monospace")
                                 .text_size(px(12.))
                                 .line_height(px(20.))
                                 .text_color(p.secondary)
                                 .overflow_x_hidden();
                             if is_diff {
-                                let mut rows = column().w_full();
-                                for line in text.lines() {
-                                    let (color, fill) =
-                                        if line.starts_with("+++") || line.starts_with('+') {
-                                            (p.success, Some(p.state_success_tertiary))
-                                        } else if line.starts_with("---") || line.starts_with('-') {
-                                            (p.danger, Some(p.hover_danger))
-                                        } else if line.starts_with("@@") {
-                                            (p.state_business_primary, None)
-                                        } else {
-                                            (p.secondary, None)
-                                        };
-                                    let row = div()
-                                        .w_full()
-                                        .px(px(6.))
-                                        .text_color(color)
-                                        .when_some(fill, |row, fill| row.bg(fill))
-                                        .child(line.to_owned());
-                                    rows = rows.child(row);
+                                // 官方 rc.3：diff/patch 围栏按行渲染——标记列单独上色，
+                                // 每个文件段用其头行声明的语言高亮增删行。
+                                use crate::markdown::diff_fence::{
+                                    diff_row_spans, parse_diff_fence,
+                                };
+                                let fence = parse_diff_fence(&text);
+                                let spans = diff_row_spans(&fence, |path| {
+                                    super::document_code::language_for_path(path)
+                                });
+                                let mut rows = column().w_full().gap_0();
+                                for (index, row) in fence.rows.iter().enumerate() {
+                                    rows = rows.child(render_diff_row(
+                                        row, index, &spans, p, &color_of, wrapped,
+                                    ));
                                 }
                                 body = body.child(rows);
                             } else {
@@ -9281,5 +9291,74 @@ fn short_text(text: &str, limit: usize) -> String {
         format!("{prefix}…")
     } else {
         prefix.to_string()
+    }
+}
+
+/// One unified-diff row: chrome rows print raw, content rows split the marker
+/// column from the tokenized body (official rc.3 CodeBlock diff fence).
+fn render_diff_row(
+    diff_row: &crate::markdown::diff_fence::DiffRow,
+    index: usize,
+    spans: &std::collections::HashMap<usize, Vec<crate::markdown::CodeSpan>>,
+    p: crate::tokens::Tokens,
+    color_of: &impl Fn(crate::markdown::CodeToken) -> gpui::Hsla,
+    _wrapped: bool,
+) -> gpui::AnyElement {
+    use crate::markdown::diff_fence::DiffKind;
+    match diff_row.kind {
+        DiffKind::Meta => div()
+            .w_full()
+            .px(px(16.))
+            .text_color(p.faint)
+            .child(diff_row.raw.clone())
+            .into_any_element(),
+        DiffKind::Hunk => div()
+            .w_full()
+            .px(px(16.))
+            .text_color(p.secondary)
+            .child(diff_row.raw.clone())
+            .into_any_element(),
+        kind => {
+            let (fill, marker_color) = match kind {
+                DiffKind::Add => (Some(p.file_diff_added_bg), p.file_diff_added_marker),
+                DiffKind::Del => (Some(p.file_diff_deleted_bg), p.file_diff_deleted_marker),
+                _ => (None, p.faint),
+            };
+            let mut content = row().w_full().items_start();
+            if !diff_row.marker.is_empty() {
+                content = content.child(
+                    div()
+                        .flex_none()
+                        .w(px(12.))
+                        .text_color(marker_color)
+                        .child(diff_row.marker.to_owned()),
+                );
+            }
+            let body = match spans.get(&index) {
+                Some(row_spans) if !row_spans.is_empty() => div().flex_1().min_w_0().child(
+                    gpui::StyledText::new(diff_row.body.clone()).with_highlights(
+                        row_spans.iter().map(|span| {
+                            (
+                                span.start..span.end,
+                                gpui::HighlightStyle {
+                                    color: Some(color_of(span.kind)),
+                                    ..Default::default()
+                                },
+                            )
+                        }),
+                    ),
+                ),
+                _ => div().flex_1().min_w_0().child(diff_row.body.clone()),
+            };
+            div()
+                .w_full()
+                .px(px(12.))
+                .when_some(fill, |element, fill| element.bg(fill))
+                .when(matches!(kind, DiffKind::Add | DiffKind::Del), |element| {
+                    element.border_l(px(3.)).border_color(marker_color)
+                })
+                .child(content.child(body))
+                .into_any_element()
+        }
     }
 }
