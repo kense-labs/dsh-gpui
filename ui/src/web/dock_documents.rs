@@ -1167,6 +1167,7 @@ impl DshApp {
                         &self.conversation.wrapped_code,
                         self.content_font_delta,
                         Some(&selection),
+                        None,
                         cx,
                     ));
                 } else if let Some(code) = code {

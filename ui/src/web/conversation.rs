@@ -80,6 +80,10 @@ pub(super) struct Conversation {
     /// Delivery files announced during the running turn; they become the
     /// official turn-tail cards when the turn settles.
     pub(super) pending_deliverables: Vec<serde_json::Value>,
+    /// Derived per-assistant file-mention vocabularies (rebuilt each transcript
+    /// render from the turn's produced paths and deliveries).
+    pub(super) mention_vocab:
+        std::collections::HashMap<String, crate::mentions::FileMentionVocabulary>,
 }
 
 impl Conversation {

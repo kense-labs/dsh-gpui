@@ -15,6 +15,7 @@ pub mod layout;
 #[cfg(any(target_family = "wasm", test))]
 mod markdown;
 pub mod media;
+pub mod mentions;
 pub mod process;
 mod provider_marks;
 mod questions;

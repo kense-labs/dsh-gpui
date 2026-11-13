@@ -1941,6 +1941,7 @@ impl DshApp {
                 &self.conversation.wrapped_code,
                 self.content_font_delta,
                 show_thought_preview,
+                self.conversation.mention_vocab.get(&entry.key),
                 cx,
             )
         };
@@ -2098,6 +2099,10 @@ impl DshApp {
             } else {
                 None
             };
+        // File mentions resolve inline-code tokens against the files this turn
+        // produced (official MarkdownFileMentions); derive the lookup once per render.
+        self.conversation.mention_vocab =
+            crate::mentions::vocabularies(entries.iter().copied(), &self.workspace);
         let mut previous_role = None;
         let mut visible_viewports = std::collections::HashSet::new();
         while index < entries.len() {
@@ -5948,6 +5953,7 @@ fn render_entry(
     wrapped_code: &std::collections::HashSet<String>,
     font_delta: i32,
     show_thought_preview: bool,
+    mentions: Option<&crate::mentions::FileMentionVocabulary>,
     cx: &mut Context<DshApp>,
 ) -> gpui::Div {
     let p = dsh(cx);
@@ -6049,6 +6055,7 @@ fn render_entry(
             wrapped_code,
             font_delta,
             None,
+            mentions,
             cx,
         )),
         EntryRole::Thought => {
@@ -6110,6 +6117,7 @@ fn render_entry(
                             copied_mark,
                             wrapped_code,
                             font_delta,
+                            None,
                             None,
                             cx,
                         ),
@@ -6531,6 +6539,7 @@ fn render_compaction(entry: &ChatEntry, expanded: bool, cx: &mut Context<DshApp>
                     &std::collections::HashSet::new(),
                     0,
                     None,
+                    None,
                     cx,
                 )),
         );
@@ -6799,6 +6808,33 @@ impl DshApp {
         }
         let pane = self.sidebar.surface.layout.focused();
         self.new_browser_tab(pane, Some(url.to_owned()), w, cx);
+    }
+
+    /// Open one file named by an inline-code mention in the sidebar preview
+    /// (official file-mention chip action).
+    pub(super) fn open_file_mention(
+        &mut self,
+        path: &str,
+        w: &mut Window,
+        cx: &mut Context<DshApp>,
+    ) {
+        // The sidebar document API addresses files relative to the workspace.
+        let workspace = self.workspace.trim_end_matches('/');
+        let relative = path
+            .strip_prefix(workspace)
+            .map(|rest| rest.trim_start_matches('/'))
+            .filter(|rest| crate::right_dock::workspace_document_path(rest));
+        let Some(relative) = relative.map(str::to_owned) else {
+            // Outside the workspace: hand the file to the system instead of
+            // promising a sidebar preview that cannot render it.
+            bridge::open_url(&format!("file://{path}"));
+            return;
+        };
+        if !self.right_panel_visible() {
+            self.toggle_right_panel(w, cx);
+        }
+        let pane = self.sidebar.surface.layout.focused();
+        self.open_workspace_document(pane, relative, w, cx);
     }
 
     fn render_image_viewer(&self, cx: &mut Context<DshApp>) -> Option<gpui::AnyElement> {
@@ -7587,6 +7623,7 @@ pub(super) fn render_markdown(
     wrapped_code: &std::collections::HashSet<String>,
     font_delta: i32,
     selection: Option<&super::document_selection::SelectionLayout>,
+    mentions: Option<&crate::mentions::FileMentionVocabulary>,
     cx: &mut Context<DshApp>,
 ) -> gpui::Div {
     let p = dsh(cx);
@@ -7610,7 +7647,7 @@ pub(super) fn render_markdown(
         let code_id = format!("{block_id}-{index}");
         list = match block {
             Block::Paragraph(text) => list.child(render_inline_rich(
-                &text, p, false, body, body_lh, selected, cx,
+                &text, p, false, body, body_lh, selected, mentions, cx,
             )),
             Block::Heading(level, text) => {
                 let (size, line_height, weight, top) = if selection.is_some() {
@@ -7664,7 +7701,7 @@ pub(super) fn render_markdown(
                             .line_height(px(body_lh))
                             .text_color(p.secondary)
                             .child(render_inline_rich(
-                                &text, p, true, body, body_lh, selected, cx,
+                                &text, p, true, body, body_lh, selected, mentions, cx,
                             )),
                     ),
             ),
@@ -7688,7 +7725,7 @@ pub(super) fn render_markdown(
                             }),
                     )
                     .child(div().flex_1().min_w_0().child(render_inline_rich(
-                        &text, p, false, body, body_lh, selected, cx,
+                        &text, p, false, body, body_lh, selected, mentions, cx,
                     ))),
             ),
             Block::Table { headers, rows } => {
@@ -7699,7 +7736,7 @@ pub(super) fn render_markdown(
                     .border_color(p.line)
                     .overflow_hidden();
                 table = table.child(render_table_row(
-                    &headers, true, p, body, body_lh, selected, cx,
+                    &headers, true, p, body, body_lh, selected, mentions, cx,
                 ));
                 for (row_index, row_cells) in rows.iter().enumerate() {
                     table = table.child(
@@ -7715,6 +7752,7 @@ pub(super) fn render_markdown(
                                 body,
                                 body_lh,
                                 selection.map(|layout| (layout, "\n")),
+                                mentions,
                                 cx,
                             )),
                     );
@@ -7970,6 +8008,7 @@ fn render_table_row(
     body: f32,
     body_lh: f32,
     selected: MarkdownSelection<'_>,
+    mentions: Option<&crate::mentions::FileMentionVocabulary>,
     cx: &mut Context<DshApp>,
 ) -> gpui::Div {
     let mut line = row().w_full().items_stretch();
@@ -7997,11 +8036,71 @@ fn render_table_row(
                     selected.map(|(layout, separator)| {
                         (layout, if index == 0 { separator } else { "\t" })
                     }),
+                    mentions,
                     cx,
                 )),
         );
     }
     line
+}
+
+/// Absolute HTTP(S) URL of an inline-code token; other schemes stay inert.
+fn inline_http_url(token: &str) -> Option<String> {
+    let trimmed = token.trim();
+    (trimmed.starts_with("http://") || trimmed.starts_with("https://")).then(|| trimmed.to_owned())
+}
+
+/// Code chrome shared by the inline-code link and file-mention chips.
+fn inline_code_clickable(
+    base: gpui::Div,
+    text: String,
+    selected: Option<(&super::document_selection::SelectionLayout, &'static str)>,
+    p: crate::tokens::Tokens,
+    body: f32,
+) -> gpui::Stateful<gpui::Div> {
+    let mut fingerprint: u64 = 0xcbf29ce484222325;
+    for byte in text.bytes() {
+        fingerprint = (fingerprint ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+    }
+    base.id(gpui::ElementId::Name(
+        format!("inline-code-{fingerprint:x}").into(),
+    ))
+    .role(gpui::Role::Button)
+    .tab_index(0)
+    .cursor_pointer()
+    .flex()
+    .items_center()
+    .gap(px(4.))
+    .px(px(4.))
+    .rounded(px(4.))
+    .bg(p.md_inline_code)
+    .font_family("monospace")
+    .text_size(px((body - 2.).max(11.)))
+    .text_color(p.link)
+    .child(markdown_leaf(text, selected))
+}
+
+/// Inert inline-code chrome (the ordinary `code` segment).
+fn inline_code_plain(
+    base: gpui::Div,
+    text: String,
+    bold: bool,
+    selected: Option<(&super::document_selection::SelectionLayout, &'static str)>,
+    p: crate::tokens::Tokens,
+    muted: bool,
+    body: f32,
+    body_lh: f32,
+) -> gpui::Div {
+    let _ = bold;
+    base.text_size(px(body))
+        .line_height(px(body_lh))
+        .text_color(if muted { p.secondary } else { p.secondary })
+        .px(px(4.))
+        .rounded(px(4.))
+        .bg(p.md_inline_code)
+        .font_family("monospace")
+        .text_size(px((body - 2.).max(11.)))
+        .child(markdown_leaf(text, selected))
 }
 
 fn render_inline_rich(
@@ -8011,34 +8110,85 @@ fn render_inline_rich(
     body: f32,
     body_lh: f32,
     selection: MarkdownSelection<'_>,
+    mentions: Option<&crate::mentions::FileMentionVocabulary>,
     cx: &mut Context<DshApp>,
 ) -> gpui::Div {
     let parts = inline_parts(text);
-    if parts
-        .iter()
-        .any(|part| matches!(part, InlinePart::Link { .. }))
+    let has_mention = parts.iter().any(|part| match part {
+        InlinePart::Text {
+            text, code: true, ..
+        } => {
+            inline_http_url(text).is_some()
+                || mentions.is_some_and(|vocabulary| vocabulary.resolve(text).is_some())
+        }
+        _ => false,
+    });
+    if has_mention
+        || parts
+            .iter()
+            .any(|part| matches!(part, InlinePart::Link { .. }))
     {
         let mut line = row().w_full().flex_wrap().gap(px(0.));
         for (index, part) in parts.into_iter().enumerate() {
             let selected =
                 selection.map(|(layout, prefix)| (layout, if index == 0 { prefix } else { "" }));
             line = match part {
-                InlinePart::Text { text, bold, code } => line.child(
-                    div()
-                        .text_size(px(body))
-                        .line_height(px(body_lh))
-                        .text_color(if muted || code { p.secondary } else { p.ink })
-                        .when(bold, |element| element.font_weight(FontWeight::SEMIBOLD))
-                        .when(code, |element| {
-                            element
-                                .px(px(4.))
-                                .rounded(px(4.))
-                                .bg(p.md_inline_code)
-                                .font_family("monospace")
-                                .text_size(px((body - 2.).max(11.)))
-                        })
-                        .child(markdown_leaf(text, selected)),
-                ),
+                InlinePart::Text { text, bold, code } => {
+                    if code {
+                        // Official inline-code affordances: an absolute HTTP(S)
+                        // token becomes a link, and a token naming a file this turn
+                        // produced becomes a chip that opens the sidebar preview.
+                        if let Some(url) = inline_http_url(&text) {
+                            line.child(
+                                inline_code_clickable(div(), text.clone(), selected, p, body)
+                                    .aria_label(text.clone())
+                                    .on_click(cx.listener({
+                                        let selection = selected.map(|(layout, _)| layout.clone());
+                                        move |this: &mut DshApp, event, w, cx| {
+                                            if selection
+                                                .as_ref()
+                                                .is_none_or(|layout| layout.clicked_link(event))
+                                            {
+                                                this.open_link(&url, w, cx);
+                                            }
+                                        }
+                                    })),
+                            )
+                        } else if let Some(path) = mentions
+                            .and_then(|vocabulary| vocabulary.resolve(&text))
+                            .map(str::to_owned)
+                        {
+                            line.child(
+                                inline_code_clickable(div(), text.clone(), selected, p, body)
+                                    .aria_label(format!("在侧边栏打开 {path}"))
+                                    .child(icon(Glyph::FileText, 12., p.link))
+                                    .on_click(cx.listener(move |this: &mut DshApp, _, w, cx| {
+                                        this.open_file_mention(&path, w, cx);
+                                    })),
+                            )
+                        } else {
+                            line.child(inline_code_plain(
+                                div(),
+                                text,
+                                bold,
+                                selected,
+                                p,
+                                muted,
+                                body,
+                                body_lh,
+                            ))
+                        }
+                    } else {
+                        line.child(
+                            div()
+                                .text_size(px(body))
+                                .line_height(px(body_lh))
+                                .text_color(if muted { p.secondary } else { p.ink })
+                                .when(bold, |element| element.font_weight(FontWeight::SEMIBOLD))
+                                .child(markdown_leaf(text, selected)),
+                        )
+                    }
+                }
                 InlinePart::Link { label, url } => {
                     let open = url.clone();
                     line.child(
