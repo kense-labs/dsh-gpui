@@ -95,6 +95,8 @@ pub(crate) enum InlinePart {
     Link {
         label: String,
         url: String,
+        /// Bold emphasis wrapped across the link (`**👉 [x](y)**`).
+        bold: bool,
     },
 }
 
@@ -359,22 +361,35 @@ pub(crate) fn inline_parts(text: &str) -> Vec<InlinePart> {
     let mut parts = Vec::new();
     let mut cursor = 0usize;
     let mut plain = String::new();
-
-    let flush_plain = |plain: &mut String, parts: &mut Vec<InlinePart>| {
-        if !plain.is_empty() {
-            parts.extend(split_emphasis(std::mem::take(plain)));
-        }
-    };
+    // A `**` opened before a link and closed after it: the link takes the
+    // emphasis and neither marker reaches the text pieces.
+    let mut bold_open = false;
 
     while cursor < text.len() {
         if text[cursor..].starts_with('[')
             && let Some((label_end, url_end)) = link_bounds(&text[cursor..])
         {
+            if odd_count(&plain, "**") == 1
+                && let Some(last) = plain.rfind("**")
+            {
+                plain.truncate(last);
+                bold_open = true;
+            }
             flush_plain(&mut plain, &mut parts);
             let label = text[cursor + 1..cursor + label_end].to_string();
             let url = text[cursor + label_end + 2..cursor + url_end - 1].to_string();
-            parts.push(InlinePart::Link { label, url });
+            let link_bold = bold_open;
+            parts.push(InlinePart::Link {
+                label,
+                url,
+                bold: link_bold,
+            });
+            bold_open = false;
+            plain.clear();
             cursor += url_end;
+            if link_bold && text[cursor..].starts_with("**") {
+                cursor += 2;
+            }
             continue;
         }
         let ch = text[cursor..].chars().next().unwrap();
@@ -383,6 +398,18 @@ pub(crate) fn inline_parts(text: &str) -> Vec<InlinePart> {
     }
     flush_plain(&mut plain, &mut parts);
     parts
+}
+
+/// Flush one plain run into renderable pieces.
+fn flush_plain(plain: &mut String, parts: &mut Vec<InlinePart>) {
+    if !plain.is_empty() {
+        parts.extend(split_emphasis(std::mem::take(plain)));
+    }
+}
+
+/// Number of non-overlapping occurrences of one marker in `text`.
+fn odd_count(text: &str, marker: &str) -> usize {
+    text.matches(marker).count() % 2
 }
 
 fn link_bounds(slice: &str) -> Option<(usize, usize)> {
@@ -400,44 +427,67 @@ fn split_emphasis(text: String) -> Vec<InlinePart> {
     let mut parts = Vec::new();
     let mut cursor = 0usize;
     while cursor < text.len() {
-        if text[cursor..].starts_with("**")
-            && let Some(offset) = text[cursor + 2..].find("**")
-        {
-            let start = cursor + 2;
-            let end = start + offset;
-            parts.push(InlinePart::Text {
-                text: text[start..end].to_string(),
-                bold: true,
-                code: false,
-            });
-            cursor = end + 2;
+        let rest = &text[cursor..];
+        // An unmatched marker renders literally and always advances the cursor,
+        // so a stray `**` or backtick can never spin this loop.
+        if rest.starts_with("**") {
+            match rest[2..].find("**") {
+                Some(offset) => {
+                    let start = cursor + 2;
+                    let end = start + offset;
+                    parts.push(InlinePart::Text {
+                        text: text[start..end].to_owned(),
+                        bold: true,
+                        code: false,
+                    });
+                    cursor = end + 2;
+                }
+                None => {
+                    parts.push(InlinePart::Text {
+                        text: "**".to_owned(),
+                        bold: false,
+                        code: false,
+                    });
+                    cursor += 2;
+                }
+            }
             continue;
         }
-        if text[cursor..].starts_with('`')
-            && let Some(offset) = text[cursor + 1..].find('`')
-        {
-            let start = cursor + 1;
-            let end = start + offset;
-            parts.push(InlinePart::Text {
-                text: text[start..end].to_string(),
-                bold: false,
-                code: true,
-            });
-            cursor = end + 1;
+        if rest.starts_with('`') {
+            match rest[1..].find('`') {
+                Some(offset) => {
+                    let start = cursor + 1;
+                    let end = start + offset;
+                    parts.push(InlinePart::Text {
+                        text: text[start..end].to_owned(),
+                        bold: false,
+                        code: true,
+                    });
+                    cursor = end + 1;
+                }
+                None => {
+                    parts.push(InlinePart::Text {
+                        text: "`".to_owned(),
+                        bold: false,
+                        code: false,
+                    });
+                    cursor += 1;
+                }
+            }
             continue;
         }
-        let next_bold = text[cursor..].find("**").map(|i| cursor + i);
-        let next_code = text[cursor..].find('`').map(|i| cursor + i);
+        let next_bold = rest.find("**").map(|i| cursor + i);
+        let next_code = rest.find('`').map(|i| cursor + i);
         let next = match (next_bold, next_code) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),
             (None, Some(b)) => Some(b),
             (None, None) => None,
         };
-        let end = next.unwrap_or(text.len());
+        let end = next.unwrap_or(text.len()).max(cursor + 1).min(text.len());
         if end > cursor {
             parts.push(InlinePart::Text {
-                text: text[cursor..end].to_string(),
+                text: text[cursor..end].to_owned(),
                 bold: false,
                 code: false,
             });
@@ -633,6 +683,43 @@ mod tests {
     };
 
     #[test]
+    fn emphasis_split_by_a_link_keeps_the_markers_out_of_the_text() {
+        // A bold run wrapped around a link used to hand split_emphasis an
+        // unmatched `**` on both sides, which spun forever.
+        let parts = inline_parts("**👉 [商品页](http://127.0.0.1:8765/pdp)**（深链直达）");
+        let link = parts
+            .iter()
+            .find_map(|part| match part {
+                InlinePart::Link { label, bold, .. } => Some((label.clone(), *bold)),
+                _ => None,
+            })
+            .expect("link");
+        assert_eq!(link.0, "商品页");
+        assert!(link.1, "the emphasis around the link reaches it");
+        for part in &parts {
+            if let InlinePart::Text { text, .. } = part {
+                assert!(!text.contains("**"), "stray marker in {text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn unmatched_emphasis_and_code_markers_terminate_as_text() {
+        // Each of these used to stop advancing the cursor in split_emphasis.
+        for text in ["**未闭合", "`未闭合", "a ** b ` c"] {
+            let parts = inline_parts(text);
+            let joined: String = parts
+                .iter()
+                .map(|part| match part {
+                    InlinePart::Text { text, .. } => text.clone(),
+                    InlinePart::Link { label, .. } => label.clone(),
+                })
+                .collect();
+            assert_eq!(joined, text, "{text:?} round-trips as plain text");
+        }
+    }
+
+    #[test]
     fn frontmatter_delimiters_must_start_the_document_and_close_on_a_full_line() {
         for text in [
             "\n---\nkey: value\n---",
@@ -704,7 +791,7 @@ mod tests {
                 url: "https://example.com/a.png".into()
             }
         );
-        let InlinePart::Link { label, url } = &inline_parts("见 [文档](https://example.com)。")
+        let InlinePart::Link { label, url, .. } = &inline_parts("见 [文档](https://example.com)。")
             .into_iter()
             .find(|part| matches!(part, InlinePart::Link { .. }))
             .unwrap()

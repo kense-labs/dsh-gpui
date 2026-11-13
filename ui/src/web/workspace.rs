@@ -9020,7 +9020,7 @@ fn render_inline_rich(
                         )
                     }
                 }
-                InlinePart::Link { label, url } => {
+                InlinePart::Link { label, url, bold } => {
                     let open = url.clone();
                     line.child(
                         div()
@@ -9036,6 +9036,7 @@ fn render_inline_rich(
                             })
                             .text_color(p.link)
                             .underline()
+                            .when(bold, |link| link.font_weight(FontWeight::SEMIBOLD))
                             .child(markdown_leaf(label, selected))
                             .on_click(cx.listener({
                                 let selection = selected.map(|(layout, _)| layout.clone());
