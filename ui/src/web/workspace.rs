@@ -1947,6 +1947,7 @@ impl DshApp {
                 self.content_font_delta,
                 show_thought_preview,
                 self.conversation.mention_vocab.get(&entry.key),
+                &self.workspace,
                 cx,
             )
         };
@@ -5974,6 +5975,7 @@ fn render_entry(
     font_delta: i32,
     show_thought_preview: bool,
     mentions: Option<&crate::mentions::FileMentionVocabulary>,
+    workspace: &str,
     cx: &mut Context<DshApp>,
 ) -> gpui::Div {
     let p = dsh(cx);
@@ -6263,6 +6265,7 @@ fn render_entry(
         EntryRole::ToolChange => render_tool_change(entry, expanded, cx),
         EntryRole::Compaction => render_compaction(entry, expanded, cx),
         EntryRole::Deliverable => render_deliverables(entry, expanded, cx),
+        EntryRole::ChangedFiles => render_changed_files(entry, expanded, workspace, cx),
         EntryRole::SystemPrompt => render_system_prompt(entry, expanded, cx),
         EntryRole::Job => render_job_row(entry, expanded, cx),
         EntryRole::System if entry.title == "turn-end" => row().w_full().justify_start().child(
@@ -6639,6 +6642,212 @@ fn render_deliverables(entry: &ChatEntry, expanded: bool, cx: &mut Context<DshAp
         cards = cards.child(row().w_full().justify_center().child(toggle));
     }
     column().w_full().mt(px(12.)).child(cards)
+}
+
+/// Official ChangedFiles card: the files this turn edited.
+///
+/// The Host serves `+N/-M` counts through a route ACP does not expose, so the
+/// card lists the mutated files and opens each in the sidebar instead of a diff.
+fn render_changed_files(
+    entry: &ChatEntry,
+    expanded: bool,
+    workspace: &str,
+    cx: &mut Context<DshApp>,
+) -> gpui::Div {
+    let paths = crate::state::changed_files(entry);
+    if paths.is_empty() {
+        return column();
+    }
+    let p = dsh(cx);
+    const COLLAPSED: usize = 4;
+    let foldable = paths.len() > COLLAPSED;
+    let open = expanded && foldable;
+    let shown: Vec<String> = if foldable && !open {
+        paths.iter().take(COLLAPSED).cloned().collect()
+    } else {
+        paths.clone()
+    };
+    let toggle_key = entry.key.clone();
+    let single = paths.len() == 1;
+    let resolved: Vec<(String, String)> = paths
+        .iter()
+        .map(|authored| {
+            (
+                authored.clone(),
+                crate::mentions::resolve_path(workspace, authored),
+            )
+        })
+        .collect();
+    let first = resolved[0].1.clone();
+    let title = if single {
+        format!("已编辑 {}", file_name(&paths[0]))
+    } else {
+        format!("已编辑 {} 个文件", paths.len())
+    };
+    let aria = if single {
+        format!("查看 {} 的改动", file_name(&paths[0]))
+    } else {
+        "在侧边栏查看本轮改动".to_owned()
+    };
+    let mut card = column()
+        .w_full()
+        .mt(px(12.))
+        .rounded(px(12.))
+        .border(px(0.5))
+        .border_color(p.border_l1)
+        .bg(p.stage)
+        .overflow_hidden();
+    card = card.child(
+        row()
+            .id(gpui::ElementId::Name(
+                format!("changed-files-header-{}", entry.key).into(),
+            ))
+            .role(gpui::Role::Button)
+            .aria_label(aria)
+            .tab_index(0)
+            .cursor_pointer()
+            .w_full()
+            .gap(px(10.))
+            .items_center()
+            .px(px(12.))
+            .py(px(10.))
+            .hover(|style| style.bg(p.hover))
+            .child(
+                div()
+                    .flex_none()
+                    .size(px(28.))
+                    .rounded(px(8.))
+                    .bg(p.selector)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(icon(Glyph::FileText, 16., p.link)),
+            )
+            .child(
+                column()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(13.))
+                            .line_height(px(20.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(p.ink)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(10.))
+                            .line_height(px(16.))
+                            .text_color(p.faint)
+                            .child("在侧边栏预览"),
+                    ),
+            )
+            .on_click(cx.listener(move |this, _, w, cx| {
+                this.open_file_mention(&first, w, cx);
+            })),
+    );
+    if !single {
+        for (index, (authored, resolved_path)) in
+            resolved.iter().enumerate().take(if foldable && !open {
+                COLLAPSED
+            } else {
+                usize::MAX
+            })
+        {
+            let _ = shown.len();
+            let display = authored.clone();
+            let open_path = resolved_path.clone();
+            card = card.child(
+                row()
+                    .id(gpui::ElementId::Name(
+                        format!("changed-file-{index}-{}", entry.key).into(),
+                    ))
+                    .role(gpui::Role::Button)
+                    .aria_label(format!("在侧边栏打开 {display}"))
+                    .tab_index(0)
+                    .cursor_pointer()
+                    .w_full()
+                    .gap(px(8.))
+                    .items_center()
+                    .px(px(12.))
+                    .py(px(5.))
+                    .border_t(px(0.5))
+                    .border_color(p.border_l1)
+                    .hover(|style| style.bg(p.hover))
+                    .child(icon(Glyph::FileText, 14., p.faint))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(12.))
+                            .line_height(px(18.))
+                            .text_color(p.secondary)
+                            .child(display),
+                    )
+                    .on_click(cx.listener(move |this, _, w, cx| {
+                        this.open_file_mention(&open_path, w, cx);
+                    })),
+            );
+        }
+        if foldable {
+            card = card.child(
+                row()
+                    .w_full()
+                    .justify_center()
+                    .py(px(4.))
+                    .border_t(px(0.5))
+                    .border_color(p.border_l1)
+                    .child(
+                        row()
+                            .id(gpui::ElementId::Name(
+                                format!("changed-files-toggle-{toggle_key}").into(),
+                            ))
+                            .role(gpui::Role::Button)
+                            .aria_label(if open {
+                                "收起改动文件列表"
+                            } else {
+                                "展开全部改动文件"
+                            })
+                            .aria_expanded(open)
+                            .tab_index(0)
+                            .cursor_pointer()
+                            .gap(px(4.))
+                            .items_center()
+                            .text_size(px(12.))
+                            .line_height(px(18.))
+                            .text_color(p.faint)
+                            .hover(|style| style.text_color(p.secondary))
+                            .child(if open {
+                                "收起".to_owned()
+                            } else {
+                                format!("全部 {} 个文件", paths.len())
+                            })
+                            .child(icon(
+                                if open { Glyph::Up } else { Glyph::Down },
+                                12.,
+                                p.faint,
+                            ))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                toggle_entry(&mut this.conversation.expanded_entries, &toggle_key);
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
+    }
+    card
+}
+
+/// Final path segment of a display path.
+fn file_name(path: &str) -> &str {
+    path.rsplit(['/', '\\'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(path)
 }
 
 /// One delivery card: file box + name + description (or upper-cased extension).

@@ -54,7 +54,7 @@ fn basename(path: &str) -> &str {
 }
 
 /// Join a relative authored path to the workspace; absolute paths stay as written.
-fn resolve_path(workspace: &str, authored: &str) -> String {
+pub(crate) fn resolve_path(workspace: &str, authored: &str) -> String {
     let absolute = authored.starts_with('/')
         || (authored.len() > 2
             && authored.as_bytes()[1] == b':'

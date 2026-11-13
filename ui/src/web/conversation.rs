@@ -42,6 +42,10 @@ pub(super) struct Conversation {
     /// Tool name whose arguments are still streaming (`Some("")` when the name is
     /// not known yet); drives the official 准备X live label.
     pub(super) preparing_tool: Option<String>,
+    /// Mutation path remembered for each in-flight tool call (official
+    /// deliverables accumulator) and the turn's settled successful mutations.
+    pub(super) tool_mutations: HashMap<String, String>,
+    pub(super) pending_changed_files: Vec<String>,
     pub(super) usage: Option<(u64, u64)>,
     pub(super) permission: Option<PermissionRequest>,
     pub(super) permission_mode: super::permission_picker::PermissionMode,
@@ -101,6 +105,26 @@ impl Conversation {
 
     /// Official DeliverablesTail: delivery cards belong to the closing turn tail,
     /// not to the tool result's position, so they are held until the turn settles.
+    /// Remember the mutation path of one tool call until its result settles.
+    pub(super) fn track_tool_call(&mut self, call_id: &str, name: &str, arguments: &str) {
+        if let Some(path) = crate::mentions::mutation_path(name, arguments) {
+            self.tool_mutations.insert(call_id.to_owned(), path);
+        }
+    }
+
+    /// Settle one tool call: a successful mutation joins the turn's changed files.
+    pub(super) fn settle_tool_call(&mut self, call_id: &str, failed: bool) {
+        let Some(path) = self.tool_mutations.remove(call_id) else {
+            return;
+        };
+        if failed {
+            return;
+        }
+        if !self.pending_changed_files.iter().any(|seen| *seen == path) {
+            self.pending_changed_files.push(path);
+        }
+    }
+
     pub(super) fn flush_pending_deliverables(&mut self) {
         if self.pending_deliverables.is_empty() {
             return;
@@ -144,6 +168,15 @@ impl Conversation {
         self.running = false;
         self.preparing_tool = None;
         self.assistant_stream.clear();
+        // Official order: the changed-files card precedes the delivered files.
+        if !self.pending_changed_files.is_empty() {
+            let paths = std::mem::take(&mut self.pending_changed_files);
+            self.entries.push(crate::state::changed_files_entry(
+                &paths,
+                Some(bridge::now_ms()),
+            ));
+        }
+        self.tool_mutations.clear();
         self.flush_pending_deliverables();
         self.permission = None;
     }

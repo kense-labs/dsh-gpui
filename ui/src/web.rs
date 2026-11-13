@@ -3377,12 +3377,10 @@ impl DshApp {
             return;
         }
         if update["sessionUpdate"] == "gpui_assistant_stream" {
-            if conversation.running {
-                conversation.assistant_stream.update(update);
-                if selected {
-                    self.maybe_follow_tail();
-                }
-            }
+            // The stream-preview rows are not rendered: activating them froze the
+            // transcript once the bridge started forwarding frames. The prepare
+            // signal travels on its own update, and durable ACP content owns the
+            // transcript text.
             return;
         }
         if update["sessionUpdate"] == "gpui_turn_tail" {
@@ -3429,6 +3427,25 @@ impl DshApp {
             }
         }
         let effect = apply_update(&mut conversation.entries, update);
+        // Official deliverables accumulator: remember each mutation's argument
+        // path and settle it on a successful result for the ChangedFiles card.
+        match update["sessionUpdate"].as_str() {
+            Some("tool_call") => {
+                if let (Some(id), Some(name)) =
+                    (update["toolCallId"].as_str(), update["title"].as_str())
+                {
+                    let arguments = update["rawInput"].to_string();
+                    conversation.track_tool_call(id, name, &arguments);
+                }
+            }
+            Some("tool_call_update") => {
+                if let Some(id) = update["toolCallId"].as_str() {
+                    let failed = update["status"].as_str() == Some("failed");
+                    conversation.settle_tool_call(id, failed);
+                }
+            }
+            _ => {}
+        }
         if update["content"]["text"]
             .as_str()
             .is_some_and(|text| !text.is_empty())

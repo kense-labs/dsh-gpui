@@ -1,4 +1,9 @@
 //! Temporary thought and answer rows sourced from the Harness assistant stream.
+//!
+//! Disabled: activating the preview rows froze the transcript once the bridge
+//! began forwarding live frames, so the UI ignores `gpui_assistant_stream` until
+//! that render path is fixed. The types stay here (with tests) for that follow-up.
+#![allow(dead_code)]
 
 use crate::state::{ChatEntry, EntryRole};
 use serde_json::Value;

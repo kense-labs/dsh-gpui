@@ -73,6 +73,9 @@ pub enum EntryRole {
     Compaction,
     /// 官方 DeliverablesTail：本轮 `present` 交付的文件卡片。
     Deliverable,
+    /// 官方 ChangedFiles：本轮编辑过的文件卡片（改动的 +/- 统计来自 Host，
+    /// ACP 不提供，因此这里只列文件并可在侧边栏打开）。
+    ChangedFiles,
 }
 
 /// One message, thought, tool invocation, or local status row.
@@ -1203,6 +1206,7 @@ fn role_name(role: EntryRole) -> &'static str {
         EntryRole::ToolChange => "tool-change",
         EntryRole::Compaction => "compaction",
         EntryRole::Deliverable => "deliverable",
+        EntryRole::ChangedFiles => "changed-files",
     }
 }
 
@@ -1635,6 +1639,49 @@ pub fn deliverable_entry(files: &[Value], at_ms: Option<f64>) -> ChatEntry {
         tool: None,
         at_ms,
     }
+}
+
+/// One turn's edited files (official ChangedFiles card).
+///
+/// The Host serves the official `+N/-M` line counts through a route ACP does not
+/// expose; the card therefore lists the files the turn successfully mutated and
+/// opens them in the sidebar instead of showing a diff.
+pub fn changed_files_entry(paths: &[String], at_ms: Option<f64>) -> ChatEntry {
+    let files: Vec<Value> = paths
+        .iter()
+        .map(|path| path.trim())
+        .filter(|path| !path.is_empty())
+        .map(|path| serde_json::json!({ "path": path }))
+        .collect();
+    ChatEntry {
+        key: format!(
+            "changed-files-{}-{}",
+            files.len(),
+            paths.first().map_or("", String::as_str)
+        ),
+        external_id: None,
+        role: EntryRole::ChangedFiles,
+        title: String::new(),
+        text: String::new(),
+        input: Value::Array(files).to_string(),
+        status: String::new(),
+        tool: None,
+        at_ms,
+    }
+}
+
+/// Paths recorded on one ChangedFiles entry.
+pub fn changed_files(entry: &ChatEntry) -> Vec<String> {
+    if entry.role != EntryRole::ChangedFiles {
+        return Vec::new();
+    }
+    serde_json::from_str::<Value>(&entry.input)
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+        .into_iter()
+        .flatten()
+        .filter_map(|file| file.get("path").and_then(Value::as_str).map(str::to_owned))
+        .collect()
 }
 
 /// Localized title of one turn-trigger row (official `turnTriggerDetails`).

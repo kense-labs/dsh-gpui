@@ -1855,8 +1855,10 @@ function observeSessionUpdates(ctx) {
         notify(agent.id, { sessionUpdate: 'gpui_tool_preparing', preparing: false });
         return;
       }
-      if (chunk.type !== 'reasoning-delta' && chunk.type !== 'text-delta' &&
-          !(chunk.type === 'block-end' && ['reasoning', 'text'].includes(chunk.block.type))) return;
+      // Token deltas need no forwarding: the client's stream-preview rows are
+      // disabled (they froze the transcript), and durable ACP content owns the
+      // transcript text. Only the prepare signal is published from this stream.
+      return;
     }
     if (frame.type === 'end') {
       // The message finished streaming: the tool now executes, and its live
@@ -1864,18 +1866,6 @@ function observeSessionUpdates(ctx) {
       preparingTools.delete(agent);
       notify(agent.id, { sessionUpdate: 'gpui_tool_preparing', preparing: false });
     }
-    const update = { sessionUpdate: 'gpui_assistant_stream', frame };
-    if (frame.type === 'end' && frame.outcome.kind === 'committed' &&
-        frame.outcome.eventType === 'assistant/message') {
-      const event = agent.session.eventAt(frame.outcome.seq);
-      if (event?.type === 'assistant/message') {
-        const { id, content } = event.data.message;
-        update.messageId = id;
-        update.hasThought = content.some(block => block.type === 'reasoning' && block.text.length > 0);
-        update.hasText = content.some(block => block.type === 'text' && block.text.length > 0);
-      }
-    }
-    notify(agent.id, update);
   }, { global: true });
   ctx.on('session/event', (session, event) => {
     if (event.type === 'tool/ptc-dispatch-start' || event.type === 'tool/ptc-dispatch') {

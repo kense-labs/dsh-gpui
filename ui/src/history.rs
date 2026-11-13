@@ -127,6 +127,11 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
     // Files announced through `present` during the open turn; they become the
     // official turn-tail delivery cards when that turn closes.
     let mut pending_deliverables: Vec<Value> = Vec::new();
+    // Successful mutations in the open turn feed the official ChangedFiles card;
+    // the call's argument path is remembered until its result settles.
+    let mut mutation_calls: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut pending_changed_files: Vec<String> = Vec::new();
     // Compaction summaries arrive just before the checkpoint message that
     // replaces the shadowed history; keep them keyed so the marker can cite the
     // official counts without rendering an extra row.
@@ -615,6 +620,9 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
+                if let Some(path) = crate::mentions::mutation_path(&name, &arguments) {
+                    mutation_calls.insert(call_id.clone(), path);
+                }
                 let title = tool_title(&name, &arguments);
                 if let Some(&index) = tool_index.get(&call_id) {
                     let entry = &mut out.entries[index];
@@ -649,6 +657,12 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                 }
                 let output = crate::tool_calls::result_text(&data["message"]);
                 let status = crate::tool_calls::result_status(&data, &data["message"]);
+                if status != "failed"
+                    && let Some(path) = mutation_calls.remove(&call_id)
+                    && !pending_changed_files.iter().any(|seen| *seen == path)
+                {
+                    pending_changed_files.push(path);
+                }
                 if let Some(&index) = tool_index.get(&call_id) {
                     let entry = &mut out.entries[index];
                     entry.text = output;
@@ -844,6 +858,11 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                 }
             }
             "turn/end" => {
+                if !pending_changed_files.is_empty() {
+                    let paths = std::mem::take(&mut pending_changed_files);
+                    out.entries
+                        .push(crate::state::changed_files_entry(&paths, at_ms));
+                }
                 if !pending_deliverables.is_empty() {
                     let files = std::mem::take(&mut pending_deliverables);
                     out.entries
@@ -1552,6 +1571,81 @@ mod tests {
         ];
         let projected = project_session_events(&events);
         assert_eq!(projected.session_title, Some((2, "会话进度确认".into())));
+    }
+
+    #[test]
+    fn a_turn_that_mutated_files_replays_the_changed_files_card() {
+        let events = vec![
+            json!({"type": "turn/start", "seq": 1, "data": {"turn": 1}}),
+            json!({"type": "tool/call", "seq": 2, "data": {
+                "turn": 1, "callId": "call-write", "name": "write",
+                "arguments": "{\"file_path\":\"src/a.rs\",\"content\":\"x\"}"
+            }}),
+            json!({"type": "tool/result", "seq": 3, "surfaceOp": "append", "data": {
+                "turn": 1,
+                "message": {"role": "tool", "toolCallId": "call-write",
+                    "source": {"kind": "tool", "callId": "call-write"},
+                    "content": [{"type": "text", "text": "ok"}]}
+            }}),
+            json!({"type": "tool/call", "seq": 4, "data": {
+                "turn": 1, "callId": "call-fail", "name": "edit",
+                "arguments": "{\"file_path\":\"src/b.rs\",\"old_string\":\"a\",\"new_string\":\"b\"}"
+            }}),
+            json!({"type": "tool/result", "seq": 5, "surfaceOp": "append", "data": {
+                "turn": 1,
+                "message": {"role": "tool", "toolCallId": "call-fail", "isError": true,
+                    "source": {"kind": "tool", "callId": "call-fail"},
+                    "content": [{"type": "text", "text": "failed"}]}
+            }}),
+            json!({"type": "turn/end", "seq": 6, "data": {"turn": 1, "reason": {"kind": "completed"}}}),
+        ];
+        let projected = project_session_events(&events);
+        let card = projected
+            .entries
+            .iter()
+            .find(|entry| entry.role == EntryRole::ChangedFiles)
+            .expect("changed files card");
+        // Only the successful write is listed; a failed edit never counts.
+        assert_eq!(
+            crate::state::changed_files(card),
+            vec!["src/a.rs".to_owned()]
+        );
+        // The card precedes nothing else in this turn, but it must trail it.
+        assert!(
+            projected
+                .entries
+                .iter()
+                .position(|entry| entry.role == EntryRole::ChangedFiles)
+                .is_some()
+        );
+        // Deduplicate: a second successful write to the same path adds no row.
+        let mut repeated = events.clone();
+        repeated.insert(
+            4,
+            json!({"type": "tool/call", "seq": 7, "data": {
+                "turn": 1, "callId": "call-write-2", "name": "write",
+                "arguments": "{\"file_path\":\"src/a.rs\",\"content\":\"y\"}"
+            }}),
+        );
+        repeated.insert(
+            5,
+            json!({"type": "tool/result", "seq": 8, "surfaceOp": "append", "data": {
+                "turn": 1,
+                "message": {"role": "tool", "toolCallId": "call-write-2",
+                    "source": {"kind": "tool", "callId": "call-write-2"},
+                    "content": [{"type": "text", "text": "ok"}]}
+            }}),
+        );
+        let projected = project_session_events(&repeated);
+        let card = projected
+            .entries
+            .iter()
+            .find(|entry| entry.role == EntryRole::ChangedFiles)
+            .expect("changed files card");
+        assert_eq!(
+            crate::state::changed_files(card),
+            vec!["src/a.rs".to_owned()]
+        );
     }
 
     #[test]
