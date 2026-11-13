@@ -9,6 +9,7 @@ mod assistant_stream;
 #[cfg(any(target_family = "wasm", test))]
 mod commands;
 pub mod data_url;
+pub mod file_icons;
 pub mod file_notes;
 #[cfg(any(target_family = "wasm", test))]
 mod files;

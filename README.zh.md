@@ -149,7 +149,7 @@ WASM 前端是 KWork 最大的产物。体积优化分成三段，全部由 `bun
 
 已验证 macOS 开发构建、API Key 管理、ACP 自动化投递、从运行记录打开会话，以及会话归档与恢复。GPUI 界面已使用官方明暗两套设计 token、菜单进入/退场与模态时长、指令结果卡片、服务商品牌图标和不闪烁的流式推理扫光。工作区可通过原生目录选择器添加（`Mod+O`），移除后可在「设置 → 通用」恢复；宿主命令失败、冷恢复的待回答问题与终端 PTY 错误都会显示在界面上，不再静默丢弃。
 
-界面按上游 `deepseek-ai/deepseek-harness` 源码（`packages/client/ui-*/README.zh.md`，共 61 个 UI 包）逐包对齐，当前对照版本为标签 `dsh-v0.2.2-rc.3`。逐项状态（已验证 / 近似实现 / ACP 不可达）记录在 [docs/parity-rc3.md](docs/parity-rc3.md)。近几轮已补齐：数学围栏降级展示、类型化工具卡（shell/read/grep/web）、交付物与已编辑文件卡片、Markdown 行内死循环修复、大转录区渲染窗口化、回放重试单行化与历史加载超时/重试。仍按包跟踪的剩余项：工作区树拖拽重排、会话日志上传、网络搜索计费、按扩展名的页签图标、终端徽标、轨迹视图、插件卡片徽标、启动页「更多工具」菜单与最小投递间隔提示。
+界面按上游 `deepseek-ai/deepseek-harness` 源码（`packages/client/ui-*/README.zh.md`，共 61 个 UI 包）逐包对齐，当前对照版本为标签 `dsh-v0.2.2-rc.3`。逐项状态（已验证 / 近似实现 / ACP 不可达）记录在 [docs/parity-rc3.md](docs/parity-rc3.md)。近几轮已补齐：数学围栏降级展示、类型化工具卡（shell/read/grep/web）、交付物与已编辑文件卡片、Markdown 行内死循环修复、大转录区渲染窗口化、回放重试单行化与历史加载超时/重试。仍按包跟踪的剩余项：工作区树拖拽重排、会话日志上传、网络搜索计费、终端徽标、轨迹视图、插件卡片徽标、启动页「更多工具」菜单与最小投递间隔提示。
 
 冷启动投递和预留会话需要配套 `dsh-acp` 提供 `ctx.acpSessionHost`。按指定 Agent 预设创建自动化会话需要上游支持：ACP profile 需挂载 `agent-preset-registry`，且 `acpSessionHost.create` 需接受预设参数；在具备该能力之前，KWork 会明确拒绝这类请求，避免用错误的 Agent 配置创建会话。工作区重命名与移除仍是本地别名/隐藏偏好，不改动注册表或磁盘目录。视觉与动画仍在按官方 `dsh-client-ui-*` 各包逐项对齐。
 

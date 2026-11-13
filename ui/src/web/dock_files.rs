@@ -8,6 +8,7 @@ use super::{
 };
 use crate::files::WorkspaceFile;
 use gpui::{canvas, fill, linear_color_stop, linear_gradient, svg};
+use kui::primitives::glyph::{Glyph, icon};
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -17,6 +18,7 @@ const FOLDER_CLOSED: &[u8] = include_bytes!("../../assets/files-folder-closed.sv
 const FOLDER_OPEN: &[u8] = include_bytes!("../../assets/files-folder-open.svg");
 const FILE_OTHER: &[u8] = include_bytes!("../../assets/files-other.svg");
 const FILE_OTHER_FOLD: &[u8] = include_bytes!("../../assets/files-other-fold.svg");
+const FILE_MARKDOWN: &[u8] = include_bytes!("../../assets/file-markdown-mark.svg");
 
 /// One workspace search's client state (official Files search).
 #[derive(Default)]
@@ -1141,7 +1143,7 @@ impl DshApp {
                 )
             })
             .when(!directory && !entry.is_other, |row| {
-                row.child(file_sheet_icon(16.))
+                row.child(file_kind_icon(&entry.name, 16., p.label_tertiary))
             })
             .child(div().min_w_0().truncate().child(entry.name.clone()));
         if entry.is_other {
@@ -1185,6 +1187,22 @@ pub(super) fn files_header(path: &str, cx: &App) -> gpui::Div {
         .border_b(px(0.5))
         .border_color(dsh(cx).border_l3)
         .child(files_path_label(path, cx))
+}
+
+/// Icon for one file, classified by extension like the official file-type
+/// glyphs (the GPUI client can only distinguish markdown, pictures and the
+/// generic sheet).
+pub(super) fn file_kind_icon(name: &str, size: f32, color: gpui::Hsla) -> gpui::AnyElement {
+    match crate::file_icons::file_kind(name) {
+        crate::file_icons::FileKind::Markdown => svg()
+            .data(FILE_MARKDOWN)
+            .size(px(size))
+            .flex_none()
+            .text_color(color)
+            .into_any_element(),
+        crate::file_icons::FileKind::Image => icon(Glyph::Monitor, size, color).into_any_element(),
+        _ => file_sheet_icon(size).into_any_element(),
+    }
 }
 
 pub(super) fn file_sheet_icon(size: f32) -> gpui::Div {

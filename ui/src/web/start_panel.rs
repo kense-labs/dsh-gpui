@@ -517,7 +517,7 @@ impl DshApp {
                             }
                         }))
                 })
-                .child(dock_tab_icon(tab, title_color, cx))
+                .child(dock_tab_icon(tab, &label, title_color, cx))
                 .child(if let Some(editor) = title_editor {
                     div()
                         .flex_auto()
@@ -1221,6 +1221,7 @@ impl DshApp {
 
 pub(super) fn dock_tab_icon(
     tab: RightPanelTab,
+    name: &str,
     title_color: gpui::Hsla,
     cx: &App,
 ) -> gpui::AnyElement {
@@ -1234,9 +1235,11 @@ pub(super) fn dock_tab_icon(
             .flex_none()
             .text_color(title_color)
             .into_any_element(),
-        RightPanelTab::Document(_) | RightPanelTab::Plan(_) => {
-            super::dock_files::file_sheet_icon(16.).into_any_element()
+        // Document tabs carry the file-type glyph for their title.
+        RightPanelTab::Document(_) => {
+            super::dock_files::file_kind_icon(name, 16., color).into_any_element()
         }
+        RightPanelTab::Plan(_) => super::dock_files::file_sheet_icon(16.).into_any_element(),
         RightPanelTab::Browser(_) => icon(Glyph::Globe, 16., color).into_any_element(),
     }
 }

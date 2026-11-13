@@ -469,7 +469,12 @@ impl DshApp {
                             )
                             .child(
                                 dock_chip()
-                                    .child(dock_tab_icon(tab, p.secondary, cx))
+                                    .child(dock_tab_icon(
+                                        tab,
+                                        &self.dock_tab_label(tab),
+                                        p.secondary,
+                                        cx,
+                                    ))
                                     .child(
                                         if let Some(editor) =
                                             self.render_terminal_title_editor(pane, tab, cx)
