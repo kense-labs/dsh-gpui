@@ -243,6 +243,21 @@ pub fn apply_update(entries: &mut Vec<ChatEntry>, update: &Value) -> UpdateEffec
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("trigger-{}", entries.len()));
+            // Variant-selecting source facts: a subagent's stop reason or a
+            // webhook's provider (official turnTriggerDetails).
+            let detail = match source {
+                "subagent" | "subagent-settled" => update
+                    .get("stopReason")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                "webhook" | "github" => update
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                _ => String::new(),
+            };
             let raw = update
                 .get("content")
                 .and_then(Value::as_str)
@@ -278,6 +293,9 @@ pub fn apply_update(entries: &mut Vec<ChatEntry>, update: &Value) -> UpdateEffec
             }) {
                 entry.title = title;
                 entry.text = text;
+                if !detail.is_empty() {
+                    entry.status = detail;
+                }
             } else {
                 entries.push(ChatEntry {
                     key: format!("trigger-{id}"),
@@ -286,7 +304,7 @@ pub fn apply_update(entries: &mut Vec<ChatEntry>, update: &Value) -> UpdateEffec
                     title,
                     text,
                     input: String::new(),
-                    status: String::new(),
+                    status: detail,
                     tool: None,
                     at_ms: update.get("time").and_then(Value::as_f64),
                 });
@@ -886,6 +904,42 @@ pub fn turn_failure_entry(turn: u64, reason: &Value, at_ms: Option<f64>) -> Opti
     })
 }
 
+/// Localized title of one turn-trigger row (official `turnTriggerDetails`).
+///
+/// `title` is the durable trigger key the projection stores (`goal`,
+/// `trigger:subagent-settled`, …) and `detail` is the extra recorded source fact
+/// that picks the variant: a subagent's stop reason or a webhook's provider.
+pub fn trigger_title(title: &str, detail: &str) -> &'static str {
+    match title {
+        "goal" | "trigger:goal" => "继续执行目标",
+        "trigger:agent" | "trigger:agent-message" => "收到任务消息",
+        "trigger:team" | "trigger:team-message" => "收到团队消息",
+        "trigger:schedule" => "自动化任务",
+        "trigger:webhook" | "trigger:github" => {
+            if detail == "github" {
+                "收到 GitHub 事件"
+            } else {
+                "收到外部事件"
+            }
+        }
+        // Official subagentTitle(): an unfamiliar or missing reason is never
+        // reported as success.
+        "trigger:subagent" | "trigger:subagent-settled" => match detail {
+            "" => "子任务状态更新",
+            "completed" => "子智能体已完成任务",
+            "aborted" => "子智能体任务已停止",
+            "error" => "子智能体执行失败",
+            "max-tokens" => "子智能体已达 token 上限",
+            "refusal" => "子智能体拒绝执行",
+            _ => "子智能体异常结束",
+        },
+        "trigger:job" | "trigger:tool-jobs" => "后台任务状态更新",
+        "trigger:plugin" => "插件状态更新",
+        // Official fallback for an unfamiliar waking producer.
+        _ => "收到执行请求",
+    }
+}
+
 /// Whether a non-human message source wakes a Turn (official TurnTriggerNodeView).
 ///
 /// Everything else is injected model history: the ACP transport forwards both
@@ -954,7 +1008,7 @@ mod tests {
     use super::{
         ChatEntry, EntryRole, adopt_logged_user_message, apply_update, context_entries_text,
         context_source_label, is_auth_failure, job_detail_text, job_status_label,
-        prompt_failure_message, turn_failure, turn_failure_entry, validate_api_key,
+        prompt_failure_message, trigger_title, turn_failure, turn_failure_entry, validate_api_key,
     };
     use serde_json::json;
 
@@ -1015,6 +1069,84 @@ mod tests {
             entries[0].text,
             "Time sampled while preparing turn 2, step 1"
         );
+    }
+
+    #[test]
+    fn trigger_titles_follow_the_recorded_source_variant() {
+        // Official subagentTitle(): outcomes are never collapsed into one label,
+        // and an unknown reason never implies success.
+        assert_eq!(
+            trigger_title("trigger:subagent-settled", ""),
+            "子任务状态更新"
+        );
+        assert_eq!(
+            trigger_title("trigger:subagent-settled", "completed"),
+            "子智能体已完成任务"
+        );
+        assert_eq!(
+            trigger_title("trigger:subagent-settled", "aborted"),
+            "子智能体任务已停止"
+        );
+        assert_eq!(
+            trigger_title("trigger:subagent-settled", "error"),
+            "子智能体执行失败"
+        );
+        assert_eq!(
+            trigger_title("trigger:subagent-settled", "max-tokens"),
+            "子智能体已达 token 上限"
+        );
+        assert_eq!(
+            trigger_title("trigger:subagent-settled", "refusal"),
+            "子智能体拒绝执行"
+        );
+        assert_eq!(
+            trigger_title("trigger:subagent-settled", "mystery"),
+            "子智能体异常结束"
+        );
+        // A GitHub webhook is told apart by its recorded provider.
+        assert_eq!(
+            trigger_title("trigger:webhook", "github"),
+            "收到 GitHub 事件"
+        );
+        assert_eq!(trigger_title("trigger:webhook", ""), "收到外部事件");
+        assert_eq!(trigger_title("goal", ""), "继续执行目标");
+        assert_eq!(trigger_title("trigger:tool-jobs", ""), "后台任务状态更新");
+        assert_eq!(trigger_title("trigger:unheard-of", ""), "收到执行请求");
+    }
+
+    #[test]
+    fn a_subagent_notice_keeps_its_stop_reason_for_the_title() {
+        let mut entries = Vec::new();
+        let effect = apply_update(
+            &mut entries,
+            &json!({
+                "sessionUpdate": "turn_trigger",
+                "messageId": "settled-1",
+                "sourceKind": "subagent-settled",
+                "stopReason": "aborted",
+                "content": "Background subagent agent-1 finished.",
+                "time": 3,
+            }),
+        );
+        assert!(effect.turn_triggered);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, "aborted");
+        assert_eq!(
+            trigger_title(&entries[0].title, &entries[0].status),
+            "子智能体任务已停止"
+        );
+        // The bridge's own trigger update may land second and must not drop it.
+        apply_update(
+            &mut entries,
+            &json!({
+                "sessionUpdate": "turn_trigger",
+                "messageId": "settled-1",
+                "sourceKind": "subagent-settled",
+                "content": "Background subagent agent-1 finished.",
+            }),
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, "aborted");
     }
 
     #[test]

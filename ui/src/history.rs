@@ -231,6 +231,19 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                 let key = id
                     .clone()
                     .unwrap_or_else(|| format!("hist-user-{}", out.entries.len()));
+                // Variant-selecting facts for a trigger card, exactly like the
+                // live projection reads them (official turnTriggerDetails).
+                let detail = match source {
+                    "subagent" | "subagent-settled" => data
+                        .pointer("/source/stopReason")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    "webhook" => data
+                        .pointer("/source/provider")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    _ => "",
+                };
                 out.entries.push(ChatEntry {
                     key,
                     external_id: id,
@@ -238,7 +251,7 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                     title,
                     text,
                     input: String::new(),
-                    status: String::new(),
+                    status: detail.to_owned(),
                     tool: None,
                     at_ms,
                 });
@@ -778,6 +791,35 @@ mod tests {
         assert_eq!(projected.entries[0].title, "系统提示词");
         assert!(projected.entries[0].text.contains("DeepSeek Harness"));
         assert_eq!(projected.entries[0].key, "system-prompt-8");
+    }
+
+    #[test]
+    fn a_replayed_subagent_notice_keeps_its_outcome() {
+        // Payload copied from a real parent log: the durable source records the
+        // child's stop reason, which selects the trigger card's title.
+        let events = vec![json!({
+            "type": "user/message", "seq": 20, "time": 30,
+            "data": {
+                "id": "settled-1",
+                "source": {
+                    "kind": "subagent-settled", "form": "notice",
+                    "summary": "Background subagent agent-1 finished.",
+                    "stopReason": "completed",
+                    "senderSessionId": "73652a28-dab6-4fd7-8aa5-a6a6d99132a8",
+                },
+                "content": [{"type": "text", "text": "Background subagent agent-1 finished."}],
+            }
+        })];
+        let projected = project_session_events(&events);
+        assert_eq!(projected.entries.len(), 1);
+        let entry = &projected.entries[0];
+        assert_eq!(entry.role, EntryRole::User);
+        assert_eq!(entry.title, "trigger:subagent-settled");
+        assert_eq!(entry.status, "completed");
+        assert_eq!(
+            crate::state::trigger_title(&entry.title, &entry.status),
+            "子智能体已完成任务"
+        );
     }
 
     #[test]

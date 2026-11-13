@@ -1899,12 +1899,16 @@ function observeSessionUpdates(ctx) {
           return;
         }
         // Waking notifications keep their trigger card (official
-        // TurnTriggerNodeView) so a goal round or job settle is visible.
+        // TurnTriggerNodeView) so a goal round or job settle is visible. The
+        // variant facts (subagent stop reason, webhook provider) select the
+        // card's localized title.
         notify(session.id, {
           sessionUpdate: 'turn_trigger',
           messageId: data.id,
           sourceKind: source,
           form: data.source?.form,
+          stopReason: data.source?.stopReason,
+          provider: data.source?.provider,
           content: contentBlocks(data.content),
           time: event.time,
         });

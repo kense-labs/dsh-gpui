@@ -6651,18 +6651,7 @@ pub(super) fn mark_copied(this: &mut DshApp, mark: &str, cx: &mut Context<DshApp
 fn render_turn_trigger(entry: &ChatEntry, expanded: bool, cx: &mut Context<DshApp>) -> gpui::Div {
     let p = dsh(cx);
     let key = entry.key.clone();
-    let title = match entry.title.as_str() {
-        "goal" | "trigger:goal" => "继续执行目标",
-        "trigger:agent" | "trigger:agent-message" => "收到任务消息",
-        "trigger:schedule" => "自动化任务",
-        "trigger:webhook" => "收到外部事件",
-        "trigger:github" => "收到 GitHub 事件",
-        "trigger:team" | "trigger:team-message" => "收到团队消息",
-        "trigger:subagent" | "trigger:subagent-settled" => "子任务状态更新",
-        "trigger:job" | "trigger:tool-jobs" => "后台任务状态更新",
-        "trigger:plugin" => "插件状态更新",
-        _ => "自动触发",
-    };
+    let title = crate::state::trigger_title(&entry.title, &entry.status);
     let glyph = match entry.title.as_str() {
         "goal" | "trigger:goal" => Glyph::Check,
         "trigger:schedule" => Glyph::Clock,
