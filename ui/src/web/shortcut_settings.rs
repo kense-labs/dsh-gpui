@@ -432,6 +432,12 @@ impl DshApp {
                 }
             }
         }
+        #[cfg(debug_assertions)]
+        if combo.eq_ignore_ascii_case("meta+shift+d") || combo.eq_ignore_ascii_case("ctrl+shift+d")
+        {
+            self.inject_rendering_demo(cx);
+            return true;
+        }
         self.handle_fixed_key(combo, w, cx)
             || !self.shortcuts.open && self.handle_file_key(combo, w, cx)
     }
