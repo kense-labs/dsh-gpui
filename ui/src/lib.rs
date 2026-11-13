@@ -32,6 +32,7 @@ mod terminal_keys;
 #[cfg(any(target_family = "wasm", test))]
 pub mod tokens;
 mod tool_calls;
+pub mod turns;
 pub mod validation;
 
 #[cfg(target_family = "wasm")]

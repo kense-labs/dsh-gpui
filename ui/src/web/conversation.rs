@@ -28,6 +28,8 @@ pub(super) struct Conversation {
     pub(super) subagents: Vec<crate::subagents::SubagentRow>,
     /// Whether the composer's subagent list is expanded.
     pub(super) subagents_expanded: bool,
+    /// Turn rail mark under the pointer (index into the rail items).
+    pub(super) turn_rail_hover: Option<usize>,
     /// 待投递列表的本地单调序号；用于忽略比某一行更早请求的 Host 快照。
     pub(super) inbox_seq: u64,
     pub(super) wrapped_code: std::collections::HashSet<String>,

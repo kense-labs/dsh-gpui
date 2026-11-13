@@ -91,7 +91,26 @@ impl DshApp {
                 {
                     main = main.child(self.render_hero(w, cx));
                 } else {
-                    main = main.child(self.render_conversation(w, cx));
+                    let rail_items = crate::turns::turn_items(
+                        self.conversation
+                            .entries
+                            .iter()
+                            .chain(self.conversation.assistant_stream.entries())
+                            .filter(|entry| !entry.is_subcall()),
+                    );
+                    let rail =
+                        (!rail_items.is_empty()).then(|| self.render_turn_rail(&rail_items, w, cx));
+                    let conversation = self.render_conversation(w, cx);
+                    let mut overlay = div()
+                        .relative()
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .child(conversation);
+                    if let Some(rail) = rail {
+                        overlay = overlay.child(rail);
+                    }
+                    main = main.child(overlay);
                     main = if approval {
                         main.children(self.render_permission(w, cx))
                     } else if plan {
@@ -2678,6 +2697,176 @@ impl DshApp {
     }
 
     /// 官方轮次收尾：消耗行 + 33px 分隔线 + 轮尾操作行。
+    /// 官方 TurnNavigator：对话右侧每轮一个刻度。
+    ///
+    /// 悬停显示该轮的输入与最新回答预览，点击跳到这一轮的开头行。少于两轮
+    /// 时不显示（和官方一致）；轨上的高亮跟随视口顶部所在的轮次。
+    fn render_turn_rail(
+        &self,
+        items: &[crate::turns::TurnItem],
+        w: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        if items.len() < 2 {
+            return div().into_any_element();
+        }
+        let p = dsh(cx);
+        let scroll_top = -self.conversation.scroll.offset().y.as_f32();
+        let tops: Vec<Option<f32>> = items
+            .iter()
+            .map(|item| self.conversation.flow_scroll.row_top(&item.anchor))
+            .collect();
+        let active = crate::turns::active_turn(&tops, scroll_top, 24.);
+        let hover = self.conversation.turn_rail_hover;
+        let total = items.len();
+        let mut marks = column().w_full().gap(px(4.)).items_center();
+        for (index, item) in items.iter().enumerate() {
+            let is_active = active == Some(index);
+            let anchor = item.anchor.clone();
+            let label = format!("第 {} 轮", item.turn);
+            let mut mark = div()
+                .id(gpui::ElementId::Name(format!("turn-mark-{index}").into()))
+                .relative()
+                .role(gpui::Role::Button)
+                .aria_label(label)
+                .tab_index(0)
+                .w_full()
+                .h(px(8.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .child(
+                    div()
+                        .w(px(if hover == Some(index) { 14. } else { 10. }))
+                        .h(px(2.))
+                        .rounded_full()
+                        .bg(if is_active || hover == Some(index) {
+                            p.ink
+                        } else {
+                            p.line
+                        }),
+                )
+                .on_hover(cx.listener(move |this, inside: &bool, _, cx| {
+                    let next = if *inside {
+                        Some(index)
+                    } else if this.conversation.turn_rail_hover == Some(index) {
+                        None
+                    } else {
+                        this.conversation.turn_rail_hover
+                    };
+                    if this.conversation.turn_rail_hover != next {
+                        this.conversation.turn_rail_hover = next;
+                        cx.notify();
+                    }
+                }))
+                // The rail is a press target: act on press so the jump lands
+                // without waiting for a click pair on an 8px hit area.
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.jump_to_turn(&anchor, index, total, cx);
+                    }),
+                );
+            if hover == Some(index) {
+                mark = mark.child(self.render_turn_preview(item, cx));
+            }
+            marks = marks.child(mark);
+        }
+        // Sit in the gutter just right of the conversation column: the
+        // transcript's own right edge can fall outside the window's clickable
+        // area, while this gutter stays inside it (and next to the reading
+        // column, like the official rail).
+        let main_width = f32::from(w.viewport_size().width) - self.sidebar_track_width(w);
+        let column = crate::layout::conversation_axis(main_width);
+        let dock = self.right_dock_frame.track;
+        let gutter = ((main_width - dock - column) / 2. + dock - 4.).max(6.);
+        div()
+            .id("turn-rail")
+            .absolute()
+            .right(px(gutter))
+            .top(px(56.))
+            .bottom(px(56.))
+            .w(px(20.))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .child(marks)
+            .into_any_element()
+    }
+
+    /// 轮次刻度的悬停预览：第 N 轮 + 输入 + 最新回答。
+    fn render_turn_preview(
+        &self,
+        item: &crate::turns::TurnItem,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let p = dsh(cx);
+        let mut preview = column()
+            .absolute()
+            .right(px(22.))
+            .top(px(-6.))
+            .w(px(240.))
+            .gap(px(3.))
+            .px(px(10.))
+            .py(px(8.))
+            .rounded(px(10.))
+            .border(px(0.5))
+            .border_color(p.line)
+            .bg(p.stage)
+            .shadow(crate::tokens::elevation_prominent())
+            .occlude()
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .line_height(px(16.))
+                    .text_color(p.faint)
+                    .child(format!("第 {} 轮", item.turn)),
+            )
+            .child(
+                div()
+                    .truncate()
+                    .text_size(px(12.))
+                    .line_height(px(18.))
+                    .text_color(p.secondary)
+                    .child(item.prompt.clone()),
+            );
+        if !item.response.is_empty() {
+            preview = preview.child(
+                div()
+                    .truncate()
+                    .text_size(px(12.))
+                    .line_height(px(18.))
+                    .text_color(p.faint)
+                    .child(item.response.clone()),
+            );
+        }
+        preview
+    }
+
+    /// Jump the transcript to one turn's opening row and stop following the tail.
+    fn jump_to_turn(&mut self, anchor: &str, turn: usize, total: usize, cx: &mut Context<Self>) {
+        let max = self.conversation.scroll.max_offset().y.as_f32();
+        // Prefer the measured row position; before the first measurement pass a
+        // proportional guess still lands near the turn instead of doing nothing.
+        let target = match self.conversation.flow_scroll.row_top(anchor) {
+            Some(top) => (top - 12.).max(0.).min(max),
+            None => {
+                let fraction = if total <= 1 {
+                    0.
+                } else {
+                    turn as f32 / (total - 1) as f32
+                };
+                (max * fraction).max(0.)
+            }
+        };
+        self.conversation.follow_tail = false;
+        let x = self.conversation.scroll.offset().x;
+        self.conversation.scroll.set_offset(point(x, px(-target)));
+        self.conversation.turn_rail_hover = None;
+        cx.notify();
+    }
+
     fn render_turn_footer(
         &self,
         summary: TurnSummary,

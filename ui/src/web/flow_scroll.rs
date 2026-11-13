@@ -126,6 +126,23 @@ impl Geometry {
 #[derive(Default, Clone)]
 pub(super) struct FlowScroll(Rc<RefCell<ScrollMemory>>);
 
+impl FlowScroll {
+    /// Top offset of one measured row from the last prepaint pass.
+    ///
+    /// The turn rail needs it to jump to a turn's opening row; `None` means the
+    /// row has not been measured yet (or is currently not rendered).
+    pub(super) fn row_top(&self, key: &str) -> Option<f32> {
+        let memory = self.0.borrow();
+        memory
+            .geometry
+            .as_ref()?
+            .rows
+            .iter()
+            .find(|row| row.key == key)
+            .map(|row| row.top)
+    }
+}
+
 #[derive(Default)]
 struct ScrollMemory {
     geometry: Option<Geometry>,
