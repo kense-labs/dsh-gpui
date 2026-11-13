@@ -243,6 +243,38 @@ pub fn project_session_events_with_more(events: &[Value], has_more: bool) -> His
                     at_ms,
                 });
             }
+            "system/message" => {
+                // Official SystemPromptRow: the complete model-visible prompt as
+                // one collapsed disclosure at its position in the turn.
+                let text = data
+                    .pointer("/message/content")
+                    .and_then(Value::as_array)
+                    .map(|blocks| content_texts(blocks))
+                    .unwrap_or_default();
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let seq = event.get("seq").and_then(Value::as_u64);
+                out.entries.push(ChatEntry {
+                    key: seq
+                        .map(|seq| format!("system-prompt-{seq}"))
+                        .unwrap_or_else(|| format!("hist-system-prompt-{}", out.entries.len())),
+                    external_id: seq.map(|seq| seq.to_string()),
+                    role: EntryRole::SystemPrompt,
+                    title: if event.get("surfaceOp") == Some(&Value::from("append"))
+                        || event.get("surfaceOp").is_none()
+                    {
+                        "系统提示词".to_owned()
+                    } else {
+                        "系统提示词更新".to_owned()
+                    },
+                    text,
+                    input: String::new(),
+                    status: String::new(),
+                    tool: None,
+                    at_ms,
+                });
+            }
             "assistant/message" => {
                 let message = data.get("message").unwrap_or(&data);
                 let id = message
@@ -718,6 +750,28 @@ mod tests {
 
     #[test]
     #[test]
+    #[test]
+    fn a_replayed_system_prompt_is_one_collapsed_row() {
+        // Payload shape copied from a real ACP session log: the complete
+        // model-visible prompt is recorded once at the turn's first step and the
+        // official transcript shows it as a disclosure row.
+        let events = vec![json!({
+            "type": "system/message", "seq": 8, "time": 1_794_544_667_013u64,
+            "data": {
+                "turn": 1, "step": 1,
+                "message": {"role": "system", "content": [
+                    {"type": "text", "text": "You are an AI agent powered by DeepSeek Harness.\nBe careful."}
+                ]}
+            }
+        })];
+        let projected = project_session_events(&events);
+        assert_eq!(projected.entries.len(), 1);
+        assert_eq!(projected.entries[0].role, EntryRole::SystemPrompt);
+        assert_eq!(projected.entries[0].title, "系统提示词");
+        assert!(projected.entries[0].text.contains("DeepSeek Harness"));
+        assert_eq!(projected.entries[0].key, "system-prompt-8");
+    }
+
     #[test]
     fn a_replayed_subagent_catalog_lists_the_children() {
         // Payload copied from a real parent session log: the parent records one

@@ -61,6 +61,8 @@ pub enum EntryRole {
     Context,
     /// 官方后台任务行：`job/registered` 建立，`job/settled` 结算。
     Job,
+    /// 官方 SystemPromptRow：本轮完整系统提示词的折叠行。
+    SystemPrompt,
     System,
     Error,
 }
@@ -399,6 +401,49 @@ pub fn apply_update(entries: &mut Vec<ChatEntry>, update: &Value) -> UpdateEffec
         // 技能目录是常驻的一类；`entries` 是该行展开后的内容，`update`
         // 表示这是替换目录而不是首次发布。
         Some("context_injection") => apply_context_injection(entries, update),
+        // Host/ACP 扩展：系统提示词折叠行（官方 SystemPromptRow）。系统提示词
+        // 是模型可见的完整文本，只作为可展开的一行出现，不参与任何状态判断。
+        Some("gpui_system_prompt") => {
+            let text = update
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            if text.is_empty() {
+                return effect;
+            }
+            let seq = update
+                .get("seq")
+                .and_then(Value::as_u64)
+                .map(|seq| seq.to_string())
+                .unwrap_or_else(|| format!("{}", entries.len()));
+            let key = format!("system-prompt-{seq}");
+            let title = if update["update"] == true {
+                "系统提示词更新"
+            } else {
+                "系统提示词"
+            };
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.key == key) {
+                entry.text = text;
+                entry.title = title.to_owned();
+                return effect;
+            }
+            entries.push(ChatEntry {
+                key,
+                external_id: update
+                    .get("seq")
+                    .and_then(Value::as_u64)
+                    .map(|seq| seq.to_string()),
+                role: EntryRole::SystemPrompt,
+                title: title.to_owned(),
+                text,
+                input: String::new(),
+                status: String::new(),
+                tool: None,
+                at_ms: update.get("time").and_then(Value::as_f64),
+            });
+        }
         // Host/ACP 扩展：斜杠指令结果行（官方 GenericCommandCard）。
         // `command/run` 建立行，`command/done` 回填结果；用 commandId 配对。
         Some("gpui_command_run" | "gpui_command_done") => {
@@ -724,6 +769,7 @@ fn role_name(role: EntryRole) -> &'static str {
         EntryRole::Command => "command",
         EntryRole::Context => "context",
         EntryRole::Job => "job",
+        EntryRole::SystemPrompt => "system-prompt",
         EntryRole::System => "system",
         EntryRole::Error => "error",
     }
@@ -896,6 +942,37 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[1].role, EntryRole::User);
         assert_eq!(entries[1].title, "goal");
+    }
+
+    #[test]
+    fn a_live_system_prompt_is_a_collapsed_row() {
+        let mut entries = Vec::new();
+        let effect = apply_update(
+            &mut entries,
+            &json!({
+                "sessionUpdate": "gpui_system_prompt",
+                "seq": 8,
+                "text": "You are an AI agent powered by DeepSeek Harness.",
+                "time": 30,
+            }),
+        );
+        // A prompt disclosure never starts or ends a turn on its own.
+        assert!(!effect.turn_triggered);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].role, EntryRole::SystemPrompt);
+        assert_eq!(entries[0].title, "系统提示词");
+        // The same sequence updates in place (one row per prompt position).
+        apply_update(
+            &mut entries,
+            &json!({
+                "sessionUpdate": "gpui_system_prompt",
+                "seq": 8,
+                "text": "You are an AI agent powered by DeepSeek Harness. Updated.",
+                "time": 31,
+            }),
+        );
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].text.ends_with("Updated."));
     }
 
     #[test]

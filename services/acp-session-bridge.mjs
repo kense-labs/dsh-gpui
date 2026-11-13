@@ -1931,6 +1931,18 @@ function observeSessionUpdates(ctx) {
       });
       return;
     }
+    // The complete model-visible system prompt is a collapsed disclosure row in
+    // the official transcript (SystemPromptRow), so forward its text once.
+    if (type === 'system/message') {
+      notify(session.id, {
+        sessionUpdate: 'gpui_system_prompt',
+        seq: event.seq,
+        text: contentBlocks(data.message?.content),
+        update: surfaceOp !== undefined && surfaceOp !== 'append',
+        time: event.time,
+      });
+      return;
+    }
     // Direct-child discovery facts are what the official lineage catalog lists;
     // the parent run can open each child's transcript from them.
     if (type === 'subagent/catalog') {

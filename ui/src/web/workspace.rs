@@ -6005,6 +6005,7 @@ fn render_entry(
         EntryRole::Retry => render_model_retry(entry, expanded, cx),
         EntryRole::Command => render_command_card(entry, expanded, cx),
         EntryRole::Context => render_context_injection(entry, expanded, cx),
+        EntryRole::SystemPrompt => render_system_prompt(entry, expanded, cx),
         EntryRole::Job => render_job_row(entry, expanded, cx),
         EntryRole::System if entry.title == "turn-end" => row().w_full().justify_start().child(
             div()
@@ -6355,6 +6356,76 @@ fn render_command_card(entry: &ChatEntry, expanded: bool, cx: &mut Context<DshAp
                 .text_size(px(12.))
                 .line_height(px(18.))
                 .text_color(p.ink)
+                .child(body),
+        );
+    }
+    card
+}
+
+/// 官方 SystemPromptRow：本轮完整系统提示词的折叠行。
+///
+/// 默认收起，只占一行；展开后是模型可见的原文（真实换行、超长可滚动），
+/// 与上下文注入行同一个正文外壳。
+fn render_system_prompt(entry: &ChatEntry, expanded: bool, cx: &mut Context<DshApp>) -> gpui::Div {
+    let p = dsh(cx);
+    let key = entry.key.clone();
+    let title = entry.title.clone();
+    let body = entry.text.clone();
+    let open = expanded && !body.trim().is_empty();
+    let toggle_key = key.clone();
+    let row = row()
+        .id(gpui::ElementId::Name(format!("system-prompt-{key}").into()))
+        .role(gpui::Role::Button)
+        .aria_label(title.clone())
+        .aria_expanded(open)
+        .tab_index(0)
+        .w_full()
+        .gap(px(7.))
+        .items_center()
+        .rounded(px(8.))
+        .h(px(24.))
+        .px(px(2.))
+        .cursor_pointer()
+        .hover(|style| style.bg(p.hover))
+        .text_color(p.faint)
+        .child(icon(Glyph::Book, 14., p.faint))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(px(13.))
+                .line_height(px(20.))
+                .child(title),
+        )
+        .child(icon(
+            if open { Glyph::Up } else { Glyph::Down },
+            12.,
+            p.faint,
+        ))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            toggle_entry(&mut this.conversation.expanded_entries, &toggle_key);
+            cx.notify();
+        }));
+    let mut card = column().w_full().child(row);
+    if open {
+        card = card.child(
+            div()
+                .id(gpui::ElementId::Name(
+                    format!("system-prompt-body-{key}").into(),
+                ))
+                .w_full()
+                .max_h(px(141.))
+                .overflow_y_scroll()
+                .ml(px(21.))
+                .mt(px(4.))
+                .px(px(10.))
+                .py(px(8.))
+                .rounded(px(8.))
+                .bg(p.stage)
+                .text_size(px(12.))
+                .line_height(px(18.))
+                .text_color(p.secondary)
                 .child(body),
         );
     }
