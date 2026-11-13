@@ -37,6 +37,8 @@ pub struct WorkspacePreferences {
     pub scratch_session: Option<String>,
     /// Chat HTTP(S) link destination: `sidebar` (built-in browser) or `new-tab`.
     pub link_open: Option<String>,
+    /// Composer statistics detail level: `compact` or `detailed`.
+    pub performance_usage: Option<String>,
 }
 
 #[tauri::command]
@@ -124,13 +126,16 @@ mod tests {
     fn link_open_preference_round_trips_as_camel_case() {
         let preferences = WorkspacePreferences {
             link_open: Some("new-tab".to_string()),
+            performance_usage: Some("compact".to_string()),
             ..WorkspacePreferences::default()
         };
         let encoded = serde_json::to_value(&preferences).expect("serialize preferences");
         assert_eq!(encoded["linkOpen"], "new-tab");
+        assert_eq!(encoded["performanceUsage"], "compact");
         let decoded: WorkspacePreferences =
             serde_json::from_value(encoded).expect("deserialize preferences");
         assert_eq!(decoded.link_open.as_deref(), Some("new-tab"));
+        assert_eq!(decoded.performance_usage.as_deref(), Some("compact"));
     }
 
     #[test]

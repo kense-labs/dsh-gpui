@@ -13,6 +13,8 @@ enum Preference {
     /// Official LinkOpeningRow: Chat HTTP(S) links open in the sidebar browser or
     /// the system default browser.
     Links,
+    /// Official performance/usage detail level for the composer statistics.
+    Performance,
 }
 
 impl Preference {
@@ -38,6 +40,11 @@ impl Preference {
                 "对话中网页链接的打开位置",
                 &["应用内侧边栏", "默认浏览器"],
             ),
+            Self::Performance => (
+                "性能与用量",
+                "选择性能与用量信息展示的详细程度",
+                &["简洁", "详细"],
+            ),
         }
     }
 
@@ -52,6 +59,7 @@ impl Preference {
             Self::Timing => usize::from(app.collapse_next_input),
             Self::Replies => usize::from(!app.keep_folded_replies),
             Self::Links => usize::from(app.link_open_external),
+            Self::Performance => usize::from(!app.performance_compact),
         }
     }
 }
@@ -68,7 +76,7 @@ struct OpenMenu {
 }
 
 pub(super) struct TranscriptPreferences {
-    triggers: [Trigger; 4],
+    triggers: [Trigger; 5],
     menu: Option<OpenMenu>,
 }
 
@@ -147,6 +155,7 @@ impl DshApp {
                 Preference::Timing => self.collapse_next_input = index == 1,
                 Preference::Replies => self.keep_folded_replies = index == 0,
                 Preference::Links => self.link_open_external = index == 1,
+                Preference::Performance => self.performance_compact = index == 0,
             }
             self.save_workspace_preferences(cx);
         }
@@ -206,6 +215,7 @@ impl DshApp {
             Preference::Timing,
             Preference::Replies,
             Preference::Links,
+            Preference::Performance,
         ];
         column().w_full().gap_0().children(
             fields

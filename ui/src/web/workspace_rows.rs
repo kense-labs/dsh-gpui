@@ -124,6 +124,9 @@ impl DshApp {
         if let Some(destination) = reply["linkOpen"].as_str() {
             self.link_open_external = destination == "new-tab";
         }
+        if let Some(mode) = reply["performanceUsage"].as_str() {
+            self.performance_compact = mode == "compact";
+        }
         if let Some(scratch) = reply
             .get("scratchSession")
             .and_then(Value::as_str)
@@ -194,6 +197,7 @@ impl DshApp {
                     "collapseTiming": if self.collapse_next_input { "next-input" } else { "completion" },
                     "foldedReplies": if self.keep_folded_replies { "all" } else { "final" },
                     "linkOpen": if self.link_open_external { "new-tab" } else { "sidebar" },
+                    "performanceUsage": if self.performance_compact { "compact" } else { "detailed" },
                     "workspaceOpenWith": self.workspace_open_with,
                     "scratchSession": self.scratch_session,
                     "workDetails": match self.work_details {

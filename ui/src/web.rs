@@ -687,6 +687,8 @@ pub(crate) struct DshApp {
     /// Chat HTTP(S) links open in the built-in right-sidebar browser (official
     /// default) unless the 网页链接 preference selects the system browser.
     pub(crate) link_open_external: bool,
+    /// Composer statistics compact mode (official 性能与用量 · 简洁).
+    pub(crate) performance_compact: bool,
     /// Full-screen picture opened from a user bubble (official image dialog).
     pub(crate) image_viewer: Option<ImageViewer>,
     confirm_permission: Option<String>,
@@ -1068,6 +1070,7 @@ impl DshApp {
             toasts: Vec::new(),
             requested_attachments: std::collections::HashSet::new(),
             link_open_external: false,
+            performance_compact: false,
             image_viewer: None,
             confirm_permission: None,
             full_access_acknowledged: false,

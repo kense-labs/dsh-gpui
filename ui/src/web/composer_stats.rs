@@ -153,10 +153,16 @@ impl DshApp {
             .gap(px(4.))
             .items_center()
             .justify_center();
-        for reading in [self.activity_reading(), self.usage_reading()]
+        // Official 性能与用量 · 简洁: the activity pill keeps only the speed and
+        // the usage pill only the cache-hit share; both become plain readings.
+        let mut readings: Vec<StatReading> = [self.activity_reading(), self.usage_reading()]
             .into_iter()
             .flatten()
-        {
+            .collect();
+        if self.performance_compact {
+            readings = readings.into_iter().filter_map(compact_reading).collect();
+        }
+        for reading in readings {
             let kind = reading.kind;
             let interactive = !reading.rows.is_empty();
             let open = interactive && self.stats_dialog == Some(kind);
@@ -421,4 +427,29 @@ fn context_meter_ring(ratio: f32, color: gpui::Hsla) -> gpui::Svg {
         .size(px(14.))
         .flex_none()
         .text_color(color)
+}
+
+/// Reduce one statistics reading to the official compact pill: the activity pill
+/// keeps the speed, the usage pill the cache-hit share, and neither opens a dialog.
+fn compact_reading(mut reading: StatReading) -> Option<StatReading> {
+    match reading.kind {
+        StatsDialog::Activity => {
+            let speed = reading
+                .rows
+                .iter()
+                .find(|(label, _)| *label == "输出速度（TPS）")
+                .map(|(_, value)| value.clone())?;
+            reading.label = speed;
+        }
+        StatsDialog::Usage => {
+            let hit = reading
+                .rows
+                .iter()
+                .find(|(label, _)| *label == "缓存命中")
+                .map(|(_, value)| format!("缓存命中 {value}"))?;
+            reading.label = hit;
+        }
+    }
+    reading.rows.clear();
+    Some(reading)
 }
