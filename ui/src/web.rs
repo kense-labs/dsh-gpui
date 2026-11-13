@@ -20,6 +20,7 @@ use crate::{
         short_session_title,
     },
     state::{ChatEntry, EntryRole, apply_update, prompt_failure_message},
+    theme_preference::ThemePreference,
     tokens::{dsh, elevation_prominent, elevation_soft},
     welcome::{Welcome, WelcomeEvent},
 };
@@ -100,7 +101,11 @@ pub fn start() {
         cx.set_global(UiLanguage::Chinese);
         kui::init(cx);
         cx.set_reduce_motion(bridge::prefers_reduced_motion());
-        Theme::global_mut(cx).set_mode(ThemeMode::Dark);
+        Theme::global_mut(cx).set_mode(if bridge::system_prefers_dark() {
+            ThemeMode::Dark
+        } else {
+            ThemeMode::Light
+        });
         if bridge::has_mac_window_material() {
             cx.set_text_rendering_mode(gpui::TextRenderingMode::Grayscale);
         }
@@ -720,6 +725,10 @@ pub(crate) struct DshApp {
     pub(crate) link_open_external: bool,
     /// Composer statistics compact mode (official 性能与用量 · 简洁).
     pub(crate) performance_compact: bool,
+    /// Official ui-theme preference: light, dark or follow the system.
+    pub(crate) theme_preference: ThemePreference,
+    /// Invalidates older follow-the-system watchers when the preference changes.
+    theme_watch_generation: u64,
     /// Open per-turn usage dialog (official TurnUsagePanel).
     pub(super) turn_usage_dialog: Option<turn_usage::TurnUsageDialog>,
     /// Host path waiting for `open_path`; the reply turns a failure into the
@@ -1146,6 +1155,8 @@ impl DshApp {
             requested_attachments: std::collections::HashSet::new(),
             link_open_external: false,
             performance_compact: false,
+            theme_preference: ThemePreference::System,
+            theme_watch_generation: 0,
             turn_usage_dialog: None,
             file_open_pending: None,
             file_open_error: None,
@@ -4264,21 +4275,87 @@ impl DshApp {
         Some(select)
     }
 
-    fn toggle_theme(&mut self, cx: &mut Context<Self>) {
-        let theme = Theme::global_mut(cx);
-        let next = if theme.mode == ThemeMode::Dark {
-            ThemeMode::Light
-        } else {
-            ThemeMode::Dark
-        };
-        theme.set_mode(next);
-        self.sync_shell_window(cx);
+    /// Persist and apply one official appearance preference (light/dark/system).
+    pub(crate) fn set_theme_preference(
+        &mut self,
+        preference: ThemePreference,
+        cx: &mut Context<Self>,
+    ) {
+        self.theme_preference = preference;
+        self.watch_system_theme(cx);
+        self.apply_theme_preference(cx);
         self.save_workspace_preferences(cx);
-        cx.refresh_windows();
+    }
+
+    /// Restore the persisted preference without writing it back (startup path).
+    pub(crate) fn restore_theme_preference(
+        &mut self,
+        preference: ThemePreference,
+        cx: &mut Context<Self>,
+    ) {
+        self.theme_preference = preference;
+        self.watch_system_theme(cx);
+        self.apply_theme_preference(cx);
+    }
+
+    /// Resolve the preference against the current platform appearance.
+    pub(crate) fn apply_theme_preference(&mut self, cx: &mut Context<Self>) {
+        // Always sync the shell first: leaving an explicit light/dark preference
+        // releases the forced native appearance, which is what lets the WebView
+        // report the real system scheme again for 跟随系统.
+        self.sync_shell_window(cx);
+        let want = if self
+            .theme_preference
+            .applies_dark(bridge::system_prefers_dark())
+        {
+            ThemeMode::Dark
+        } else {
+            ThemeMode::Light
+        };
+        if Theme::global(cx).mode != want {
+            Theme::global_mut(cx).set_mode(want);
+            self.sync_shell_window(cx);
+            cx.refresh_windows();
+        }
+    }
+
+    /// Keep following the platform appearance while the preference is system.
+    fn watch_system_theme(&mut self, cx: &mut Context<Self>) {
+        self.theme_watch_generation = self.theme_watch_generation.wrapping_add(1);
+        if self.theme_preference != ThemePreference::System {
+            return;
+        }
+        let generation = self.theme_watch_generation;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(1500))
+                    .await;
+                let keep = this
+                    .update(cx, |app, cx| {
+                        if app.theme_watch_generation != generation
+                            || app.theme_preference != ThemePreference::System
+                        {
+                            return false;
+                        }
+                        app.apply_theme_preference(cx);
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn sync_shell_window(&mut self, cx: &App) {
-        let dark = (!self.show_welcome).then(|| Theme::global(cx).mode == ThemeMode::Dark);
+        // With 跟随系统 the native window must keep the platform appearance:
+        // forcing it would make the WebView's prefers-color-scheme report the
+        // forced value instead of the system's, freezing the follow loop.
+        let dark = (!self.show_welcome && self.theme_preference != ThemePreference::System)
+            .then(|| Theme::global(cx).mode == ThemeMode::Dark);
         let presentation = (self.show_welcome, dark);
         if self.shell_presentation != Some(presentation) {
             self.shell_presentation = Some(presentation);

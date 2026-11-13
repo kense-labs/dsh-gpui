@@ -2,6 +2,7 @@
 
 use super::workspace::{composer_bg, menu_bg, path_name};
 use super::*;
+use crate::theme_preference::ThemePreference;
 use gpui::{Transformation, svg};
 
 impl DshApp {
@@ -164,20 +165,17 @@ impl DshApp {
             self.scratch_session = Some(scratch.to_owned());
         }
         if let Some(mode) = reply.get("themeMode").and_then(Value::as_str) {
-            let next = match mode {
-                "light" => ThemeMode::Light,
-                "dark" => ThemeMode::Dark,
-                _ => Theme::global(cx).mode,
-            };
-            if Theme::global(cx).mode != next {
-                Theme::global_mut(cx).set_mode(next);
-                self.sync_shell_window(cx);
-                cx.refresh_windows();
-            }
+            let preference = ThemePreference::from_id(mode);
+            self.restore_theme_preference(preference, cx);
+        } else {
+            // Official DEFAULT_PREFERENCE is 跟随系统; a fresh profile follows
+            // the platform appearance instead of pinning one theme.
+            let preference = ThemePreference::System;
+            self.restore_theme_preference(preference, cx);
         }
     }
 
-    pub(super) fn save_workspace_preferences(&self, cx: &App) {
+    pub(super) fn save_workspace_preferences(&self, _cx: &App) {
         let mut hidden = self.hidden_workspaces.iter().cloned().collect::<Vec<_>>();
         let mut collapsed = self
             .collapsed_workspaces
@@ -251,10 +249,7 @@ impl DshApp {
                     "pinned": pinned,
                     "sessionTitles": self.legacy_session_titles,
                     "archived": archived,
-                    "themeMode": match Theme::global(cx).mode {
-                        ThemeMode::Dark => "dark",
-                        ThemeMode::Light => "light",
-                    },
+                    "themeMode": self.theme_preference.id(),
                     "contentFontDelta": self.content_font_delta,
                     "collapseTiming": if self.collapse_next_input { "next-input" } else { "completion" },
                     "foldedReplies": if self.keep_folded_replies { "all" } else { "final" },

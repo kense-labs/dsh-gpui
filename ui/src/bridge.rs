@@ -63,6 +63,12 @@ export function dshNow() {
     return Date.now();
 }
 
+// Follow-the-system appearance: read the platform colour scheme. The caller
+// polls this while the preference is "system"; matchMedia is cheap.
+export function dshSystemPrefersDark() {
+    return window.matchMedia?.('(prefers-color-scheme: dark)').matches ?? false;
+}
+
 export function dshListenDockCancel(callback) {
     window.addEventListener('pointercancel', callback, true);
     window.addEventListener('lostpointercapture', callback, true);
@@ -418,6 +424,9 @@ extern "C" {
     #[wasm_bindgen(js_name = dshNow)]
     fn now_js() -> f64;
 
+    #[wasm_bindgen(js_name = dshSystemPrefersDark)]
+    fn system_prefers_dark_js() -> bool;
+
     #[wasm_bindgen(js_name = dshReadSidebar)]
     pub(crate) fn read_sidebar(session: &str) -> String;
 
@@ -489,6 +498,11 @@ extern "C" {
 
     #[wasm_bindgen(js_name = dshTimeLabel)]
     fn time_label_js(ms: f64) -> String;
+}
+
+/// Whether the platform currently prefers a dark appearance.
+pub(crate) fn system_prefers_dark() -> bool {
+    system_prefers_dark_js()
 }
 
 /// Wall-clock milliseconds since the Unix epoch (local browser clock).

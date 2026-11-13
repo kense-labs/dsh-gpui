@@ -36,6 +36,7 @@ pub mod submit;
 mod submitted_plan;
 #[cfg(any(target_family = "wasm", test))]
 mod terminal_keys;
+pub mod theme_preference;
 #[cfg(any(target_family = "wasm", test))]
 pub mod tokens;
 mod tool_calls;

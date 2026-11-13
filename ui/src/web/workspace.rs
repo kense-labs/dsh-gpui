@@ -7,6 +7,7 @@ use super::session_context_menu::{
     SessionMenuAnchor, SessionMenuOrigin, mac_control_click, session_menu_gestures,
 };
 use super::*;
+use crate::theme_preference::ThemePreference;
 use gpui::{AvailableSpace, canvas, point, size, svg};
 use kui::primitives::ops_surface::icon_btn;
 
@@ -5771,18 +5772,43 @@ impl DshApp {
                 column()
                     .w_full()
                     .gap(px(14.))
-                    .child(
-                        Button::new("toggle-theme")
-                            .label(if dark(cx) {
-                                "切换为浅色主题"
+                    .child({
+                        // Official Appearance row: three preference cubes whose
+                        // selection follows the stored preference, not the
+                        // resolved theme (ui-theme AppearanceRow).
+                        let mut themes = column().w_full().gap(px(8.)).child(
+                            div()
+                                .text_size(px(12.))
+                                .line_height(px(18.))
+                                .text_color(p.label_tertiary)
+                                .child("主题"),
+                        );
+                        let mut row = row().w_full().gap(px(8.)).items_center();
+                        for preference in ThemePreference::ALL {
+                            let selected = self.theme_preference == preference;
+                            let icon = match preference {
+                                ThemePreference::Light => Glyph::Sun,
+                                ThemePreference::Dark => Glyph::Moon,
+                                ThemePreference::System => Glyph::Monitor,
+                            };
+                            let button = Button::new(gpui::ElementId::Name(
+                                format!("theme-{}", preference.id()).into(),
+                            ))
+                            .label(preference.label())
+                            .with_icon(icon, false)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.set_theme_preference(preference, cx);
+                            }));
+                            let button = if selected {
+                                button.primary()
                             } else {
-                                "切换为深色主题"
-                            })
-                            .with_icon(if dark(cx) { Glyph::Sun } else { Glyph::Moon }, false)
-                            .secondary()
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_theme(cx)))
-                            .into_themed(cx),
-                    )
+                                button.secondary()
+                            };
+                            row = row.child(button.into_themed(cx));
+                        }
+                        themes = themes.child(row);
+                        themes
+                    })
                     .child(labeled_control(
                         "正文字号",
                         Some(
