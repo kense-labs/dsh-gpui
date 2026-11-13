@@ -1610,7 +1610,8 @@ impl DshApp {
 
     fn composer_width(&self, w: &Window) -> f32 {
         let main_width = f32::from(w.viewport_size().width) - self.sidebar_track_width(w);
-        let width = (conversation_axis(main_width) + 32.).min((main_width - 32.).max(272.));
+        let width =
+            (crate::layout::conversation_axis(main_width) + 32.).min((main_width - 32.).max(272.));
         if self.right_dock_frame.track > 0. {
             width.min((main_width - self.right_dock_frame.track - 32.).max(240.))
         } else {
@@ -1953,8 +1954,9 @@ impl DshApp {
         self.prepare_rating_rows(w, cx);
         let p = dsh(cx);
         let flow_rows = super::flow_scroll::FlowRows::default();
-        let content_width =
-            conversation_axis(f32::from(w.viewport_size().width) - self.sidebar_track_width(w));
+        let content_width = crate::layout::conversation_axis(
+            f32::from(w.viewport_size().width) - self.sidebar_track_width(w),
+        );
         let mut content = column()
             .w(px(content_width))
             .max_w_full()
@@ -2823,10 +2825,13 @@ impl DshApp {
     /// 官方 toast：底部居中，.16s 淡入，停留 3s，1s 淡出。
     fn render_toasts(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let p = dsh(cx);
+        // Official Toast is a top-center banner: `position: fixed; top: 40px;
+        // left: 50%; transform: translateX(-50%)` (Toast.module.css). It never
+        // intercepts clicks, so the layer is inert.
         let mut list = column()
             .id("toast-layer")
             .absolute()
-            .bottom(px(24.))
+            .top(px(40.))
             .left_0()
             .right_0()
             .flex_none()
@@ -2834,27 +2839,25 @@ impl DshApp {
             .gap(px(8.));
         for toast in &self.toasts {
             let age = ((bridge::monotonic_ms() - toast.at) / 1000.) as f32;
-            if age >= 4. {
+            if age >= crate::anim::TOAST_TOTAL_SECONDS {
                 continue;
             }
-            let opacity = if age < 0.16 {
-                age / 0.16
-            } else if age < 3. {
-                1.
-            } else {
-                1. - (age - 3.)
-            };
+            // `dsh-toast-in 160ms ease-out` then `dsh-toast-fade 1000ms ease`
+            // delayed by the hold, which is what the layer's lifetimes encode.
+            let (opacity, rise) = crate::anim::toast_frame(age);
             list = list.child(
                 div()
-                    .px(px(14.))
-                    .py(px(9.))
-                    .rounded(px(12.))
-                    .bg(menu_bg(cx))
+                    .max_w(px(640.))
+                    .px(px(16.))
+                    .py(px(12.))
+                    .rounded(px(16.))
+                    .bg(p.toast_bg)
+                    .text_color(p.toast_label)
                     .shadow(elevation_prominent())
-                    .text_size(px(13.))
-                    .line_height(px(20.))
-                    .text_color(p.ink)
+                    .text_size(px(14.))
+                    .line_height(px(22.))
                     .opacity(opacity.clamp(0., 1.))
+                    .top(px(rise))
                     .child(toast.message.clone()),
             );
         }
@@ -6679,12 +6682,6 @@ pub(super) fn collapsed_sidebar_width() -> f32 {
     } else {
         SIDEBAR_RAIL_WIDTH
     }
-}
-
-fn conversation_axis(main_width: f32) -> f32 {
-    (main_width * 0.64)
-        .clamp(680., 920.)
-        .min((main_width - 64.).max(240.))
 }
 
 fn permission_icon(id: &str, size: f32, color: gpui::Hsla) -> Option<gpui::Svg> {

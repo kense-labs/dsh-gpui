@@ -36,6 +36,30 @@ pub const FISH_SWIM: Duration = Duration::from_millis(1600);
 /// 待命圆点呼吸（input-pending）。
 pub const PENDING: Duration = Duration::from_millis(1000);
 
+/// Toast 时序，对应官方 `Toast.tsx` 的 `HOLD_MS` / `FADE_MS` 与样式表里的
+/// `dsh-toast-in 160ms`。淡出起点是 3s，因此总时长 4s。
+pub const TOAST_IN_SECONDS: f32 = 0.16;
+pub const TOAST_HOLD_SECONDS: f32 = 3.;
+pub const TOAST_FADE_SECONDS: f32 = 1.;
+pub const TOAST_TOTAL_SECONDS: f32 = TOAST_HOLD_SECONDS + TOAST_FADE_SECONDS;
+
+/// How far a toast has travelled through its life, as `(opacity, rise_px)`.
+///
+/// Mirrors the official animation pair `dsh-toast-in 160ms ease-out` and
+/// `dsh-toast-fade 1000ms ease` delayed by the hold (Toast.module.css). The
+/// 6px entry offset is the same in the official keyframes.
+pub fn toast_frame(age_seconds: f32) -> (f32, f32) {
+    if age_seconds < TOAST_IN_SECONDS {
+        let t = (age_seconds / TOAST_IN_SECONDS).clamp(0., 1.);
+        (t, -6. * (1. - t))
+    } else if age_seconds < TOAST_HOLD_SECONDS {
+        (1., 0.)
+    } else {
+        let t = ((age_seconds - TOAST_HOLD_SECONDS) / TOAST_FADE_SECONDS).clamp(0., 1.);
+        (1. - t, 0.)
+    }
+}
+
 /// 菜单进入淡入：opacity 0→1，40ms ease-out。
 /// 以零尺寸包裹层承担透明度动画（对 absolute 浮层无布局影响）。
 pub fn menu_in<E: IntoElement + 'static>(
@@ -170,7 +194,30 @@ pub fn shimmer_falloff(offset: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{SHIMMER_PAUSE_RATIO, shimmer_falloff, shimmer_should_animate, shimmer_sweep};
+    use super::{
+        SHIMMER_PAUSE_RATIO, TOAST_HOLD_SECONDS, TOAST_IN_SECONDS, TOAST_TOTAL_SECONDS,
+        shimmer_falloff, shimmer_should_animate, shimmer_sweep, toast_frame,
+    };
+
+    #[test]
+    fn toast_slides_in_holds_then_fades_on_the_official_clock() {
+        // Starts transparent, 6px high, and settles to full opacity at rest.
+        let (o0, r0) = toast_frame(0.);
+        assert_eq!((o0, r0), (0., -6.));
+        let (o1, r1) = toast_frame(TOAST_IN_SECONDS);
+        assert!((o1 - 1.).abs() < 0.001);
+        assert_eq!(r1, 0.);
+
+        // Full opacity for the whole hold, positioned at rest.
+        assert_eq!(toast_frame(1.5), (1., 0.));
+        assert_eq!(toast_frame(TOAST_HOLD_SECONDS - 0.001), (1., 0.));
+
+        // The fade starts at the hold and finishes exactly at the total.
+        assert!((toast_frame(TOAST_HOLD_SECONDS + 0.5).0 - 0.5).abs() < 0.001);
+        assert_eq!(toast_frame(TOAST_TOTAL_SECONDS).0, 0.);
+        // Total is the official 3s hold plus the 1s fade.
+        assert_eq!(TOAST_TOTAL_SECONDS, 4.);
+    }
 
     #[test]
     fn a_label_animates_only_while_it_is_visible_and_active() {

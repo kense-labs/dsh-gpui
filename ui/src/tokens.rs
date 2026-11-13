@@ -75,7 +75,9 @@ pub struct Tokens {
     pub menu_surface: Hsla, // --dsw-specific-menu（darwin 不透明底衬）
     pub menu_group_header: Hsla, // --dsw-alias-menu-group-header-fill
     pub toast_bg: Hsla,    // --dsw-alias-toast-bg
-    pub tooltip_bg: Hsla,  // --dsw-alias-tooltip-bg
+    /// --dsw-alias-toast-label：静态 bluish-00，明暗两套主题下都是纯白。
+    pub toast_label: Hsla,
+    pub tooltip_bg: Hsla, // --dsw-alias-tooltip-bg
     // 滚动条
     pub scrollbar_l1: Hsla,       // --dsw-alias-scrollbar-bg-l1
     pub scrollbar_l1_hover: Hsla, // hover-l1
@@ -171,6 +173,7 @@ impl Tokens {
             menu_surface: rgb(0x303136).into(),
             menu_group_header: rgb(0x303136).into(),
             toast_bg: rgb(0x43454a).into(),
+            toast_label: rgb(0xffffff).into(),
             tooltip_bg: rgb(0x43454a).into(),
             scrollbar_l1: rgb(0x3c3c3d).into(),
             scrollbar_l1_hover: rgb(0x545557).into(),
@@ -254,6 +257,7 @@ impl Tokens {
             menu_surface: rgb(0xf8f9fa).into(),
             menu_group_header: rgb(0xf8f9fa).into(),
             toast_bg: rgb(0x353638).into(),
+            toast_label: rgb(0xffffff).into(),
             tooltip_bg: rgb(0x2c2c2e).into(),
             scrollbar_l1: rgb(0xe5e5e5).into(),
             scrollbar_l1_hover: rgb(0xd4d4d4).into(),

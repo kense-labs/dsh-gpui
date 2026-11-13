@@ -1098,10 +1098,14 @@ impl DshApp {
             .filter(|used| *used > 0)
     }
 
-    /// 官方 toast：.16s 滑入，停留 3s，1s 淡出后移除。
+    /// 官方 toast：160ms 滑入，停留 3s，1s 淡出后移除（总 4s）。
+    /// 生命周期由 `anim` 的常量推导，避免渲染曲线与卸载定时器各写一个数而漂移。
     pub(crate) fn push_toast(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        let total_ms = (anim::TOAST_TOTAL_SECONDS * 1000.) as f64;
+        // Wake slightly after the fade finishes so the last frame is not clipped.
+        let wake_ms = total_ms as u64 + 100;
         self.toasts
-            .retain(|toast| bridge::monotonic_ms() - toast.at < 4000.);
+            .retain(|toast| bridge::monotonic_ms() - toast.at < total_ms);
         self.toasts.push(Toast {
             message: message.into(),
             at: bridge::monotonic_ms(),
@@ -1109,11 +1113,11 @@ impl DshApp {
         cx.notify();
         cx.spawn(async move |this, cx| {
             cx.background_executor()
-                .timer(std::time::Duration::from_millis(4100))
+                .timer(std::time::Duration::from_millis(wake_ms))
                 .await;
             this.update(cx, |app, cx| {
                 app.toasts
-                    .retain(|toast| bridge::monotonic_ms() - toast.at < 4000.);
+                    .retain(|toast| bridge::monotonic_ms() - toast.at < total_ms);
                 cx.notify();
             })
             .ok();
