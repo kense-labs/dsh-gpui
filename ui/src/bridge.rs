@@ -556,6 +556,23 @@ pub fn listen_keys(callback: &js_sys::Function) {
 }
 
 /// Listen for document-level file drag/drop and paste of files/images.
+#[cfg(target_family = "wasm")]
+#[wasm_bindgen(inline_js = r#"
+export function dshReportPanic(message) {
+  try {
+    if (window.__TAURI_INTERNALS__) window.__TAURI_INTERNALS__.invoke('note_panic', { message });
+  } catch (error) {}
+}
+"#)]
+extern "C" {
+    fn dshReportPanic(message: &str);
+}
+
+/// Send one wasm panic message to the native log before the instance aborts.
+pub(crate) fn report_panic(message: &str) {
+    dshReportPanic(message);
+}
+
 pub fn listen_files(callback: &js_sys::Function) {
     listen_files_js(callback);
 }

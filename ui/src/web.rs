@@ -63,6 +63,21 @@ thread_local! {
 #[wasm_bindgen]
 pub fn start() {
     console_error_panic_hook::set_once();
+    // A wasm panic aborts the UI thread and leaves a frozen window; ship the
+    // message to the native log first so the failure is diagnosable.
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|location| format!("{}:{}", location.file(), location.line()))
+            .unwrap_or_default();
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|message| (*message).to_owned())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".to_owned());
+        crate::bridge::report_panic(&format!("{location}: {payload}"));
+    }));
     gpui_platform::web_init();
     gpui_platform::application().run(|cx: &mut App| {
         cx.text_system()
@@ -1963,7 +1978,7 @@ impl DshApp {
         }
         self.rebuild_selectors(w, cx);
         if resumed {
-            self.request_session_history();
+            self.request_session_history(cx);
         }
         for event in std::mem::take(&mut self.opening_session_events) {
             if event["sessionId"] == id {
@@ -2195,7 +2210,7 @@ impl DshApp {
         cx.notify();
     }
 
-    fn request_session_history(&mut self) {
+    fn request_session_history(&mut self, cx: &mut Context<Self>) {
         let Some(session_id) = self.active_session.clone() else {
             return;
         };
@@ -2210,6 +2225,27 @@ impl DshApp {
                 "limit": 2500,
             }),
         );
+        // A Host that never answers must not leave the transcript on
+        // 载入历史… forever: surface the failure so the edge row offers 重新加载.
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(20))
+                .await;
+            this.update(cx, |app, cx| {
+                if app.active_session.as_deref() != Some(session_id.as_str())
+                    || !app.conversation.history_loading
+                {
+                    return;
+                }
+                app.conversation.history_loading = false;
+                app.conversation.history_was_partial = true;
+                app.conversation.history_error = Some("历史加载失败：请求超时".to_owned());
+                app.conversation.error = app.conversation.history_error.clone();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub(crate) fn request_older_history(&mut self, cx: &mut Context<Self>) {

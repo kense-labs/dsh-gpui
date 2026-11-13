@@ -32,6 +32,12 @@ fn private_child_env_keys() -> impl Iterator<Item = std::ffi::OsString> {
     })
 }
 
+/// Write one wasm panic message to stderr (the window freezes after a panic).
+#[tauri::command]
+async fn note_panic(message: String) {
+    eprintln!("WASM PANIC: {message}");
+}
+
 fn main() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -92,6 +98,7 @@ fn main() {
             history::export::archive::download_session_log,
             history::peek_session_titles,
             history::list_local_sessions,
+            note_panic,
             history::read_attachment,
             history::read_image_file,
             history::turn_token_usage,

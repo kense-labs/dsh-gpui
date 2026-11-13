@@ -2100,9 +2100,11 @@ impl DshApp {
         // Official chat history edge: 加载更早 / 正在加载 / 载入历史… / 重新加载 /
         // 已到会话开头. It stays while this session exposed an incomplete window.
         let history = &self.conversation;
-        let history_edge = history
-            .history_edge()
-            .filter(|_| !history.entries.is_empty() || history.history_loading);
+        let history_edge = history.history_edge().filter(|_| {
+            !history.entries.is_empty()
+                || history.history_loading
+                || history.history_error.is_some()
+        });
         if let Some(edge) = history_edge {
             let label = edge.label();
             let actionable = edge.actionable();
@@ -2124,7 +2126,12 @@ impl DshApp {
                     .text_color(p.secondary)
                     .hover(|style| style.text_color(p.ink))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.request_older_history(cx);
+                        // A failed first page has no `beforeSeq`; retry the load.
+                        if this.conversation.history_oldest_seq.is_none() {
+                            this.request_session_history(cx);
+                        } else {
+                            this.request_older_history(cx);
+                        }
                     }));
             }
             content = content.child(row().w_full().mb(px(8.)).justify_center().child(edge));
