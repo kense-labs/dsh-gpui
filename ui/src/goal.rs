@@ -24,6 +24,9 @@ pub enum GoalPhase {
 pub enum GoalActivation {
     Armed,
     Disarmed,
+    /// The activation projection has not arrived (or named an unknown value):
+    /// the pause/resume toggle stays disabled until it is known.
+    Unknown,
 }
 
 /// One live goal view: durable snapshot plus replay counters and activation.
@@ -52,8 +55,11 @@ impl GoalView {
             _ => return None,
         };
         let activation = match value["activation"].as_str() {
+            Some("armed") => GoalActivation::Armed,
             Some("disarmed") => GoalActivation::Disarmed,
-            _ => GoalActivation::Armed,
+            // rc.3 keeps the toggle disabled until activation is known instead
+            // of assuming the process may continue.
+            _ => GoalActivation::Unknown,
         };
         Some(Self {
             id: id.to_owned(),
@@ -77,8 +83,8 @@ impl GoalView {
     /// Durable phase label, matching the official PhaseLabels dictionary.
     pub fn label(&self) -> &'static str {
         match (self.phase, self.activation) {
-            (GoalPhase::Active, GoalActivation::Armed) => "进行中的目标",
             (GoalPhase::Active, GoalActivation::Disarmed) => "待继续的目标",
+            (GoalPhase::Active, _) => "进行中的目标",
             (GoalPhase::Paused, _) => "已暂停的目标",
             (GoalPhase::Blocked, _) => "受阻的目标",
             (GoalPhase::Complete, _) => "",
@@ -93,6 +99,12 @@ impl GoalView {
     /// Resume is offered for every phase that is not currently running.
     pub fn can_resume(&self) -> bool {
         self.phase != GoalPhase::Active || self.activation == GoalActivation::Disarmed
+    }
+
+    /// rc.3: the pause/resume toggle pauses only an armed active goal and
+    /// resumes every other phase; it is disabled while activation is unknown.
+    pub fn can_toggle(&self) -> bool {
+        self.can_pause() || self.can_resume()
     }
 
     /// Hover text: the blocked reason when the goal is blocked.
@@ -140,6 +152,9 @@ mod tests {
     fn phases_and_activation_pick_the_official_labels() {
         assert_eq!(view("active", "armed").label(), "进行中的目标");
         assert_eq!(view("active", "disarmed").label(), "待继续的目标");
+        // Missing/unknown activation keeps the active label but disables the toggle.
+        assert_eq!(view("active", "unknown").label(), "进行中的目标");
+        assert!(!view("active", "unknown").can_toggle());
         assert_eq!(view("paused", "disarmed").label(), "已暂停的目标");
         assert_eq!(view("blocked", "disarmed").label(), "受阻的目标");
         assert!(!view("complete", "disarmed").visible());

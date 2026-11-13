@@ -3836,7 +3836,6 @@ impl DshApp {
             return div().into_any_element();
         };
         let busy = self.conversation.goal_busy;
-        let can_pause = goal.can_pause();
         let can_resume = goal.can_resume();
         let action_button =
             |id: &'static str,
@@ -3917,28 +3916,8 @@ impl DshApp {
                     .child(error),
             );
         }
-        // The official strip renders exactly the verbs the phase allows: pause
-        // only for an armed active goal, resume for every other phase.
-        if can_pause {
-            bar = bar.child(action_button(
-                "goal-pause",
-                "暂停目标",
-                Glyph::Pause,
-                true,
-                cx,
-                |this, w, cx| this.run_goal_action("pause", w, cx),
-            ));
-        }
-        if can_resume {
-            bar = bar.child(action_button(
-                "goal-resume",
-                "恢复目标",
-                Glyph::Play,
-                true,
-                cx,
-                |this, w, cx| this.run_goal_action("resume", w, cx),
-            ));
-        }
+        // rc.3 action order: edit, clear, then the single pause/resume toggle,
+        // disabled until activation is known.
         bar = bar
             .child(action_button(
                 "goal-edit",
@@ -3956,6 +3935,26 @@ impl DshApp {
                 cx,
                 |this, w, cx| this.run_goal_action("clear", w, cx),
             ));
+        let resume = can_resume;
+        bar = bar.child(if resume {
+            action_button(
+                "goal-toggle",
+                "恢复目标",
+                Glyph::Play,
+                goal.can_toggle(),
+                cx,
+                |this, w, cx| this.run_goal_action("resume", w, cx),
+            )
+        } else {
+            action_button(
+                "goal-toggle",
+                "暂停目标",
+                Glyph::Pause,
+                goal.can_toggle(),
+                cx,
+                |this, w, cx| this.run_goal_action("pause", w, cx),
+            )
+        });
         bar.into_any_element()
     }
 
