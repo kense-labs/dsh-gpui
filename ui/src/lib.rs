@@ -7,6 +7,8 @@ pub mod approval_command;
 #[cfg(any(target_family = "wasm", test))]
 mod assistant_stream;
 #[cfg(any(target_family = "wasm", test))]
+mod command_summary;
+#[cfg(any(target_family = "wasm", test))]
 mod commands;
 pub mod data_url;
 pub mod file_icons;

@@ -20,6 +20,54 @@ impl SessionSummary {
             "未命名"
         })
     }
+
+    /// Title safe to show in the sidebar/header: Host-side fallback titles can
+    /// be the raw goal injection text, which must never reach the UI.
+    pub(crate) fn display_title(&self) -> String {
+        sanitize_session_title(self.title())
+    }
+}
+
+/// Replace a raw goal injection used as a session title with its objective.
+///
+/// The Host derives `session/list` titles from the first user message; a goal
+/// round stores `<goal_round>\nObjective: "…"\nRound: 1/256…`, so an untitled
+/// session can surface that internal prompt. Official clients never show it.
+pub(crate) fn sanitize_session_title(title: &str) -> String {
+    let trimmed = title.trim();
+    if !(trimmed.starts_with("<goal_round>") || trimmed.starts_with("<goal_complete>")) {
+        return title.to_owned();
+    }
+    if let Some(rest) = trimmed.split("Objective:").nth(1) {
+        let rest = rest.trim_start();
+        // The Host may keep the injection's newlines or collapse them into one
+        // title line; handle both, preferring the quoted objective.
+        let objective = if let Some(quoted) = rest.strip_prefix('"') {
+            match quoted.find('"') {
+                Some(end) => quoted[..end].trim().to_owned(),
+                None => quoted.lines().next().unwrap_or(quoted).trim().to_owned(),
+            }
+        } else {
+            let line = rest.lines().next().unwrap_or(rest).trim();
+            line.split(" Round:")
+                .next()
+                .unwrap_or(line)
+                .trim()
+                .to_owned()
+        };
+        if !objective.is_empty() {
+            return objective;
+        }
+    }
+    // No objective to recover: drop the tag and keep the first readable line.
+    trimmed
+        .trim_start_matches("<goal_round>")
+        .trim_start_matches("<goal_complete>")
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_owned()
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -182,6 +230,33 @@ pub(crate) fn relative_session_age(updated_at_ms: u64, now_ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn goal_injection_titles_become_the_objective() {
+        use super::{SessionSummary, sanitize_session_title};
+        let raw = "<goal_round>\nObjective: \"帮我从1数到50\"\nRound: 1/256\n\nContinue working toward the objective in this same session. Treat the current workspace, tool results, and durable session state as authoritative; inspect them instead of assuming earlier narration is still current.";
+        assert_eq!(sanitize_session_title(raw), "帮我从1数到50");
+        assert_eq!(
+            sanitize_session_title(
+                "<goal_complete>\nObjective: \"Fix the bug\"\nThe goal is marked complete"
+            ),
+            "Fix the bug"
+        );
+        assert_eq!(
+            sanitize_session_title("<goal_round>\nObjective: \nRound: 1"),
+            "Round: 1"
+        );
+        assert_eq!(sanitize_session_title("普通标题"), "普通标题");
+
+        let session = SessionSummary {
+            id: "s".to_owned(),
+            cwd: "/tmp".to_owned(),
+            title: Some(raw.to_owned()),
+            blank: false,
+            created_at_ms: None,
+        };
+        assert_eq!(session.display_title(), "帮我从1数到50");
+    }
+
     use super::*;
 
     fn session(id: &str, title: Option<&str>, blank: bool) -> SessionSummary {

@@ -1566,8 +1566,12 @@ impl DshApp {
             String::new()
         } else {
             session
-                .and_then(|session| self.session_title_name(session))
-                .map(|title| short_text(title, 52))
+                .map(|session| {
+                    self.session_title_name(session)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| session.display_title())
+                })
+                .map(|title| short_text(&title, 52))
                 .or_else(|| {
                     self.conversation
                         .entries
@@ -8194,10 +8198,21 @@ fn render_command_card(entry: &ChatEntry, expanded: bool, cx: &mut Context<DshAp
     // 官方：仅当结果含换行时 DisclosureRow 才可展开。
     let expandable = body.as_deref().is_some_and(|text| text.contains('\n'));
     let open = expanded && expandable;
+    // The collapsed row is a single line in the official card: the browser
+    // collapses the result's newlines there, while the expandable body keeps
+    // the original text.
     let summary = match (running, failed) {
         (true, _) => "执行中…".to_string(),
-        (false, true) => body.clone().unwrap_or_else(|| "指令失败".to_string()),
-        (false, false) => body.clone().unwrap_or_else(|| "已完成".to_string()),
+        (false, true) => body
+            .as_deref()
+            .map(crate::command_summary::command_summary)
+            .filter(|summary| !summary.is_empty())
+            .unwrap_or_else(|| "指令失败".to_string()),
+        (false, false) => body
+            .as_deref()
+            .map(crate::command_summary::command_summary)
+            .filter(|summary| !summary.is_empty())
+            .unwrap_or_else(|| "已完成".to_string()),
     };
     let title = if entry.title.is_empty() {
         "指令".to_string()

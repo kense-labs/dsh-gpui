@@ -655,10 +655,7 @@ impl DshApp {
         else {
             return;
         };
-        let name = self
-            .session_title_name(session)
-            .unwrap_or_default()
-            .to_owned();
+        let name = self.session_display_title(session);
         self.dismiss_header_menu(true, w, cx);
         let restore_focus = w.focused(cx);
         super::document_html::restore_shell_focus();
@@ -1034,17 +1031,18 @@ impl DshApp {
         cx.notify();
     }
     /// Preserve pre-upgrade aliases until the user saves a durable title.
-    pub(super) fn session_title_name<'a>(&'a self, session: &'a SessionSummary) -> Option<&'a str> {
+    /// User-assigned rename/alias only. The Host title is read through
+    /// [`SessionSummary::display_title`] so raw goal injections never surface.
+    pub(super) fn session_title_name(&self, session: &SessionSummary) -> Option<&str> {
         self.legacy_session_titles
             .get(&session.id)
             .map(String::as_str)
-            .or(session.title.as_deref())
     }
 
     pub(super) fn session_display_title(&self, session: &SessionSummary) -> String {
         self.session_title_name(session)
-            .unwrap_or_else(|| session.title())
-            .to_owned()
+            .map(str::to_owned)
+            .unwrap_or_else(|| session.display_title())
     }
 }
 
